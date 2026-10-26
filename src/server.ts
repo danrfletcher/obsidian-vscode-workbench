@@ -9,27 +9,28 @@
  *    argument, and is never logged, shown in a Notice or written to data.json;
  *  - telemetry is switched off when the build supports it (F5).
  */
-import { spawn, execFile, execFileSync, type ChildProcess } from "node:child_process";
+import { spawn, execFile, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
+import * as dns from "node:dns";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ChildRegistry } from "./child-registry";
+import { isAlive, listDescendants, pidsWithCommandContaining, signal, signalGroup } from "./process-utils";
 
-/**
- * SPIKE ONLY. The server licence flag is accepted by a hard-coded dev constant.
- * PR-2 replaces this with the licence modal; nothing is downloaded from
- * Microsoft in the shipped plugin until Dan has accepted the terms.
- */
-export const DEV_ACCEPT_SERVER_LICENSE = true;
+export { descendantsFromPs, listDescendants } from "./process-utils";
 
 export const LOOPBACK_HOST = "127.0.0.1";
 export const READY_TIMEOUT_MS = 30_000;
 /** Once the server answers "still downloading" (HTTP 202) we wait this long in total. */
 export const DOWNLOAD_TIMEOUT_MS = 300_000;
-export const STDERR_TAIL_LINES = 10;
-const COMMIT_RE = /^[0-9a-f]{40}$/;
+/** How many of the child's last output lines (stdout and stderr) are kept for failure messages. */
+export const LOG_TAIL_LINES = 10;
+/** Where `serve-web` downloads its server build from; the only host the start talks to (F5). */
+export const DOWNLOAD_HOST = "update.code.visualstudio.com";
+export const COMMIT_RE = /^[0-9a-f]{40}$/;
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -280,7 +281,7 @@ export function shareExtensions(sourceDir: string | null, serverDataDir: string)
 }
 
 // ---------------------------------------------------------------------------
-// Ports and process helpers
+// Ports and probing
 // ---------------------------------------------------------------------------
 
 /** Ask the OS for a free loopback port. */
@@ -296,58 +297,19 @@ export function findFreePort(): Promise<number> {
   });
 }
 
-/** Parse `ps -A -o pid=,ppid=` output into all descendant pids of `rootPid`. */
-export function descendantsFromPs(psOutput: string, rootPid: number): number[] {
-  const children = new Map<number, number[]>();
-  for (const line of psOutput.split("\n")) {
-    const [pid, ppid] = line.trim().split(/\s+/).map(Number);
-    if (!pid || Number.isNaN(ppid)) continue;
-    const list = children.get(ppid) ?? [];
-    list.push(pid);
-    children.set(ppid, list);
+/** Ports of servers this process started and that are still up: a new start never reuses one. */
+const heldPorts = new Set<number>();
+
+/** A free loopback port that no server of ours still holds. */
+export async function pickPort(pick: () => Promise<number> = findFreePort): Promise<number> {
+  for (let i = 0; i < 20; i++) {
+    const port = await pick();
+    if (!heldPorts.has(port)) return port;
   }
-  const out: number[] = [];
-  const queue = [rootPid];
-  while (queue.length) {
-    for (const c of children.get(queue.shift() as number) ?? []) {
-      out.push(c);
-      queue.push(c);
-    }
-  }
-  return out;
+  throw new ServerStartError("Could not find a free port on 127.0.0.1.", null, "", { kind: "port-bind" });
 }
 
-/**
- * All descendant pids of `rootPid` (the `code` wrapper forks several layers and
- * some leave the process group). Synchronous so stop() can collect them before
- * the parent dies and its children are re-parented.
- */
-export function listDescendants(rootPid: number): number[] {
-  try {
-    return descendantsFromPs(execFileSync("ps", ["-A", "-o", "pid=,ppid="], { encoding: "utf8" }), rootPid);
-  } catch {
-    return [];
-  }
-}
-
-function signal(pid: number, sig: NodeJS.Signals): void {
-  try {
-    process.kill(pid, sig);
-  } catch {
-    /* already gone */
-  }
-}
-
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function httpStatus(port: number, token: string, timeoutMs = 2000): Promise<number | null> {
+export function httpStatus(port: number, token: string, timeoutMs = 2000): Promise<number | null> {
   return new Promise((resolve) => {
     const req = http.get(
       { host: LOOPBACK_HOST, port, path: `/?tkn=${token}`, timeout: timeoutMs },
@@ -361,18 +323,146 @@ function httpStatus(port: number, token: string, timeoutMs = 2000): Promise<numb
   });
 }
 
+/** One probe: the status code and the start of the body (for the "download failed" page). */
+export interface ProbeResult {
+  status: number | null;
+  body: string;
+}
+
+export function httpProbe(port: number, token: string, timeoutMs = 2000): Promise<ProbeResult> {
+  return new Promise((resolve) => {
+    const req = http.get(
+      { host: LOOPBACK_HOST, port, path: `/?tkn=${token}`, timeout: timeoutMs },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk: string) => {
+          if (body.length < 2048) body += chunk;
+        });
+        res.on("end", () => resolve({ status: res.statusCode ?? null, body: body.slice(0, 2048) }));
+        res.on("error", () => resolve({ status: res.statusCode ?? null, body }));
+      },
+    );
+    req.on("timeout", () => req.destroy());
+    req.on("error", () => resolve({ status: null, body: "" }));
+  });
+}
+
+/**
+ * Whether the download host can be reached: a name lookup, then a TCP connect to
+ * port 443 (no request is sent). `serve-web` does not say why a download failed,
+ * so this is how "the network is unreachable" is told apart from any other
+ * download failure.
+ */
+export function checkDownloadHostReachable(host = DOWNLOAD_HOST, timeoutMs = 4000): Promise<boolean> {
+  return new Promise((resolve) => {
+    dns.lookup(host, (err, address) => {
+      if (err) return resolve(false);
+      const socket = net.connect({ host: address, port: 443, timeout: timeoutMs });
+      const done = (ok: boolean) => {
+        socket.destroy();
+        resolve(ok);
+      };
+      socket.once("connect", () => done(true));
+      socket.once("timeout", () => done(false));
+      socket.once("error", () => done(false));
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Reading the child's log
+// ---------------------------------------------------------------------------
+
+/** `[time] info Downloading server <commit>`: logged when a download attempt starts. */
+const DOWNLOAD_START_RE = /\binfo\s+Downloading server\b/i;
+/** An error-level log line that is about the download. */
+const DOWNLOAD_ERROR_LINE_RE = /^\[[^\]]*\]\s+(error|critical)\b.*download/i;
+/** What `serve-web` answers (instead of the "please wait" page) when the download failed. */
+const DOWNLOAD_ERROR_BODY_RE = /error was encountered downloading the server/i;
+
+/** Lines that say nothing useful in a failure message: the licence banner and the line that carries the token. */
+export function isLogNoise(line: string): boolean {
+  return line.startsWith("*") || /^Web UI available at\b/.test(line);
+}
+
+/**
+ * Whether the child's output and the probe show a failed download. The real
+ * `serve-web` keeps answering 202 "downloading" after a failed attempt and logs
+ * no reason: every new request starts another attempt and logs another
+ * "Downloading server" line. A download that is really in progress logs that
+ * line once, however many requests arrive, so a second line means the first
+ * attempt failed.
+ */
+export function downloadFailureSignal(input: { startLines: number; errorLine: string | null; probeBody: string }): string | null {
+  if (input.errorLine) return input.errorLine;
+  if (DOWNLOAD_ERROR_BODY_RE.test(input.probeBody)) return input.probeBody.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+  if (input.startLines >= 2) return "The server download was attempted again after it failed.";
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// The serve-web download cache
+// ---------------------------------------------------------------------------
+
+/** Commits whose server build is cached under `<cliDataDir>/serve-web/`. */
+export function cachedServerCommits(cliDataDir: string): Set<string> {
+  try {
+    return new Set(fs.readdirSync(path.join(cliDataDir, "serve-web")).filter((n) => COMMIT_RE.test(n)));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Remove server builds that appeared in the cache after `before` was taken: a
+ * download that failed part-way must not be left looking like a usable build.
+ */
+export function removePartialDownloads(cliDataDir: string, before: ReadonlySet<string>): string[] {
+  const removed: string[] = [];
+  for (const commit of cachedServerCommits(cliDataDir)) {
+    if (before.has(commit)) continue;
+    fs.rmSync(path.join(cliDataDir, "serve-web", commit), { recursive: true, force: true });
+    fs.rmSync(path.join(cliDataDir, "serve-web", ".locks", commit), { recursive: true, force: true });
+    removed.push(commit);
+  }
+  return removed;
+}
+
 // ---------------------------------------------------------------------------
 // The server
 // ---------------------------------------------------------------------------
 
+export type StartErrorKind = "missing-binary" | "no-serve-web" | "spawn" | "exit" | "timeout" | "port-bind" | "download";
+
 export class ServerStartError extends Error {
+  readonly kind: StartErrorKind;
+  readonly port?: number;
+  /** Extra text for the Notice (e.g. the CLI path for "no serve-web"). */
+  readonly detail?: string;
+  /** Seconds waited, for a timeout. */
+  readonly seconds?: number;
+
   constructor(
     message: string,
     readonly exitCode: number | null,
     readonly stderrTail: string,
+    extra: { kind?: StartErrorKind; port?: number; detail?: string; seconds?: number } = {},
   ) {
     super(message);
     this.name = "ServerStartError";
+    this.kind = extra.kind ?? "exit";
+    this.port = extra.port;
+    this.detail = extra.detail;
+    this.seconds = extra.seconds;
+  }
+}
+
+/** Thrown to callers of a start that was cancelled by stop() or restart() before it finished. */
+export class StartCancelledError extends Error {
+  constructor() {
+    super("The VS Code server start was cancelled.");
+    this.name = "StartCancelledError";
   }
 }
 
@@ -387,6 +477,16 @@ export interface ServerOptions {
   pollIntervalMs?: number;
   /** Extra env for the child (tests only). */
   env?: NodeJS.ProcessEnv;
+  /** The child registers here (and so in the pidfile) the moment it is spawned. */
+  registry?: ChildRegistry;
+  /** The vault folder; recorded in the pidfile entry. */
+  workspace?: string;
+  /** Replaces the readiness/health HTTP probe (tests). */
+  probe?: (port: number, token: string) => Promise<number | null>;
+  /** Replaces the check that tells an unreachable network from another download failure (tests). */
+  downloadHostReachable?: () => Promise<boolean>;
+  /** Replaces the free-port lookup (tests). */
+  findPort?: () => Promise<number>;
 }
 
 export interface RunningServer {
@@ -396,13 +496,24 @@ export interface RunningServer {
   token: string;
 }
 
+export interface ExitInfo {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}
+
 export class WorkbenchServer {
   private child: ChildProcess | null = null;
   private starting: Promise<RunningServer> | null = null;
   private running: RunningServer | null = null;
   private stopping: Promise<void> | null = null;
-  private stderrLines: string[] = [];
-  private exit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+  private stopRequested = false;
+  private heldPort: number | null = null;
+  private tokenFile = "";
+  private logLines: string[] = [];
+  private downloadStartLines = 0;
+  private downloadErrorLine: string | null = null;
+  private exit: ExitInfo | null = null;
+  private exitListeners: Array<(info: ExitInfo) => void> = [];
 
   constructor(private readonly opts: ServerOptions) {}
 
@@ -418,6 +529,22 @@ export class WorkbenchServer {
     return path.join(this.opts.runtimeDir, "server-data");
   }
 
+  get cliDataDir(): string {
+    return path.join(this.opts.runtimeDir, "cli-data");
+  }
+
+  /** Called when the server dies without stop() having been asked for (a crash, `kill -9`). */
+  onUnexpectedExit(listener: (info: ExitInfo) => void): void {
+    this.exitListeners.push(listener);
+  }
+
+  /** One HTTP check of the running server: the status code, or null when nothing answers. */
+  async probe(): Promise<number | null> {
+    const r = this.running;
+    if (!r) return null;
+    return (this.opts.probe ?? httpStatus)(r.port, r.token);
+  }
+
   /** Start the server if it is not running; concurrent and repeated calls share one process. */
   ensureStarted(): Promise<RunningServer> {
     if (this.running && this.child && this.exit === null) return Promise.resolve(this.running);
@@ -431,13 +558,14 @@ export class WorkbenchServer {
   private async start(): Promise<RunningServer> {
     const { build, runtimeDir } = this.opts;
     const tokenFile = path.join(runtimeDir, "connection-token");
-    const cliDataDir = path.join(runtimeDir, "cli-data");
+    this.tokenFile = tokenFile;
+    const cliDataDir = this.cliDataDir;
     fs.mkdirSync(this.serverDataDir, { recursive: true });
     fs.mkdirSync(cliDataDir, { recursive: true });
 
     const token = createTokenFile(tokenFile);
     shareExtensions(build.extensionsDir, this.serverDataDir);
-    const port = await findFreePort();
+    const port = await pickPort(this.opts.findPort);
     const args = buildServeWebArgs({
       port,
       tokenFile,
@@ -448,8 +576,11 @@ export class WorkbenchServer {
       commitId: build.commit,
     });
 
-    this.stderrLines = [];
+    this.logLines = [];
+    this.downloadStartLines = 0;
+    this.downloadErrorLine = null;
     this.exit = null;
+    this.stopRequested = false;
     // detached => its own process group, so stop() can take the whole tree down.
     const child = spawn(build.cli, args, {
       detached: true,
@@ -457,24 +588,50 @@ export class WorkbenchServer {
       env: { ...process.env, ...this.opts.env },
     });
     this.child = child;
+    heldPorts.add(port);
+    this.heldPort = port;
+    if (child.pid !== undefined) {
+      const server = this;
+      this.opts.registry?.register({
+        pid: child.pid,
+        label: "vscode-server",
+        match: "serve-web",
+        workspace: this.opts.workspace,
+        group: true,
+        kill: () => server.stop(),
+      });
+    }
 
-    // stdout carries a "Web UI available at" line that includes the token: drain it, keep nothing.
-    child.stdout?.on("data", () => undefined);
-    let partial = "";
-    child.stderr?.on("data", (buf: Buffer) => {
-      const lines = (partial + buf.toString("utf8")).split("\n");
-      partial = lines.pop() ?? "";
-      for (const l of lines) this.pushStderr(l, token);
+    // Both streams are the log: the real serve-web writes its log lines to stdout and leaves stderr empty.
+    // stdout also carries a "Web UI available at" line that includes the token; every line is redacted
+    // and that one is dropped (isLogNoise).
+    const flushers = [child.stdout, child.stderr].map((stream) => {
+      let partial = "";
+      stream?.on("data", (buf: Buffer) => {
+        const lines = (partial + buf.toString("utf8")).split("\n");
+        partial = lines.pop() ?? "";
+        for (const l of lines) this.pushLog(l, token);
+      });
+      return () => {
+        if (partial) this.pushLog(partial, token);
+        partial = "";
+      };
     });
     child.once("exit", (code, sig) => {
-      if (partial) this.pushStderr(partial, token);
+      for (const flush of flushers) flush();
       this.exit = { code, signal: sig };
+      heldPorts.delete(port);
+      if (child.pid !== undefined) this.opts.registry?.unregister(child.pid);
       if (this.child === child) {
+        const wasRunning = this.running !== null;
         this.running = null;
+        if (wasRunning && !this.stopRequested) for (const l of this.exitListeners) l({ code, signal: sig });
       }
     });
     const spawnFailed = new Promise<never>((_, reject) => {
-      child.once("error", (e) => reject(new ServerStartError(`Could not run VS Code: ${e.message}`, null, "")));
+      child.once("error", (e) =>
+        reject(new ServerStartError(`Could not run VS Code: ${e.message}`, null, "", { kind: "spawn" })),
+      );
     });
 
     try {
@@ -483,15 +640,22 @@ export class WorkbenchServer {
       await this.stop();
       throw e;
     }
+    if (this.stopRequested) throw new StartCancelledError();
     this.running = { baseUrl: `http://${LOOPBACK_HOST}:${port}`, port, token };
     return this.running;
   }
 
-  private pushStderr(line: string, token: string): void {
-    const clean = redactToken(line, token).trimEnd();
-    if (!clean) return;
-    this.stderrLines.push(clean);
-    if (this.stderrLines.length > STDERR_TAIL_LINES) this.stderrLines.shift();
+  private pushLog(line: string, token: string): void {
+    const clean = redactToken(line, token).trim();
+    if (!clean || isLogNoise(clean)) return;
+    if (DOWNLOAD_START_RE.test(clean)) this.downloadStartLines++;
+    if (DOWNLOAD_ERROR_LINE_RE.test(clean)) this.downloadErrorLine = clean;
+    this.addTail(clean);
+  }
+
+  private addTail(line: string): void {
+    this.logLines.push(line);
+    if (this.logLines.length > LOG_TAIL_LINES) this.logLines.shift();
   }
 
   private async waitUntilReady(port: number, token: string): Promise<void> {
@@ -499,30 +663,57 @@ export class WorkbenchServer {
     const readyMs = this.opts.readyTimeoutMs ?? READY_TIMEOUT_MS;
     const downloadMs = this.opts.downloadTimeoutMs ?? DOWNLOAD_TIMEOUT_MS;
     const interval = this.opts.pollIntervalMs ?? 250;
+    const probe = async (): Promise<ProbeResult> =>
+      this.opts.probe ? { status: await this.opts.probe(port, token), body: "" } : httpProbe(port, token);
     let downloading = false;
     for (;;) {
+      if (this.stopRequested) throw new StartCancelledError();
       if (this.exit) {
-        const tail = this.stderrLines.join("\n");
+        const tail = this.logLines.join("\n");
         throw new ServerStartError(
           `VS Code server exited with code ${this.exit.code ?? this.exit.signal}${tail ? `:\n${tail}` : ""}`,
           this.exit.code,
           tail,
+          { kind: "exit", port },
         );
       }
-      const status = await httpStatus(port, token);
+      const { status, body } = await probe();
       if (status === 200 || status === 302) return;
       if (status === 202) downloading = true; // "downloading the VS Code Server, please wait"
+      if (status === 202 || status === 500 || this.downloadErrorLine) {
+        // A failed download does not end the process: it keeps answering 202 (see downloadFailureSignal).
+        const signal = downloadFailureSignal({ startLines: this.downloadStartLines, errorLine: this.downloadErrorLine, probeBody: redactToken(body, token) });
+        if (signal) await this.failDownload(signal, port);
+      }
       const limit = downloading ? downloadMs : readyMs;
       if (Date.now() - start > limit) {
-        const tail = this.stderrLines.join("\n");
+        const tail = this.logLines.join("\n");
         throw new ServerStartError(
           `VS Code server was not ready after ${Math.round(limit / 1000)} s${tail ? `:\n${tail}` : ""}`,
-          this.exit ? (this.exit as { code: number | null }).code : null,
+          this.exit ? (this.exit as ExitInfo).code : null,
           tail,
+          { kind: "timeout", port, seconds: Math.round(limit / 1000) },
         );
       }
       await new Promise((r) => setTimeout(r, interval));
     }
+  }
+
+  /**
+   * The download failed. serve-web does not say why, so check whether the
+   * download host can be reached and put the answer in the log tail: the
+   * failure message is chosen from it (see failure-messages.ts).
+   */
+  private async failDownload(signal: string, port: number): Promise<never> {
+    const reachable = await (this.opts.downloadHostReachable ?? checkDownloadHostReachable)();
+    this.addTail(signal);
+    this.addTail(
+      reachable
+        ? `The server download keeps failing although ${DOWNLOAD_HOST} answers.`
+        : `Network is unreachable: could not connect to ${DOWNLOAD_HOST} (dns error: failed to lookup address information).`,
+    );
+    const tail = this.logLines.join("\n");
+    throw new ServerStartError(`VS Code server download failed:\n${tail}`, null, tail, { kind: "download", port });
   }
 
   /**
@@ -531,6 +722,7 @@ export class WorkbenchServer {
    */
   stop(): Promise<void> {
     if (this.stopping) return this.stopping;
+    this.stopRequested = true;
     const child = this.child;
     if (!child || child.pid === undefined) {
       this.running = null;
@@ -538,27 +730,41 @@ export class WorkbenchServer {
     }
     const pid = child.pid;
     this.running = null;
+    if (this.exit !== null) {
+      // The wrapper is already gone, so its pid (and process group id) may have been reused by
+      // another program: never signal it. Stragglers are found by our own token-file path, which
+      // appears on the command line of every process the wrapper started.
+      const stragglers = this.tokenFile ? pidsWithCommandContaining(this.tokenFile) : [];
+      for (const d of stragglers) signal(d, "SIGTERM");
+      this.stopping = (async () => {
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline && stragglers.some(isAlive)) await new Promise((r) => setTimeout(r, 50));
+        for (const p of stragglers) if (isAlive(p)) signal(p, "SIGKILL");
+        this.finishStop(child, pid);
+      })();
+      return this.stopping;
+    }
     // Collect the tree before signalling: once the parent dies its children are re-parented.
     const descendants = listDescendants(pid);
-    try {
-      process.kill(-pid, "SIGTERM"); // own process group
-    } catch {
-      signal(pid, "SIGTERM");
-    }
+    signalGroup(pid, "SIGTERM"); // own process group
+    signal(pid, "SIGTERM");
     for (const d of descendants) signal(d, "SIGTERM");
     this.stopping = (async () => {
       const all = [pid, ...descendants];
       const deadline = Date.now() + 3000;
       while (Date.now() < deadline && all.some(isAlive)) await new Promise((r) => setTimeout(r, 50));
       for (const p of all) if (isAlive(p)) signal(p, "SIGKILL");
-      try {
-        process.kill(-pid, "SIGKILL");
-      } catch {
-        /* group already gone */
-      }
-      if (this.child === child) this.child = null;
-      this.stopping = null;
+      signalGroup(pid, "SIGKILL");
+      this.finishStop(child, pid);
     })();
     return this.stopping;
+  }
+
+  private finishStop(child: ChildProcess, pid: number): void {
+    if (this.child === child) this.child = null;
+    if (this.heldPort !== null) heldPorts.delete(this.heldPort);
+    this.heldPort = null;
+    this.opts.registry?.unregister(pid);
+    this.stopping = null;
   }
 }

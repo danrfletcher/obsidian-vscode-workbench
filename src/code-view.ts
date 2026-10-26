@@ -2,6 +2,7 @@
 import { ItemView, type ViewStateResult, type WorkspaceLeaf } from "obsidian";
 import { buildFileUrl } from "./paths";
 import type { RunningServer } from "./server";
+import type { ServerState } from "./server-manager";
 import { buildBrowserSeedScript } from "./settings";
 
 export const VIEW_TYPE_CODE = "vscode-workbench-code";
@@ -22,7 +23,39 @@ export interface CodeViewHost {
   ensureServer(): Promise<RunningServer>;
   trackView(view: CodeView): void;
   untrackView(view: CodeView): void;
+  serverState(): ServerState;
+  /** Notified on every server state change; returns the unsubscribe function. */
+  onServerState(cb: (state: ServerState) => void): () => void;
+  /** Restart the server (the banner's button). Resolves once it is running again; rejects if it cannot start. */
+  restartServer(): Promise<void>;
 }
+
+/**
+ * Reads whether the page holds an unsaved buffer. The VS Code web workbench puts
+ * "●" in front of the window title when the active editor is dirty, and marks a
+ * dirty editor tab with the class `dirty`. The result is `true` or `false`.
+ */
+export const DIRTY_SCRIPT = `(() => {
+  if ((document.title || "").startsWith("\u25cf")) return true;
+  return document.querySelector(".monaco-workbench .tab.dirty") !== null;
+})()`;
+
+/**
+ * VS Code's default "Save All" key sequence, as Electron key events: Cmd+Alt+S on macOS, and the
+ * chord Ctrl+K then S on Windows and Linux. Each entry is a key pressed and released.
+ */
+export function saveAllKeys(platform: string): Array<{ keyCode: string; modifiers: string[] }> {
+  if (platform === "darwin") return [{ keyCode: "S", modifiers: ["meta", "alt"] }];
+  return [
+    { keyCode: "K", modifiers: ["control"] },
+    { keyCode: "S", modifiers: [] },
+  ];
+}
+
+export const CRASH_TEXT =
+  "The VS Code server stopped unexpectedly. Restarting reloads this tab, and any unsaved changes in your open Code tabs are lost. Copy anything you need first.";
+export const RESTART_FAILED_TEXT =
+  "The VS Code server could not be restarted. Unsaved changes in this tab are lost if you reload it. Try Restart again, or use \"Restart server\" in the plugin settings.";
 
 interface CodeViewState {
   file?: string;
@@ -32,6 +65,7 @@ interface CodeViewState {
 /** The part of Electron's <webview> element the seeding step uses. */
 interface WebviewLike extends HTMLElement {
   executeJavaScript?: (code: string) => Promise<unknown>;
+  sendInputEvent?: (event: { type: string; keyCode?: string; modifiers?: string[] }) => unknown;
 }
 
 /**
@@ -67,6 +101,16 @@ export function baseName(file: string): string {
 export class CodeView extends ItemView {
   private file = "";
   private frame: HTMLElement | null = null;
+  private banner: HTMLElement | null = null;
+  private unsubscribe: (() => void) | null = null;
+  /** The server died under this tab; the banner is up and the page may hold unsaved text. */
+  private crashed = false;
+  /** The server was stopped (idle, settings restart) or failed since this tab loaded. */
+  private stale = false;
+  private loading = false;
+  private domReady = false;
+  /** Counts loadWorkbench calls, so a restart can tell whether the "running" event already reloaded this tab. */
+  private loadCount = 0;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -87,6 +131,10 @@ export class CodeView extends ItemView {
     return "code-2";
   }
 
+  get filePath(): string {
+    return this.file;
+  }
+
   getState(): CodeViewState {
     // Only the vault-relative path is persisted. The token never goes into view state.
     return { file: this.file };
@@ -104,15 +152,65 @@ export class CodeView extends ItemView {
 
   async onOpen(): Promise<void> {
     this.host.trackView(this);
+    this.unsubscribe = this.host.onServerState((s) => this.onServerState(s));
     this.contentEl.addClass("vscode-workbench-view");
     this.contentEl.style.padding = "0";
+    this.contentEl.style.position = "relative";
     this.contentEl.style.overflow = "hidden";
   }
 
   async onClose(): Promise<void> {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
     this.host.untrackView(this);
     this.frame?.remove();
     this.frame = null;
+  }
+
+  /** True when this tab is on screen (not a background tab). */
+  isVisible(): boolean {
+    return (this.contentEl as { isShown?: () => boolean }).isShown?.() ?? false;
+  }
+
+  /** Call when tab visibility may have changed: a tab left behind by an idle stop wakes the server when shown. */
+  notifyVisible(): void {
+    if (this.stale && !this.crashed && !this.loading && this.isVisible()) void this.loadWorkbench();
+  }
+
+  private onServerState(state: ServerState): void {
+    if (this.loading) return;
+    switch (state) {
+      case "crashed":
+        if (this.frame) {
+          this.crashed = true;
+          this.showBanner(CRASH_TEXT);
+        }
+        break;
+      case "stopped":
+      case "stopped-by-idle":
+        if (this.frame && !this.crashed) this.stale = true;
+        break;
+      case "failed":
+        // A start failed (a settings restart, say) and this tab still shows the page of the server that
+        // was stopped for it: no tab is left on a dead embed (G14). A tab with the crash banner stays,
+        // because its page may hold text to copy and the banner's Restart can try again.
+        if (this.frame && !this.crashed) this.closeDeadTab();
+        break;
+      case "running":
+        // A restart (banner button or settings): reload this tab onto the new port and token.
+        if (this.crashed || (this.stale && this.isVisible())) void this.loadWorkbench();
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** Close this tab: its server is gone and could not be brought back. The reason is already in a Notice. */
+  private closeDeadTab(): void {
+    this.frame?.remove();
+    this.frame = null;
+    this.stale = false;
+    this.leaf.detach();
   }
 
   /** Reload the embedded workbench (used after a theme change). */
@@ -123,9 +221,95 @@ export class CodeView extends ItemView {
     else void this.loadWorkbench();
   }
 
+  // --- unsaved buffers ------------------------------------------------------
+
+  /**
+   * Whether the workbench in this tab holds an unsaved buffer. When the page
+   * cannot be asked (it has loaded but the script fails) the answer is "yes":
+   * an unsaved buffer must never be discarded on a guess.
+   */
+  async isDirty(): Promise<boolean> {
+    const f = this.frame as WebviewLike | null;
+    if (!f || typeof f.executeJavaScript !== "function") return false; // nothing loaded, or an iframe (cannot be read)
+    if (!this.domReady) return false;
+    try {
+      return (await f.executeJavaScript(DIRTY_SCRIPT)) === true;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Press the workbench's "Save All" shortcut and wait until no editor in the tab is dirty. True if
+   * everything saved. Save All, not Save: Save only reaches the active editor, and any other dirty
+   * editor would stay dirty. An untitled editor opens a Save As box that nothing here can answer, so
+   * it stays dirty and this returns false; the caller asks the user what to do next.
+   */
+  async saveBuffers(timeoutMs = 5000): Promise<boolean> {
+    const f = this.frame as WebviewLike | null;
+    if (!f || typeof f.sendInputEvent !== "function") return !(await this.isDirty());
+    (f as HTMLElement).focus?.();
+    // The workbench's own auto-save setting is left alone.
+    const platform = typeof process !== "undefined" ? process.platform : "linux";
+    for (const { keyCode, modifiers } of saveAllKeys(platform)) {
+      await f.sendInputEvent({ type: "keyDown", keyCode, modifiers });
+      await f.sendInputEvent({ type: "keyUp", keyCode, modifiers });
+      await new Promise((r) => setTimeout(r, 50)); // a chord's second key must arrive after the first
+    }
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!(await this.isDirty())) return true;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return !(await this.isDirty());
+  }
+
+  // --- loading ----------------------------------------------------------------
+
+  private showBanner(text: string): void {
+    this.banner?.remove();
+    const banner = this.contentEl.createDiv({ cls: "vscode-workbench-banner", text: "" }) as HTMLElement;
+    banner.style.position = "absolute";
+    banner.style.top = "0";
+    banner.style.left = "0";
+    banner.style.right = "0";
+    banner.style.zIndex = "10";
+    banner.style.padding = "8px 12px";
+    banner.style.background = "var(--background-modifier-error, #a33)";
+    banner.style.color = "var(--text-on-accent, #fff)";
+    banner.createEl("span", { text });
+    const button = banner.createEl("button", { text: "Restart", cls: "mod-cta" });
+    button.style.marginLeft = "12px";
+    button.addEventListener("click", () => void this.restartFromBanner());
+    this.banner = banner;
+    // The banner floats over the (dead) page, which stays visible so unsaved text can be copied.
+  }
+
+  private async restartFromBanner(): Promise<void> {
+    const loadsBefore = this.loadCount;
+    try {
+      await this.host.restartServer();
+    } catch {
+      // The failure notice has been shown; keep the banner so Restart can be pressed again.
+      if (!this.loading) this.showBanner(RESTART_FAILED_TEXT);
+      return;
+    }
+    // Normally the "running" event has already reloaded this tab (successfully or not); this covers a
+    // server that was already running again, when no event reached this tab.
+    if (this.loadCount === loadsBefore && !this.loading && (this.crashed || this.stale)) await this.loadWorkbench();
+  }
+
   private async loadWorkbench(): Promise<void> {
+    // Only a tab that showed the crash banner keeps its place when the reload fails; any other tab is closed.
+    const keepForRestart = this.crashed;
+    this.loadCount++;
+    this.loading = true;
+    this.crashed = false;
+    this.stale = false;
+    this.domReady = false;
     this.contentEl.empty();
     this.frame = null;
+    this.banner = null;
     try {
       const server = await this.host.ensureServer();
       const url = buildFileUrl(server.baseUrl, this.host.vaultRoot(), this.file, server.token);
@@ -134,6 +318,9 @@ export class CodeView extends ItemView {
       if (isWebview) {
         el.setAttribute("partition", "persist:vscode-workbench");
         el.setAttribute("allowpopups", "");
+        el.addEventListener("dom-ready", () => {
+          if (this.frame === el) this.domReady = true;
+        });
       }
       el.style.width = "100%";
       el.style.height = "100%";
@@ -150,8 +337,18 @@ export class CodeView extends ItemView {
         if (this.frame === el) el.setAttribute("src", url);
       }
     } catch {
-      // main.ts has already shown the Notice with the (token-free) reason.
-      this.contentEl.createDiv({ text: "VS Code server is not running. Run \"Open spike file in Code tab\" to retry." });
+      // main.ts has already shown the (token-free) reason. A tab is closed rather than left blank; only a
+      // tab that was showing the crash banner (its page may hold text to copy) keeps its place and offers Restart.
+      this.frame = null;
+      this.contentEl.empty();
+      if (keepForRestart) {
+        this.crashed = true;
+        this.showBanner(RESTART_FAILED_TEXT);
+      } else {
+        this.leaf.detach();
+      }
+    } finally {
+      this.loading = false;
     }
   }
 }

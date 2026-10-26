@@ -54,6 +54,9 @@ function makeView(host: Partial<CodeViewHost> = {}) {
     ensureServer: async () => ({ baseUrl: "http://127.0.0.1:5555", port: 5555, token: "tok123" }),
     trackView: vi.fn(),
     untrackView: vi.fn(),
+    serverState: () => "running",
+    onServerState: () => () => undefined,
+    restartServer: async () => undefined,
     ...host,
   };
   const view = new CodeView(new WorkspaceLeaf() as never, full);
@@ -148,7 +151,7 @@ describe("CodeView", () => {
     expect(el.children[0].executed).toEqual([]);
   });
 
-  it("shows a message instead of an embed when the server cannot start", async () => {
+  it("closes the tab instead of leaving a blank embed when the server cannot start", async () => {
     const { view, el } = makeView({
       ensureServer: async () => {
         throw new Error("boom");
@@ -156,7 +159,7 @@ describe("CodeView", () => {
     });
     await view.setState({ file: "a.py" }, {} as never);
     expect(el.children).toHaveLength(0);
-    expect(el.text).toMatch(/not running/);
+    expect((view.leaf as unknown as WorkspaceLeaf & { detached: boolean }).detached).toBe(true);
   });
 
   it("registers with the host on open and unregisters on close", async () => {

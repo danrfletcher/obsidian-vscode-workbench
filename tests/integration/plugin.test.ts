@@ -39,11 +39,11 @@ function makeApp(root: string): MockApp {
   return a;
 }
 
-async function load(env: Record<string, string> = {}): Promise<void> {
+async function load(env: Record<string, string> = {}, data: Record<string, unknown> = {}): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile }, env);
   app = makeApp(vault);
   plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
-  (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, embed: "iframe" };
+  (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, embed: "iframe", serverLicenceAccepted: true, ...data };
   await plugin.onload();
 }
 
@@ -168,8 +168,10 @@ describe("failure", () => {
     await load({ FAKE_CODE_MODE: "exit-early" });
     await plugin.openSpikeFile();
     const shown = Notice.messages.join("\n");
-    expect(shown).toContain("exited with code 3");
-    expect(shown).toContain("address already in use");
+    // the fake's stderr says "address already in use": a port-bind failure, with the exit code and the last stderr line
+    expect(shown).toContain("could not listen on 127.0.0.1:");
+    expect(shown).toContain("exit code 3");
+    expect(shown).toContain("Last message: secret <redacted> leaked on purpose");
     const tokenFile = path.join(vault, ".obsidian/plugins/obsidian-vscode-workbench/.server/connection-token");
     expect(shown).not.toContain(fs.readFileSync(tokenFile, "utf8"));
     expect(app.workspace.leaves).toHaveLength(0);
@@ -181,7 +183,7 @@ describe("unload", () => {
     await load();
     await plugin.openSpikeFile();
     const [serverPid] = serverPids();
-    const wrapper = (plugin as unknown as { server: { pid: number; current: { port: number } } }).server;
+    const wrapper = (plugin as unknown as { manager: { serverInstance: { pid: number; current: { port: number } } } }).manager.serverInstance;
     const port = wrapper.current.port;
     const wrapperPid = wrapper.pid;
     expect(listenersOn(port).length).toBeGreaterThan(0);

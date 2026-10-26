@@ -101,11 +101,23 @@ describe("source tree (F5)", () => {
     }
   });
 
-  it("contacts only 127.0.0.1: every URL in src/ is loopback", () => {
+  // The licence terms address is shown in the licence modal as text. It is never requested by the plugin.
+  const DISPLAYED_NOT_FETCHED = ["https://aka.ms/vscode-server-license"];
+
+  it("contacts only 127.0.0.1: every URL in src/ is loopback, except the licence address that is only displayed", () => {
     for (const [f, text] of sources) {
       const urls = [...text.matchAll(/https?:\/\/[^\s"'`)]+/g)].map((m) => m[0]);
-      const external = urls.filter((u) => !/^https?:\/\/(127\.0\.0\.1|\$\{)/.test(u));
+      const external = urls.filter((u) => !/^https?:\/\/(127\.0\.0\.1|\$\{)/.test(u) && !DISPLAYED_NOT_FETCHED.includes(u));
       expect(external, f).toEqual([]);
+    }
+  });
+
+  it("only the licence module and its modal mention the displayed address, and nothing fetches it", () => {
+    const mentions = sources.filter(([, t]) => t.includes("aka.ms")).map(([f]) => f);
+    expect(mentions).toEqual(["licence.ts"]);
+    for (const [f, t] of sources) {
+      if (f === "licence.ts") continue;
+      expect(t, f).not.toMatch(/SERVER_LICENCE_URL[^\n]*(fetch|http\.get|requestUrl|XMLHttpRequest)/);
     }
   });
 
