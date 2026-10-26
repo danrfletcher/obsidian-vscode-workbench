@@ -533,6 +533,15 @@ export class WorkbenchServer {
     return path.join(this.opts.runtimeDir, "cli-data");
   }
 
+  /**
+   * The plugin-owned user-data dir holding the copy of the instance's `User/settings.json` and
+   * `User/keybindings.json`. The server does not read those two files itself; the browser profile gets
+   * the same content through the Code tab (see src/server/user-data-seed.ts).
+   */
+  get userDataDir(): string {
+    return path.join(this.serverDataDir, "data");
+  }
+
   /** Called when the server dies without stop() having been asked for (a crash, `kill -9`). */
   onUnexpectedExit(listener: (info: ExitInfo) => void): void {
     this.exitListeners.push(listener);

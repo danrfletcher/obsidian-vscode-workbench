@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { REPO_ROOT } from "../helpers";
+import { REPO_ROOT, listTsFiles } from "../helpers";
 
 const manifest = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "manifest.json"), "utf8")) as Record<string, unknown>;
 
@@ -23,8 +23,7 @@ describe("manifest.json", () => {
 
   it("has no mobile code paths in src/ (F1)", () => {
     const dir = path.join(REPO_ROOT, "src");
-    const text = fs
-      .readdirSync(dir)
+    const text = listTsFiles(dir)
       .map((f) => fs.readFileSync(path.join(dir, f), "utf8"))
       .join("\n");
     expect(text).not.toMatch(/Platform\.isMobile|isMobileApp|Capacitor/);

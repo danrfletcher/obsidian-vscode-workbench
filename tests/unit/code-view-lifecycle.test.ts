@@ -71,6 +71,7 @@ function makeView() {
       return () => (listeners = listeners.filter((l) => l !== cb));
     },
     restartServer: restart as never,
+    userDataCopy: () => null,
   };
   const leaf = new WorkspaceLeaf();
   const view = new CodeView(leaf as never, host);

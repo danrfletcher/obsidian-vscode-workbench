@@ -93,3 +93,15 @@ All of the former open items were run in Obsidian 1.14.5: Code tab renders (`PR-
 `<iframe>` fails, theme toggled (`PR-1-theme.png`), Ctrl+` confirmed not bridged, Node version
 recorded. Still for Dan on his Mac: the feel of IntelliSense and the real macOS VS Code build
 with his own extensions (Pylance), and the Workspace Trust decision above.
+
+## Settings copy: where it takes effect (PR-3, G16/G17, review round 1)
+
+Measured on the real server (VS Code 1.144.0-insider, headless Chrome, scratch ports; `tests/render/user-data-check.mjs`):
+
+| Where the key is | `editor.fontSize` (copied) | copied keybinding | `search.exclude` |
+|---|---|---|---|
+| `<server-data>/data/User/settings.json` and `keybindings.json` | no effect | no effect | no effect (search still finds `.obsidian`, `Attachments`) |
+| `<server-data>/data/Machine/settings.json` | not used here | n/a | takes effect |
+| browser profile (IndexedDB `/User/settings.json`, `/User/keybindings.json`) | takes effect (31px) | takes effect (ctrl+alt+n toggled the side bar) | takes effect and merges with the Machine file's |
+
+So the plugin keeps writing `data/User/*` (the plugin-owned copy), writes the five excludes into the Machine file on every rewrite, and seeds the browser profile with the merged settings and the keybindings once per server start (`UserDataCopy`, `buildBrowserSeedScript`). The check's control run (no browser seed) shows the font size, the keybinding and the instance's own exclude doing nothing, with the Machine-file excludes still in force.

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceLeaf } from "../mocks/obsidian";
 import { CodeView, VIEW_TYPE_CODE, baseName, runInWebview, type CodeViewHost } from "../../src/code-view";
-import { buildBrowserSeedScript } from "../../src/settings";
+import { BROWSER_APP_SETTINGS, buildBrowserSeedScript } from "../../src/settings";
 
 class FakeEl {
   attrs: Record<string, string> = {};
@@ -57,6 +57,7 @@ function makeView(host: Partial<CodeViewHost> = {}) {
     serverState: () => "running",
     onServerState: () => () => undefined,
     restartServer: async () => undefined,
+    userDataCopy: () => null,
     ...host,
   };
   const view = new CodeView(new WorkspaceLeaf() as never, full);
@@ -111,6 +112,15 @@ describe("CodeView", () => {
     expect(wv.srcs[1]).toContain("tkn=tok123");
     expect(wv.executed).toEqual([buildBrowserSeedScript()]);
     expect(wv.executed[0]).not.toContain("tok123");
+  });
+
+  it("puts the copied settings and keybindings into the seed script the host gives it (G17)", async () => {
+    const copy = { id: "start-1", settings: { "editor.fontSize": 23 }, keybindingsBase64: Buffer.from("[]").toString("base64") };
+    const { view, el } = makeView({ userDataCopy: () => copy });
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].executed).toEqual([buildBrowserSeedScript(BROWSER_APP_SETTINGS, copy)]);
+    expect(el.children[0].executed[0]).toContain('"editor.fontSize":23');
+    expect(el.children[0].executed[0]).not.toContain("tok123");
   });
 
   it("still opens the workbench when the seed script fails", async () => {

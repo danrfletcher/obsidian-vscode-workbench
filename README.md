@@ -2,7 +2,7 @@
 
 Obsidian desktop plugin that opens every text file in a real VS Code editor (via `code serve-web`) with a VS Code-style bottom terminal drawer.
 
-Status: in development (PR-1 is the spike: one ribbon icon, one Code tab, see `docs/spike-decision.md`). Not submitted to the community store.
+Status: in development (a spike with one ribbon icon and one Code tab, plus the server lifecycle and the settings tab; see `docs/spike-decision.md`). Not submitted to the community store.
 
 ## Network use
 
@@ -11,6 +11,25 @@ On first use the plugin downloads the VS Code server from Microsoft, after you a
 The first time a Code tab opens, VS Code asks whether to trust the folder; until you do, the Python extensions stay inactive (Restricted Mode).
 
 The ribbon icon opens the active file if Obsidian can open it itself (not Markdown, canvas or base); otherwise it opens the file named by `spikeFile` in the plugin's `data.json` (a vault-relative path, hand-edited), then the built-in spike file. Obsidian has no view for `.py`, so a code file is never the active file.
+
+## Settings
+
+Open Settings, Community plugins, Workbench. Every time the tab opens it rescans, shows "Scanning…", then the list.
+
+- **VS Code instance.** The scan reads `/Applications` and `~/Applications` for VS Code, VS Code Insiders, VSCodium, Antigravity and Antigravity IDE. A build is classified by its bundle identifier (`Info.plist`, else `product.json`), never by its folder name, and is listed only if its command-line tool passes `serve-web --help` (exit 0, output mentions `serve-web`, 5 seconds; run directly, never through a shell). The check starts no server, opens no port and downloads nothing. The default is the newest VS Code build (stable or Insiders, by version number); a build you pick is kept, and if it later disappears or fails its check the tab says why and uses the default until you pick again (the saved choice is not rewritten). Changing the instance while a server runs does not stop it, so unsaved buffers are safe: the change applies the next time the server starts.
+- **Custom CLI path.** An absolute path to a VS Code command-line tool. Verify runs the same check; a path that passes is listed as Custom.
+- **Excluded file extensions, terminal drawer toggle, shell.** Stored here for the features that read them (the text-file rules and the terminal drawer). Extensions are entered without a dot; they are trimmed, lowercased and de-duplicated. The shell defaults to `$SHELL`, else `/bin/zsh`.
+- **Restart server.** Stops the server and starts a fresh one.
+
+A hand-edited `codeCliPath` in `data.json` still overrides the instance chosen in the tab. A corrupt or partial `data.json` falls back to the defaults field by field.
+
+### Your VS Code settings
+
+At each server start the plugin copies the chosen instance's `User/settings.json` and `User/keybindings.json` (from its folder under `~/Library/Application Support`, for example `Code - Insiders`) one way into the plugin's own user-data folder, replacing the previous copy, and writes the workspace excludes on top: `.git`, `.obsidian`, `Attachments`, `node_modules` and `_to_delete` are excluded from `files.watcherExclude` and `search.exclude`, and win over the copied values. Comments and trailing commas in your `settings.json` are accepted; if it is invalid JSON, only the excludes are written and a notice says so. The VS Code server does not read those two files from its data folder, so the same copy is also written into the Code tab's own browser profile when the tab opens (once per server start; the excludes also go into the server's Machine settings, which it does read). Checked on a real server: a copied `editor.fontSize`, a copied keybinding and the excludes all take effect (`npm run check:user-data`). Edits made inside the embedded editor change the copy only and are replaced at the next start. The plugin never writes to, renames, deletes or changes the permissions of another instance's settings, extensions or app bundle, and it creates nothing in your vault outside its own plugin folder. The copy is private to you (mode 0600 in a 0700 folder) because settings can contain secrets.
+
+### Microsoft-only extensions
+
+Some extensions (for example Pylance, C/C++ and the Remote extensions) are licensed for Microsoft's own builds and may refuse to run in VSCodium or the Antigravity builds. The settings tab shows a one-line warning when the selected instance is not a Microsoft build. Nothing is done to work around the licence: choose VS Code or VS Code Insiders to use those extensions.
 
 ## Requirements
 

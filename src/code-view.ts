@@ -3,7 +3,7 @@ import { ItemView, type ViewStateResult, type WorkspaceLeaf } from "obsidian";
 import { buildFileUrl } from "./paths";
 import type { RunningServer } from "./server";
 import type { ServerState } from "./server-manager";
-import { buildBrowserSeedScript } from "./settings";
+import { buildBrowserSeedScript, BROWSER_APP_SETTINGS, type UserDataCopy } from "./settings";
 
 export const VIEW_TYPE_CODE = "vscode-workbench-code";
 
@@ -28,6 +28,8 @@ export interface CodeViewHost {
   onServerState(cb: (state: ServerState) => void): () => void;
   /** Restart the server (the banner's button). Resolves once it is running again; rejects if it cannot start. */
   restartServer(): Promise<void>;
+  /** The copy of the chosen instance's settings and keybindings made at the last server start, or null. */
+  userDataCopy(): UserDataCopy | null;
 }
 
 /**
@@ -326,14 +328,15 @@ export class CodeView extends ItemView {
       el.style.height = "100%";
       el.style.border = "0";
       // The application-scoped off switches (extension updates, experiments,
-      // telemetry) are only read from the browser profile, so a webview first
+      // telemetry) and the user's settings and keybindings (copied from the chosen
+      // instance, G17) are only read from the browser profile, so a webview first
       // loads the server's origin (no workbench), has them written into that
       // profile, and only then navigates to the workbench.
       el.setAttribute("src", isWebview ? `${server.baseUrl}/` : url);
       this.contentEl.appendChild(el);
       this.frame = el;
       if (isWebview) {
-        await runInWebview(el as WebviewLike, buildBrowserSeedScript());
+        await runInWebview(el as WebviewLike, buildBrowserSeedScript(BROWSER_APP_SETTINGS, this.host.userDataCopy()));
         if (this.frame === el) el.setAttribute("src", url);
       }
     } catch {

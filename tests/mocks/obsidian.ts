@@ -101,6 +101,26 @@ export class Modal {
   onClose(): void {}
 }
 
+export interface MockButton {
+  text: string;
+  disabled: boolean;
+  handler: (() => unknown) | null;
+}
+export interface MockDropdown {
+  options: Array<{ value: string; label: string }>;
+  value: string;
+  handler: ((v: string) => unknown) | null;
+}
+export interface MockText {
+  placeholder: string;
+  value: string;
+  handler: ((v: string) => unknown) | null;
+}
+export interface MockToggle {
+  value: boolean;
+  handler: ((v: boolean) => unknown) | null;
+}
+
 export class Setting {
   static all: Setting[] = [];
   static reset(): void {
@@ -108,7 +128,12 @@ export class Setting {
   }
   name = "";
   desc = "";
-  button: { text: string; disabled: boolean; handler: (() => unknown) | null } | null = null;
+  /** The last button added (the Restart server tests read this one). */
+  button: MockButton | null = null;
+  buttons: MockButton[] = [];
+  dropdown: MockDropdown | null = null;
+  text: MockText | null = null;
+  toggle: MockToggle | null = null;
   constructor(public containerEl: unknown) {
     Setting.all.push(this);
   }
@@ -140,6 +165,68 @@ export class Setting {
     };
     cb(b);
     this.button = b;
+    this.buttons.push(b);
+    return this;
+  }
+  addDropdown(cb: (d: unknown) => unknown): this {
+    const d: MockDropdown & Record<string, unknown> = {
+      options: [],
+      value: "",
+      handler: null,
+      addOption(value: string, label: string) {
+        d.options.push({ value, label });
+        return d;
+      },
+      setValue(v: string) {
+        d.value = v;
+        return d;
+      },
+      onChange(fn: (v: string) => unknown) {
+        d.handler = fn;
+        return d;
+      },
+    };
+    cb(d);
+    this.dropdown = d;
+    return this;
+  }
+  addText(cb: (t: unknown) => unknown): this {
+    const t: MockText & Record<string, unknown> = {
+      placeholder: "",
+      value: "",
+      handler: null,
+      setPlaceholder(v: string) {
+        t.placeholder = v;
+        return t;
+      },
+      setValue(v: string) {
+        t.value = v;
+        return t;
+      },
+      onChange(fn: (v: string) => unknown) {
+        t.handler = fn;
+        return t;
+      },
+    };
+    cb(t);
+    this.text = t;
+    return this;
+  }
+  addToggle(cb: (t: unknown) => unknown): this {
+    const t: MockToggle & Record<string, unknown> = {
+      value: false,
+      handler: null,
+      setValue(v: boolean) {
+        t.value = v;
+        return t;
+      },
+      onChange(fn: (v: boolean) => unknown) {
+        t.handler = fn;
+        return t;
+      },
+    };
+    cb(t);
+    this.toggle = t;
     return this;
   }
 }

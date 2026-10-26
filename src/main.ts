@@ -1,4 +1,5 @@
 import { FileSystemAdapter, Notice, Plugin, TFile, type Tasks } from "obsidian";
+import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import { ChildRegistry } from "./child-registry";
 import { CodeView, VIEW_TYPE_CODE, baseName, type CodeViewHost, type EmbedElement } from "./code-view";
@@ -19,8 +20,14 @@ import {
   type RunningServer,
 } from "./server";
 import { ServerManager, type ServerState, type StartOptions } from "./server-manager";
-import { WorkbenchSettingTab } from "./settings-tab";
-import { writeMachineSettings } from "./settings";
+import { chooseInstance } from "./instances/choose";
+import { verifyCliPath, type CliCheck } from "./instances/probe";
+import { appSupportRoot, describeCustom, type Instance, type ScanResult } from "./instances/scan";
+import { InstanceService } from "./instances/service";
+import { instanceUserDir, seedUserData } from "./server/user-data-seed";
+import { dataObject, readSettings, type WorkbenchSettings } from "./settings/data";
+import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
+import { writeMachineSettings, type UserDataCopy } from "./settings";
 
 /** Spike: opened by the ribbon icon when the active file is not a code file. */
 export const SPIKE_FILE = "AWS SA Associate Mock Exams/scripts/estimate_time.py";
@@ -28,8 +35,8 @@ export const SPIKE_FILE = "AWS SA Associate Mock Exams/scripts/estimate_time.py"
 /** Never opened in a Code tab (F6, and Obsidian's own formats). */
 const NOT_CODE = new Set(["md", "canvas", "base"]);
 
-interface WorkbenchData {
-  /** Hand-edited; path to a `code` CLI. Default: newest VS Code build found. */
+interface WorkbenchData extends Partial<WorkbenchSettings> {
+  /** Hand-edited; path to a `code` CLI. When set it overrides the instance chosen in the settings tab. */
   codeCliPath?: string;
   /** Hand-edited; vault-relative file the ribbon opens when no openable active file exists. */
   spikeFile?: string;
@@ -40,7 +47,7 @@ interface WorkbenchData {
   lastServer?: { commit: string; version: string };
 }
 
-export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHost {
+export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHost, SettingsHost {
   private views = new Set<CodeView>();
   private data_: WorkbenchData = {};
   private registry = new ChildRegistry(null);
@@ -50,12 +57,19 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private serverRequest: Promise<RunningServer> | null = null;
   private restarting: Promise<void> | null = null;
   private lastBuild: CodeBuild | null = null;
+  /** The instance's settings and keybindings as copied at the last server start; the Code tab seeds its browser profile from it. */
+  private copy: UserDataCopy | null = null;
+  private instances = new InstanceService();
   private cachedBefore: ReadonlySet<string> = new Set();
   /** Tests only: replaces the reachability check that turns a failed download into "the network is unreachable". */
   private downloadHostReachable?: () => Promise<boolean>;
 
   async onload(): Promise<void> {
-    this.data_ = ((await this.loadData()) as WorkbenchData | null) ?? {};
+    try {
+      this.data_ = dataObject(await this.loadData()) as WorkbenchData;
+    } catch {
+      this.data_ = {}; // an unreadable data.json: every setting falls back to its default
+    }
 
     // Nothing below spawns a process or opens a port: the server starts at the first Code tab (G13).
     this.registry = new ChildRegistry(new PidFile(path.join(this.runtimeDir(), "pids.json")));
@@ -249,8 +263,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private async createServer(o: StartOptions): Promise<WorkbenchServer> {
     // Defence in depth: no download can start without an accepted licence.
     if (!this.gate.accepted) throw new LicenceDeclinedError();
-    const build = findNewestBuild({ override: this.data_.codeCliPath });
-    if (!build) throw new ServerStartError("No VS Code installation found.", null, "", { kind: "missing-binary" });
+    const chosen = await this.instanceForStart();
+    const build = chosen ? findNewestBuild({ override: chosen.cli }) : null;
+    if (!chosen || !build) throw new ServerStartError("No VS Code installation found.", null, "", { kind: "missing-binary" });
     const support = await checkServeWebSupport(build.cli);
     if (!support.serveWeb) {
       throw new ServerStartError(`${build.cli} has no "serve-web" command.`, null, "", { kind: "no-serve-web", detail: build.cli });
@@ -273,7 +288,58 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       downloadHostReachable: this.downloadHostReachable,
     });
     writeMachineSettings(server.serverDataDir, { dark: this.isDark() });
+    this.seedUserData(server.userDataDir, chosen);
     return server;
+  }
+
+  /**
+   * The instance the next start runs on: the hand-edited `codeCliPath` if there is one, else the
+   * saved choice, else the default (the newest VS Code build). null when none can be found.
+   */
+  private async instanceForStart(): Promise<Instance | null> {
+    const override = this.data_.codeCliPath;
+    if (override) return describeCustom(override);
+    const scan = await this.scanInstances();
+    return chooseInstance(scan, this.workbenchSettings().instanceId).selected;
+  }
+
+  /** At each start: copy the instance's settings and keybindings one way into the user-data dir, excludes on top (G16, G17). */
+  private seedUserData(userDataDir: string, instance: Instance): void {
+    try {
+      const result = seedUserData({ userDataDir, sourceUserDir: instanceUserDir(instance.userDataName, appSupportRoot()) });
+      if (result.notice) new Notice(`VS Code Workbench: ${result.notice}`, 10000);
+      this.copy = { id: randomBytes(8).toString("hex"), settings: result.merged, keybindingsBase64: result.keybindingsBase64 };
+    } catch {
+      this.copy = null;
+      new Notice("VS Code Workbench: could not copy the instance's settings, so the editor starts without them.", 10000);
+    }
+  }
+
+  userDataCopy(): UserDataCopy | null {
+    return this.copy;
+  }
+
+  // --- SettingsHost -------------------------------------------------------
+
+  workbenchSettings(): WorkbenchSettings {
+    return readSettings(this.data_);
+  }
+
+  async updateSettings(patch: Partial<WorkbenchSettings>): Promise<void> {
+    Object.assign(this.data_, patch);
+    await this.saveData(this.data_);
+  }
+
+  scanInstances(): Promise<ScanResult> {
+    return this.instances.scan(this.workbenchSettings().customCliPath);
+  }
+
+  verifyCustomCli(input: string): Promise<CliCheck> {
+    return verifyCliPath(input);
+  }
+
+  codeCliOverride(): string | undefined {
+    return this.data_.codeCliPath || undefined;
   }
 
   /**

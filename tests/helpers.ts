@@ -39,3 +39,16 @@ export function listenersOn(port: number): number[] {
     return [];
   }
 }
+
+/** Every .ts file under a directory (recursively), as paths relative to it with `/` separators, sorted. */
+export function listTsFiles(dir: string): string[] {
+  const out: string[] = [];
+  const walk = (d: string, prefix: string) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      if (e.isDirectory()) walk(path.join(d, e.name), `${prefix}${e.name}/`);
+      else if (e.name.endsWith(".ts")) out.push(`${prefix}${e.name}`);
+    }
+  };
+  walk(dir, "");
+  return out.sort();
+}

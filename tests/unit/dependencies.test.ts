@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { REPO_ROOT, tempDir } from "../helpers";
+import { REPO_ROOT, listTsFiles, tempDir } from "../helpers";
 
 const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as Record<string, Record<string, string> | undefined>;
 const allDeps = {
@@ -91,7 +91,7 @@ describe("isNativePackage (the scanner the F9 test relies on)", () => {
 
 describe("source tree (F5)", () => {
   const srcDir = path.join(REPO_ROOT, "src");
-  const files = fs.readdirSync(srcDir).filter((f) => f.endsWith(".ts"));
+  const files = listTsFiles(srcDir);
   const sources = files.map((f) => [f, fs.readFileSync(path.join(srcDir, f), "utf8")] as const);
 
   it("imports no tracking package", () => {
