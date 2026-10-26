@@ -1,9 +1,9 @@
 /**
  * The settings this PR adds to `data.json` (G15), read field by field so a
  * corrupt, partial or missing file falls back to defaults and the settings tab
- * still opens. These values are only stored here: the exclude list and the
- * non-code drawer toggle are read by later PRs (PR-4, PR-6), the shell path by
- * the terminal drawer.
+ * still opens. The exclude list is read by the extension scan (PR-4); the
+ * non-code drawer toggle and the shell path are only stored here, for the
+ * terminal drawer (PR-6).
  */
 import * as path from "node:path";
 

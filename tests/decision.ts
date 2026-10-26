@@ -3,9 +3,11 @@ export const DECISION_FIELDS = {
   embed: ["works", "partial", "fails"],
   chrome: ["hidden", "visible"],
   hotkey_bridge: ["yes", "no"],
+  /** What a click on an extensionless file does: open a Code tab, or (the fallback) hand it to the system app. */
+  extensionless: ["intercept", "system-app"],
 } as const;
 
-export type Decision = { embed: string; chrome: string; hotkey_bridge: string };
+export type Decision = { embed: string; chrome: string; hotkey_bridge: string; extensionless: string };
 
 export function parseDecision(text: string): Decision {
   const m = /^---\n([\s\S]*?)\n---/.exec(text);

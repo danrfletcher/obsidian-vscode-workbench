@@ -67,9 +67,12 @@ function makeAppObj(root: string): MockApp {
       adapter: new FileSystemAdapter(root),
       configDir: ".obsidian",
       getAbstractFileByPath: (p: string) => (fs.existsSync(path.join(root, p)) ? new TFile(p) : null),
+      on: (name: string, cb: (...args: any[]) => void) => ({ name, cb }),
     },
     workspace: {
+      onLayoutReady: (cb: () => void) => cb(),
       getActiveFile: () => null,
+      getLeavesOfType: () => [] as WorkspaceLeaf[],
       getLeaf: () => new WorkspaceLeaf(),
       revealLeaf: async () => undefined,
       detachLeavesOfType: () => undefined,

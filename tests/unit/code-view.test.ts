@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceLeaf } from "../mocks/obsidian";
 import { CodeView, VIEW_TYPE_CODE, baseName, runInWebview, type CodeViewHost } from "../../src/code-view";
+import { LicenceDeclinedError } from "../../src/licence";
 import { BROWSER_APP_SETTINGS, buildBrowserSeedScript } from "../../src/settings";
 
 class FakeEl {
@@ -58,6 +59,9 @@ function makeView(host: Partial<CodeViewHost> = {}) {
     onServerState: () => () => undefined,
     restartServer: async () => undefined,
     userDataCopy: () => null,
+    admitFile: async () => true,
+    releaseFile: () => undefined,
+    openInSystemApp: () => undefined,
     ...host,
   };
   const view = new CodeView(new WorkspaceLeaf() as never, full);
@@ -178,6 +182,119 @@ describe("CodeView", () => {
     expect(full.trackView).toHaveBeenCalledWith(view);
     await view.onClose();
     expect(full.untrackView).toHaveBeenCalledWith(view);
+  });
+});
+
+describe("CodeView: one tab per file and the open guard", () => {
+  const leafOf = (view: CodeView) => view.leaf as unknown as WorkspaceLeaf & { detached: boolean };
+
+  it("asks the host to admit the file before it asks for the server, with nothing awaited first", async () => {
+    const order: string[] = [];
+    const { view } = makeView({
+      admitFile: async (f) => {
+        order.push(`admit ${f}`);
+        return true;
+      },
+      ensureServer: async () => {
+        order.push("server");
+        return { baseUrl: "http://127.0.0.1:5555", port: 5555, token: "tok123" };
+      },
+    });
+    const pending = view.setState({ file: "a.py" }, {} as never);
+    expect(order).toEqual(["admit a.py"]); // the claim is taken in the same tick setState is called
+    await pending;
+    expect(order).toEqual(["admit a.py", "server"]);
+  });
+
+  it("a refused file closes the tab and never loads the workbench", async () => {
+    const ensure = vi.fn();
+    const { view, el } = makeView({ admitFile: async () => false, ensureServer: ensure as never });
+    await view.setState({ file: "big.log" }, {} as never);
+    expect(leafOf(view).detached).toBe(true);
+    expect(ensure).not.toHaveBeenCalled();
+    expect(el.children).toHaveLength(0);
+    expect(view.filePath).toBe("");
+  });
+
+  it("gives the claim back on close", async () => {
+    const { view, full } = makeView({ releaseFile: vi.fn() });
+    await view.setState({ file: "a.py" }, {} as never);
+    await view.onClose();
+    expect(full.releaseFile).toHaveBeenCalledWith("a.py", view.leaf);
+  });
+
+  it("gives the old claim back when the tab moves to another file", async () => {
+    const { view, full } = makeView({ releaseFile: vi.fn() });
+    await view.setState({ file: "a.py" }, {} as never);
+    await view.setState({ file: "b.py" }, {} as never);
+    expect(full.releaseFile).toHaveBeenCalledWith("a.py", view.leaf);
+    expect(full.releaseFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("a second setState with the file the tab already shows does not reload the workbench", async () => {
+    const ensure = vi.fn(async () => ({ baseUrl: "http://127.0.0.1:5555", port: 5555, token: "tok123" }));
+    const admit = vi.fn(async () => true);
+    const { view, el } = makeView({ ensureServer: ensure, admitFile: admit });
+    await view.setState({ file: "a.py" }, {} as never);
+    const wv = el.children[0];
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(ensure).toHaveBeenCalledTimes(1);
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(el.children).toEqual([wv]); // same element, content not emptied
+    expect(wv.srcs).toHaveLength(2); // seed origin + workbench, nothing more
+    expect(leafOf(view).detached).toBe(false);
+    expect(view.filePath).toBe("a.py");
+  });
+
+  it("a second setState with the same file while the first is still loading does not start another load", async () => {
+    const ensure = vi.fn(async () => ({ baseUrl: "http://127.0.0.1:5555", port: 5555, token: "tok123" }));
+    const { view } = makeView({ ensureServer: ensure });
+    const first = view.setState({ file: "a.py" }, {} as never);
+    const second = view.setState({ file: "a.py" }, {} as never); // while admitFile is still pending
+    await Promise.all([first, second]);
+    expect(ensure).toHaveBeenCalledTimes(1);
+  });
+
+  it("a tab that went stale or crashed does reload when it is given its own file again", async () => {
+    const ensure = vi.fn(async () => ({ baseUrl: "http://127.0.0.1:5555", port: 5555, token: "tok123" }));
+    let notify: (s: "stopped-by-idle") => void = () => undefined;
+    const { view } = makeView({
+      ensureServer: ensure,
+      onServerState: ((cb: (s: "stopped-by-idle") => void) => {
+        notify = cb;
+        return () => undefined;
+      }) as never,
+    });
+    await view.onOpen();
+    await view.setState({ file: "a.py" }, {} as never);
+    notify("stopped-by-idle");
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(ensure).toHaveBeenCalledTimes(2);
+  });
+
+  it("a declined licence hands the file to the system app (a tab Obsidian opened itself)", async () => {
+    const openInSystemApp = vi.fn();
+    const { view } = makeView({
+      openInSystemApp,
+      ensureServer: async () => {
+        throw new LicenceDeclinedError();
+      },
+    });
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(openInSystemApp).toHaveBeenCalledWith("a.py");
+    expect(leafOf(view).detached).toBe(true);
+  });
+
+  it("another start failure does not open the system app", async () => {
+    const openInSystemApp = vi.fn();
+    const { view } = makeView({
+      openInSystemApp,
+      ensureServer: async () => {
+        throw new Error("boom");
+      },
+    });
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(openInSystemApp).not.toHaveBeenCalled();
   });
 });
 

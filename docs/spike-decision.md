@@ -2,6 +2,7 @@
 embed: works
 chrome: visible
 hotkey_bridge: no
+extensionless: intercept
 ---
 
 # Spike decision (PR-1)
@@ -9,7 +10,7 @@ hotkey_bridge: no
 Written by the PR-1 build. Round 3 ran the golden path in Obsidian itself (the
 container, Obsidian 1.14.5, VS Code 1.143.1 `serve-web`, Python extensions), so the rows
 that were PENDING are now filled in. Result keys above: `embed` (works | partial | fails),
-`chrome` (hidden | visible), `hotkey_bridge` (yes | no).
+`chrome` (hidden | visible), `hotkey_bridge` (yes | no), `extensionless` (intercept | system-app; added in PR-4).
 
 Overall: **embed WORKS.** A plain `<iframe>` does not work in Obsidian (see below), but the
 Code tab's `<webview>` renders the full workbench inside Obsidian's Electron, loads the
@@ -40,7 +41,7 @@ protocol and `xdotool`. Screenshots are in the round-3 evidence set (`PR-1-*.png
 | IntelliSense (GP4) | WORKS (yes), after Workspace Trust is accepted | In Obsidian, in `estimate_time.py`, typing `os.` opened the suggest widget with `abort, access, altsep, chdir, chmod, chown, chroot, CLD_CONTINUED, CLD_DUMPED, CLD_EXITED` (Pylance, not word-based; before trust it listed only `__main__, __name__, def, getcwd, if, import, main, os, print`) (`PR-1-intellisense.png`). |
 | Workspace Trust | PARTIAL | The workbench starts in Restricted Mode. `security.workspace.trust.enabled=false` in the Machine file does not change that (round 3 removes it from the file: it was ineffective, and a silent trust-off would trust whatever sits in the vault). With Python 2026.10.0 / Pylance 2026.4.1 the extensions are listed but do not activate in Restricted Mode (the extension rows show the workspace-trust icon; no `ms-python.*` activation in the extension host log) and `os.` gives only word completions. After `Workspaces: Manage Workspace Trust` and the `Trust` button, `ms-python.python` and Pylance activated and completions came from Pylance. The trust decision is stored per origin in the Code tab's browser profile; the origin includes the random port, so a new server start asks again (observed: trusted on `:40371`, Restricted Mode again on `:42321`). Left for PR-2: decide between a stable port, an automatic trust step, or telling the user. Dan to decide. |
 | Hotkey bridge into the embed | NO (confirmed) | With focus inside the workbench, Ctrl+` toggled the workbench's own panel (terminal strip 213 px high) while a capture-phase `keydown` listener on Obsidian's window recorded nothing. Electron's `<webview>` does not forward keys to the host page. Fallback per plan Q18: hotkey outside the embed plus the bottom strip. |
-| Extensionless-file click interception | NOT PROBED | Needs a running Obsidian; belongs to the PR that registers extensions. Assume best-effort. |
+| Extensionless-file click interception | NOT PROBED (built in PR-4 as best effort; the PR-4 container run records the result) | Built in PR-4: a capture-phase click listener on the file explorer rows (`.nav-file-title[data-path]`) takes over a click on a file with no usable extension (Makefile, Dockerfile, `.env`, `.gitignore`) and opens it in a Code tab. Header `extensionless: intercept` is the mode the plugin starts in; `system-app` is the fallback (the file opens in the system app with a notice, never a blank tab) and can be set by hand in `data.json` as `extensionlessMode`. Known limits, not yet confirmed in Obsidian: it only sees rows Obsidian draws, and Obsidian lists no dotfiles and, with \"Detect all file extensions\" off, no extensionless files. Unit and integration tests cover both modes with simulated clicks. |
 | node / Python versions | RECORDED | Host: Node 24.11.1, system `python3` 3.9.6. Obsidian 1.14.5 (container): Electron 43.7.7, Chromium 150.0.7871.250, Node 24.21.0; container `python3` 3.14.4 (found by the Python extension). The server brings its own Node. The plugin spawns the user's `code` CLI and needs no Node of its own. |
 | Telemetry | PARTIAL | `--disable-telemetry` is supported by `serve-web` and is passed: with no extensions the server process sent no telemetry. Extension telemetry is a different path (see "Outbound connections"): `telemetry.telemetryLevel: off` in the machine settings did NOT stop it (application-scoped, ignored there); setting it in the browser profile did. |
 | Outbound connections (F5) | PARTIAL | See the section below. Measured on the host with a loopback logging proxy for the server tree, `lsof` on the server pids and a Chrome net-log for the workbench page. |
@@ -86,6 +87,8 @@ Real `extensions.json` entries carry an absolute `location` into the instance's 
 | `chrome: visible` (now) | Ship with chrome visible (F11); skip the hidden-chrome check; keep the check that the activity bar and status bar are hidden by settings. |
 | `hotkey_bridge: yes` | Check Ctrl+` and the quick switcher with focus inside the editor. |
 | `hotkey_bridge: no` (now) | Check the hotkey and strip outside the embed only; with focus inside the editor expect the editor to keep the key. |
+| `extensionless: intercept` (now) | Click `Makefile` (and Dockerfile, `.env`, `.gitignore` where Obsidian lists them): a Code tab opens, one per file. |
+| `extensionless: system-app` | Click the same files: they open in the system app with a notice, never a blank tab; the limit is in the README. |
 
 ## Round-3 container run: what was checked
 

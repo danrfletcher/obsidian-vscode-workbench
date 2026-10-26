@@ -2,7 +2,7 @@
 
 Obsidian desktop plugin that opens every text file in a real VS Code editor (via `code serve-web`) with a VS Code-style bottom terminal drawer.
 
-Status: in development (a spike with one ribbon icon and one Code tab, plus the server lifecycle and the settings tab; see `docs/spike-decision.md`). Not submitted to the community store.
+Status: in development (a spike with one ribbon icon and one Code tab, the server lifecycle, the settings tab, and the Code tab opening every text file in the vault; see `docs/spike-decision.md`). Not submitted to the community store.
 
 ## Network use
 
@@ -12,13 +12,30 @@ The first time a Code tab opens, VS Code asks whether to trust the folder; until
 
 The ribbon icon opens the active file if Obsidian can open it itself (not Markdown, canvas or base); otherwise it opens the file named by `spikeFile` in the plugin's `data.json` (a vault-relative path, hand-edited), then the built-in spike file. Obsidian has no view for `.py`, so a code file is never the active file.
 
+## Which files open
+
+Nothing is registered by hand. When the plugin starts, and again whenever a file is created or renamed (and when the window regains focus, at most every 30 seconds, for files made outside Obsidian), it walks the vault folder on disk and registers every file extension it finds against the Code tab, in small slices so the window stays responsive. It walks the disk rather than asking Obsidian's file index because, with "Detect all file extensions" off, Obsidian does not list a `.py` or `.zig` file until its extension is registered. The registered set is written to the developer console (`VS Code Workbench: registered extensions (...)`).
+
+- **Hidden:** the contents of `.obsidian`, `.git` and `node_modules` are never scanned or opened.
+- **Open as text:** code files, dotfiles, and `svg`, `csv`, `txt` and `json`.
+- **Never in a Code tab:** Markdown, canvas and base files, and binaries (images, pdf, archives, audio, video, fonts, executables and the like). Obsidian's own views handle them, and their extensions are never passed to the registration call.
+- **Your exclude list** (settings) is never registered.
+- **A symlink loop, a broken link or an unreadable folder** is skipped with a console warning; the scan carries on. Links to folders are followed once.
+- **Size and binary guard:** a file over 2 MB (2,097,152 bytes opens, one byte more is refused), or with a null byte in its first 8 KB, is refused with a notice and opened in your system's app. A file over the limit is never read; otherwise only the first 8 KB is.
+- **Other editors:** if Code Files, VSCode Editor, Code Workbench or any other plugin already owns an extension, this plugin leaves that extension alone and shows a notice naming the owner (one notice per extension per session, listing the extensions that one owner keeps). It only reads the view registry and never changes another plugin's registration or settings. An extension Obsidian itself opens (`svg` is shown by its image viewer) is left alone without a notice. To use Code tabs for a refused extension, turn the other plugin off and reload.
+- **One tab per file:** opening a file that already has a Code tab (from the explorer, quick switcher, a link, a split or another pane, even twice in quick succession) focuses that tab instead of adding one.
+
+### Extensionless files and dotfiles
+
+Obsidian opens files by extension, so `Makefile`, `Dockerfile`, `.env` and `.gitignore` have nothing to register. As a best effort, a click on such a file's row in the file explorer is taken over and opens in a Code tab. If a Code tab cannot open, or the plugin is set to the fallback mode (`"extensionlessMode": "system-app"` in `data.json`), the file opens in your system's app with a notice, never as a blank tab. The limit: this only sees rows Obsidian draws. Obsidian never lists dotfiles, and with "Detect all file extensions" off it does not list extensionless files either, so for those there is no row to click and nothing to intercept (turn "Detect all file extensions" on to see extensionless files).
+
 ## Settings
 
 Open Settings, Community plugins, Workbench. Every time the tab opens it rescans, shows "Scanning…", then the list.
 
 - **VS Code instance.** The scan reads `/Applications` and `~/Applications` for VS Code, VS Code Insiders, VSCodium, Antigravity and Antigravity IDE. A build is classified by its bundle identifier (`Info.plist`, else `product.json`), never by its folder name, and is listed only if its command-line tool passes `serve-web --help` (exit 0, output mentions `serve-web`, 5 seconds; run directly, never through a shell). The check starts no server, opens no port and downloads nothing. The default is the newest VS Code build (stable or Insiders, by version number); a build you pick is kept, and if it later disappears or fails its check the tab says why and uses the default until you pick again (the saved choice is not rewritten). Changing the instance while a server runs does not stop it, so unsaved buffers are safe: the change applies the next time the server starts.
 - **Custom CLI path.** An absolute path to a VS Code command-line tool. Verify runs the same check; a path that passes is listed as Custom.
-- **Excluded file extensions, terminal drawer toggle, shell.** Stored here for the features that read them (the text-file rules and the terminal drawer). Extensions are entered without a dot; they are trimmed, lowercased and de-duplicated. The shell defaults to `$SHELL`, else `/bin/zsh`.
+- **Excluded file extensions, terminal drawer toggle, shell.** The exclude list is read by the extension scan (see "Which files open"); the toggle and the shell are stored here for the terminal drawer. Extensions are entered without a dot; they are trimmed, lowercased and de-duplicated. An extension added to the list is not registered at the next scan; one that is already registered stays registered until Obsidian reloads. The shell defaults to `$SHELL`, else `/bin/zsh`.
 - **Restart server.** Stops the server and starts a fresh one.
 
 A hand-edited `codeCliPath` in `data.json` still overrides the instance chosen in the tab. A corrupt or partial `data.json` falls back to the defaults field by field.

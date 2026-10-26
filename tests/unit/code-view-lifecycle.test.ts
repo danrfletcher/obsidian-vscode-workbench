@@ -72,6 +72,9 @@ function makeView() {
     },
     restartServer: restart as never,
     userDataCopy: () => null,
+    admitFile: async () => true,
+    releaseFile: () => undefined,
+    openInSystemApp: () => undefined,
   };
   const leaf = new WorkspaceLeaf();
   const view = new CodeView(leaf as never, host);

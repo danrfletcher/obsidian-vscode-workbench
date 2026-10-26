@@ -1,5 +1,7 @@
 /** The Code tab: one Obsidian tab hosting the VS Code web workbench for one file. */
 import { ItemView, type ViewStateResult, type WorkspaceLeaf } from "obsidian";
+import { LicenceDeclinedError } from "./licence";
+import { fileKey } from "./open-file";
 import { buildFileUrl } from "./paths";
 import type { RunningServer } from "./server";
 import type { ServerState } from "./server-manager";
@@ -30,6 +32,17 @@ export interface CodeViewHost {
   restartServer(): Promise<void>;
   /** The copy of the chosen instance's settings and keybindings made at the last server start, or null. */
   userDataCopy(): UserDataCopy | null;
+  /**
+   * Called synchronously, before anything is awaited, when a tab is given a file. Claims the file for
+   * `leaf` (one Code tab per file) and runs the binary and size guard. Resolves false when the tab must
+   * not show the file: another tab already shows it (that tab has been focused), or the file was refused
+   * and handed to the system app. The tab then closes itself.
+   */
+  admitFile(file: string, leaf: WorkspaceLeaf): Promise<boolean>;
+  /** The tab no longer shows `file` (closed, or moved to another file): give its claim back. */
+  releaseFile(file: string, leaf: WorkspaceLeaf): void;
+  /** Hand a file to the system's default app (the licence was declined). */
+  openInSystemApp(file: string): void;
 }
 
 /**
@@ -110,6 +123,8 @@ export class CodeView extends ItemView {
   /** The server was stopped (idle, settings restart) or failed since this tab loaded. */
   private stale = false;
   private loading = false;
+  /** setState has asked the host to admit the file and is waiting for the answer. */
+  private admitting = false;
   private domReady = false;
   /** Counts loadWorkbench calls, so a restart can tell whether the "running" event already reloaded this tab. */
   private loadCount = 0;
@@ -145,9 +160,35 @@ export class CodeView extends ItemView {
   async setState(state: unknown, result: ViewStateResult): Promise<void> {
     const file = (state as CodeViewState | null)?.file;
     if (typeof file === "string" && file) {
-      this.file = file;
-      (this.leaf as unknown as { updateHeader?: () => void }).updateHeader?.();
-      await this.loadWorkbench();
+      // Obsidian calls setState again on a tab that already shows the file (the file is clicked in the explorer,
+      // or opened from a link or the quick switcher). Reloading would restart the workbench and could drop
+      // unsaved text, so a tab that has the file loaded, or is loading it, is left alone. A crashed or stale
+      // tab falls through and reloads, which is what brings it back.
+      const alreadyShown =
+        this.file !== "" && fileKey(file) === fileKey(this.file) && !this.crashed && !this.stale && (this.admitting || this.loading || this.frame !== null);
+      if (!alreadyShown) {
+        // The claim is taken before anything is awaited, so two tabs given the same file in one tick cannot both win.
+        const admitting = this.host.admitFile(file, this.leaf);
+        // Navigate-in-place: Obsidian can also hand this tab a different file (an explorer click while a Code tab
+        // is active). The old file is released and the tab reloads with no unsaved-buffer check; PR-5's dirty
+        // guard must cover this path too, not only close, idle stop and quit.
+        if (this.file && fileKey(this.file) !== fileKey(file)) this.host.releaseFile(this.file, this.leaf);
+        this.file = file;
+        this.admitting = true;
+        let admitted: boolean;
+        try {
+          admitted = await admitting;
+        } finally {
+          this.admitting = false;
+        }
+        if (!admitted) {
+          this.file = "";
+          this.leaf.detach();
+          return;
+        }
+        (this.leaf as unknown as { updateHeader?: () => void }).updateHeader?.();
+        await this.loadWorkbench();
+      }
     }
     await super.setState(state, result);
   }
@@ -162,6 +203,7 @@ export class CodeView extends ItemView {
   }
 
   async onClose(): Promise<void> {
+    if (this.file) this.host.releaseFile(this.file, this.leaf);
     this.unsubscribe?.();
     this.unsubscribe = null;
     this.host.untrackView(this);
@@ -339,7 +381,10 @@ export class CodeView extends ItemView {
         await runInWebview(el as WebviewLike, buildBrowserSeedScript(BROWSER_APP_SETTINGS, this.host.userDataCopy()));
         if (this.frame === el) el.setAttribute("src", url);
       }
-    } catch {
+    } catch (e) {
+      // A declined licence opens the file in the system app, as the explicit open does (a tab Obsidian
+      // opened itself, from the explorer or a link, comes this way).
+      if (e instanceof LicenceDeclinedError) this.host.openInSystemApp(this.file);
       // main.ts has already shown the (token-free) reason. A tab is closed rather than left blank; only a
       // tab that was showing the crash banner (its page may hold text to copy) keeps its place and offers Restart.
       this.frame = null;

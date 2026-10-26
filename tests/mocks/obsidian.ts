@@ -29,6 +29,9 @@ export class WorkspaceLeaf {
   async setViewState(s: { type: string; state?: unknown }): Promise<void> {
     this.viewState = s;
   }
+  getViewState(): { type?: string; state?: unknown } {
+    return this.viewState ?? {};
+  }
   detach(): void {
     this.detached = true;
   }
@@ -255,12 +258,22 @@ export class ItemView {
 export type ViewStateResult = Record<string, unknown>;
 
 export interface MockApp {
-  vault: { adapter: unknown; configDir: string; getAbstractFileByPath(p: string): unknown };
+  vault: {
+    adapter: unknown;
+    configDir: string;
+    getAbstractFileByPath(p: string): unknown;
+    on(name: string, cb: (...args: any[]) => void): { name: string; cb: (...args: any[]) => void };
+  };
+  /** Obsidian's private view registry: extension to view type. Tests that exercise registration set it. */
+  viewRegistry?: { typeByExtension: Record<string, string> };
   workspace: {
+    /** Runs `cb` once every community plugin has loaded (immediately in most tests). */
+    onLayoutReady(cb: () => void): void;
     activeFile: TFile | null;
     leaves: WorkspaceLeaf[];
     getActiveFile(): TFile | null;
     getLeaf(kind: string): WorkspaceLeaf;
+    getLeavesOfType(type: string): WorkspaceLeaf[];
     revealLeaf(l: WorkspaceLeaf): Promise<void>;
     detachLeavesOfType(t: string): void;
     on(name: string, cb: (...args: any[]) => void): { name: string; cb: (...args: any[]) => void };
@@ -271,12 +284,15 @@ export class Plugin {
   static ribbon: Array<{ icon: string; title: string }> = [];
   static commands: Array<{ id: string; name: string; callback: () => void }> = [];
   static views: string[] = [];
+  /** Every successful `registerExtensions` call, in order. */
+  static registrations: Array<{ extensions: string[]; viewType: string }> = [];
   static events: Array<{ name: string; cb: (...args: any[]) => void }> = [];
   static settingTabs: unknown[] = [];
   static reset(): void {
     Plugin.ribbon = [];
     Plugin.commands = [];
     Plugin.views = [];
+    Plugin.registrations = [];
     Plugin.events = [];
     Plugin.settingTabs = [];
   }
@@ -306,7 +322,16 @@ export class Plugin {
   registerEvent(e: { name: string; cb: (...args: any[]) => void }): void {
     Plugin.events.push(e);
   }
-  registerDomEvent(el: unknown, name: string, cb: () => void): void {
-    (el as { addEventListener?: (n: string, f: () => void) => void } | null)?.addEventListener?.(name, cb);
+  registerDomEvent(el: unknown, name: string, cb: (ev: any) => void, options?: boolean | object): void {
+    (el as { addEventListener?: (n: string, f: (ev: any) => void, o?: boolean | object) => void } | null)?.addEventListener?.(name, cb, options);
+  }
+  /** Like Obsidian: an extension that already has a view type is refused with a thrown error; the view type is recorded otherwise. */
+  registerExtensions(extensions: string[], viewType: string): void {
+    const registry = this.app.viewRegistry?.typeByExtension;
+    for (const e of extensions) {
+      if (registry && e in registry) throw new Error(`Attempting to register an existing view extension "${e}"`);
+    }
+    for (const e of extensions) if (registry) registry[e] = viewType;
+    Plugin.registrations.push({ extensions: [...extensions], viewType });
   }
 }

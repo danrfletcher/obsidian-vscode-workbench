@@ -4,14 +4,14 @@ import { describe, expect, it } from "vitest";
 import { parseDecision, stopMessage } from "../decision";
 import { REPO_ROOT } from "../helpers";
 
-const ok = "---\nembed: works\nchrome: hidden\nhotkey_bridge: yes\n---\nbody";
+const ok = "---\nembed: works\nchrome: hidden\nhotkey_bridge: yes\nextensionless: intercept\n---\nbody";
 
 describe("parseDecision", () => {
-  it("reads the three fields", () => {
-    expect(parseDecision(ok)).toEqual({ embed: "works", chrome: "hidden", hotkey_bridge: "yes" });
+  it("reads the four fields", () => {
+    expect(parseDecision(ok)).toEqual({ embed: "works", chrome: "hidden", hotkey_bridge: "yes", extensionless: "intercept" });
   });
 
-  it.each(["embed", "chrome", "hotkey_bridge"])("fails when %s is missing", (field) => {
+  it.each(["embed", "chrome", "hotkey_bridge", "extensionless"])("fails when %s is missing", (field) => {
     const text = ok
       .split("\n")
       .filter((l) => !l.startsWith(`${field}:`))
@@ -30,12 +30,12 @@ describe("parseDecision", () => {
 
 describe("stopMessage", () => {
   it("says 'STOP: ask Dan' when the embed fails", () => {
-    expect(stopMessage({ embed: "fails", chrome: "visible", hotkey_bridge: "no" })).toMatch(/^STOP: ask Dan/);
+    expect(stopMessage({ embed: "fails", chrome: "visible", hotkey_bridge: "no", extensionless: "intercept" })).toMatch(/^STOP: ask Dan/);
   });
 
   it("is silent for works or partial", () => {
-    expect(stopMessage({ embed: "works", chrome: "hidden", hotkey_bridge: "yes" })).toBeNull();
-    expect(stopMessage({ embed: "partial", chrome: "visible", hotkey_bridge: "no" })).toBeNull();
+    expect(stopMessage({ embed: "works", chrome: "hidden", hotkey_bridge: "yes", extensionless: "intercept" })).toBeNull();
+    expect(stopMessage({ embed: "partial", chrome: "visible", hotkey_bridge: "no", extensionless: "system-app" })).toBeNull();
   });
 });
 

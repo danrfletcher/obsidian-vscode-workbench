@@ -1,12 +1,18 @@
-import { FileSystemAdapter, Notice, Plugin, TFile, type Tasks } from "obsidian";
+import { FileSystemAdapter, Notice, Plugin, TFile, type TAbstractFile, type Tasks, type WorkspaceLeaf } from "obsidian";
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
+import { checkFile, refusalMessage } from "./binary-guard";
 import { ChildRegistry } from "./child-registry";
+import { ownerOfExtension, type ViewRegistryLike } from "./coexistence";
 import { CodeView, VIEW_TYPE_CODE, baseName, type CodeViewHost, type EmbedElement } from "./code-view";
+import { ExtensionRegistry } from "./extension-registry";
+import { scanVault } from "./extension-scan";
+import { createClickInterceptor, readMode, type ClickLike, type ExtensionlessMode } from "./extensionless-intercept";
 import { describeFailure, type StartFailure } from "./failure-messages";
 import { IdleTimer } from "./idle-timer";
 import { LicenceDeclinedError, LicenceGate } from "./licence";
 import { promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard } from "./modals";
+import { OpenFiles } from "./open-file";
 import { PidFile, sweepOrphans } from "./pidfile";
 import {
   ServerStartError,
@@ -28,18 +34,21 @@ import { instanceUserDir, seedUserData } from "./server/user-data-seed";
 import { dataObject, readSettings, type WorkbenchSettings } from "./settings/data";
 import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
 import { writeMachineSettings, type UserDataCopy } from "./settings";
+import { decideFile, extensionOf, fileName } from "./text-file-rules";
 
 /** Spike: opened by the ribbon icon when the active file is not a code file. */
 export const SPIKE_FILE = "AWS SA Associate Mock Exams/scripts/estimate_time.py";
 
-/** Never opened in a Code tab (F6, and Obsidian's own formats). */
-const NOT_CODE = new Set(["md", "canvas", "base"]);
+/** The least time between two rescans triggered by the window regaining focus (files made outside Obsidian). */
+const FOCUS_RESCAN_MS = 30_000;
 
 interface WorkbenchData extends Partial<WorkbenchSettings> {
   /** Hand-edited; path to a `code` CLI. When set it overrides the instance chosen in the settings tab. */
   codeCliPath?: string;
   /** Hand-edited; vault-relative file the ribbon opens when no openable active file exists. */
   spikeFile?: string;
+  /** Hand-edited; what a click on an extensionless file does: "intercept" (Code tab, the default) or "system-app". */
+  extensionlessMode?: ExtensionlessMode;
   embed?: EmbedElement;
   /** The VS Code server licence was accepted (the modal at the first Code-tab open). Never holds a token. */
   serverLicenceAccepted?: boolean;
@@ -49,6 +58,12 @@ interface WorkbenchData extends Partial<WorkbenchSettings> {
 
 export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHost, SettingsHost {
   private views = new Set<CodeView>();
+  private openFiles = new OpenFiles<WorkspaceLeaf>(() => this.app.workspace.getLeavesOfType(VIEW_TYPE_CODE));
+  private extensionRegistry!: ExtensionRegistry;
+  private scan: Promise<void> | null = null;
+  private scanAgain = false;
+  private lastScanAt = 0;
+  private unloaded = false;
   private data_: WorkbenchData = {};
   private registry = new ChildRegistry(null);
   private manager!: ServerManager;
@@ -102,6 +117,15 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     }
 
     this.registerView(VIEW_TYPE_CODE, (leaf) => new CodeView(leaf, this));
+    this.extensionRegistry = new ExtensionRegistry(
+      {
+        registerExtensions: (extensions, viewType) => this.registerExtensions(extensions, viewType),
+        ownerOf: (extension) => ownerOfExtension((this.app as unknown as { viewRegistry?: ViewRegistryLike }).viewRegistry, extension),
+        notice: (message) => void new Notice(message, 10000),
+        log: (message, ...args) => console.info(message, ...args),
+      },
+      VIEW_TYPE_CODE,
+    );
     this.addRibbonIcon("code-2", "Open in VS Code", () => void this.openSpikeFile());
     this.addCommand({
       id: "open-spike-file",
@@ -142,9 +166,36 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.registerDomEvent(window, "pagehide", () => {
       void this.manager.shutdown();
     });
+
+    // Every extension found in the vault is registered against the Code tab, now and as new files appear (GP1).
+    // All of it waits for layout-ready, when every community plugin has loaded: registering earlier would take
+    // an extension before Code Files, VSCode Editor or Code Workbench had registered it, and their own
+    // registerExtensions call would then throw and abort their onload (F8). Obsidian also fires "create" once
+    // per existing file while the vault loads, which would register everything early the same way.
+    // The scan runs in the background in small slices; nothing waits for it.
+    this.app.workspace.onLayoutReady(() => {
+      if (this.unloaded) return;
+      this.registerEvent(this.app.vault.on("create", (f) => this.onFileAppeared(f)));
+      this.registerEvent(this.app.vault.on("rename", (f) => this.onFileAppeared(f)));
+      // A file made outside Obsidian (a `touch` in a terminal) is picked up when the window next gets focus.
+      this.registerDomEvent(window, "focus", () => {
+        if (Date.now() - this.lastScanAt >= FOCUS_RESCAN_MS) void this.rescanExtensions();
+      });
+      void this.rescanExtensions();
+    });
+    // Extensionless files and dotfiles: best-effort click interception on the explorer's file rows (G7).
+    const intercept = createClickInterceptor({
+      mode: () => readMode(this.data_.extensionlessMode),
+      excluded: () => this.workbenchSettings().excludeExtensions,
+      openInCodeTab: (p) => this.openCodeFile(p),
+      openInSystemApp: (p) => this.openInSystemApp(p, "extensionless"),
+      notice: (m) => void new Notice(m),
+    });
+    this.registerDomEvent(document, "click", (ev: MouseEvent) => intercept(ev as ClickLike), true);
   }
 
   onunload(): void {
+    this.unloaded = true;
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_CODE);
     this.idle?.stop();
     // shutdown() sends its kill signals synchronously; unload does not wait for the exit.
@@ -390,19 +441,125 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     await this.manager.shutdown();
   }
 
-  /** Open a file with the system's default app (the licence was declined). */
-  openInSystemApp(file: string): void {
+  /**
+   * Open a file with the system's default app: the licence was declined, the guard refused
+   * the file (its notice is already shown), or an extensionless file cannot open in a Code tab.
+   */
+  openInSystemApp(file: string, why: "licence" | "refused" | "extensionless" = "licence"): void {
     const app = this.app as unknown as { openWithDefaultApp?: (p: string) => unknown };
+    const because = why === "licence" ? "licence declined" : why === "refused" ? "file refused" : "extensionless file";
     if (typeof app.openWithDefaultApp === "function") {
       // Logged so a run can see which way the file went (the console shows it; no token is involved).
-      console.info(`VS Code Workbench: licence declined; opening ${file} in the system app.`);
+      console.info(`VS Code Workbench: ${because}; opening ${file} in the system app.`);
       Promise.resolve(app.openWithDefaultApp(file)).catch((e: unknown) => {
         console.warn(`VS Code Workbench: the system app could not open ${file}:`, e instanceof Error ? e.message : e);
         new Notice(`VS Code Workbench: could not open ${file} in your system's app.`);
       });
     } else {
-      console.info(`VS Code Workbench: licence declined; this Obsidian cannot open ${file} in the system app.`);
-      new Notice(`VS Code Workbench: open ${file} in your system's app; Code tabs are off until the licence is accepted.`);
+      console.info(`VS Code Workbench: ${because}; this Obsidian cannot open ${file} in the system app.`);
+      new Notice(
+        why === "licence"
+          ? `VS Code Workbench: open ${file} in your system's app; Code tabs are off until the licence is accepted.`
+          : `VS Code Workbench: open ${file} in your system's app.`,
+      );
+    }
+  }
+
+  // --- Which files open, one tab per file ---------------------------------
+
+  async admitFile(file: string, leaf: WorkspaceLeaf): Promise<boolean> {
+    // Synchronous up to here: the claim is taken before any await.
+    const other = this.openFiles.claim(file, leaf);
+    if (other) {
+      await this.focusLeaf(other);
+      return false;
+    }
+    const kind = decideFile(file).kind;
+    if (kind === "never" || kind === "hidden") {
+      this.openFiles.release(file, leaf);
+      console.info(`VS Code Workbench: ${file} is not opened in a Code tab (${kind}).`);
+      return false;
+    }
+    if (!(await this.fitsInCodeTab(file))) {
+      this.openFiles.release(file, leaf);
+      return false;
+    }
+    return true;
+  }
+
+  releaseFile(file: string, leaf: WorkspaceLeaf): void {
+    this.openFiles.release(file, leaf);
+  }
+
+  /** The size and binary guard (E6). A refused file gets a notice and goes to the system app. */
+  private async fitsInCodeTab(file: string): Promise<boolean> {
+    const result = await checkFile(path.join(this.vaultRoot(), file));
+    if (result.ok) return true;
+    new Notice(refusalMessage(fileName(file), result), 10000);
+    // A file that cannot be read (deleted, say, behind a restored tab) has nothing for the system app to open.
+    if (result.reason !== "unreadable") this.openInSystemApp(file, "refused");
+    return false;
+  }
+
+  private async focusLeaf(leaf: WorkspaceLeaf): Promise<void> {
+    await this.app.workspace.revealLeaf(leaf);
+    const ws = this.app.workspace as unknown as { setActiveLeaf?: (l: WorkspaceLeaf, o?: { focus: boolean }) => void };
+    ws.setActiveLeaf?.(leaf, { focus: true });
+  }
+
+  // --- Extension registration (GP1, E7, F8) -------------------------------
+
+  /**
+   * Scan the vault folder and register every extension found. Calls that arrive while a scan
+   * runs share it and trigger one more pass afterwards, so a file made mid-scan is not missed.
+   */
+  rescanExtensions(): Promise<void> {
+    if (this.scan) {
+      this.scanAgain = true;
+      return this.scan;
+    }
+    const run = async () => {
+      do {
+        this.scanAgain = false;
+        await this.scanOnce();
+      } while (this.scanAgain && !this.unloaded);
+    };
+    const p = run().finally(() => {
+      if (this.scan === p) this.scan = null;
+    });
+    this.scan = p;
+    return p;
+  }
+
+  private async scanOnce(): Promise<void> {
+    const excluded = this.workbenchSettings().excludeExtensions;
+    try {
+      const result = await scanVault(this.vaultRoot(), { excluded, isCancelled: () => this.unloaded });
+      if (this.unloaded) return;
+      const outcome = this.extensionRegistry.register(result.extensions, excluded);
+      this.lastScanAt = Date.now();
+      console.info(
+        `VS Code Workbench: scanned ${result.files} files (${result.skipped} skipped); found ${result.extensions.length} extensions: ${result.extensions.join(", ") || "none"}`,
+      );
+      console.info(`VS Code Workbench: registered extensions (${this.extensionRegistry.registered.length}): ${this.extensionRegistry.registered.join(", ")}`);
+      if (outcome.refused.length) {
+        console.info(`VS Code Workbench: left to other plugins: ${outcome.refused.map((r) => `.${r.extension} (${r.owner})`).join(", ")}`);
+      }
+    } catch (e) {
+      console.warn("VS Code Workbench: the extension scan failed:", e instanceof Error ? e.message : e);
+    }
+  }
+
+  /** A file was created or renamed: register its extension if it is new. No full scan is needed. */
+  private onFileAppeared(file: TAbstractFile): void {
+    if (!(file instanceof TFile)) return;
+    const extension = extensionOf(file.path);
+    const excluded = this.workbenchSettings().excludeExtensions;
+    if (extension === "" || this.extensionRegistry.isSettled(extension)) return;
+    if (decideFile(file.path, excluded).kind !== "extension") return;
+    const outcome = this.extensionRegistry.register([extension], excluded);
+    if (outcome.registered.length) {
+      console.info(`VS Code Workbench: registered extensions (${this.extensionRegistry.registered.length}): ${this.extensionRegistry.registered.join(", ")}`);
     }
   }
 
@@ -416,7 +573,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
    */
   private pickFile(): string | null {
     const active = this.app.workspace.getActiveFile();
-    if (active && !NOT_CODE.has(active.extension.toLowerCase())) return active.path;
+    if (active && decideFile(active.path, this.workbenchSettings().excludeExtensions).kind === "extension") return active.path;
     for (const candidate of [this.data_.spikeFile, SPIKE_FILE]) {
       if (!candidate) continue;
       const found = this.findVaultFile(candidate);
@@ -444,11 +601,26 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   }
 
   /**
-   * Open a file in a Code tab. The server (and, the first time, the licence
-   * modal) comes first: a failed start leaves no tab, and a declined licence
-   * opens the file in the system app instead.
+   * Open a file in a Code tab, or focus the one that already shows it (one tab per file; a second
+   * call while the first is still opening waits for it). The guard comes first, then the server (and,
+   * the first time, the licence modal): a refused file or a failed start leaves no tab, and a declined
+   * licence opens the file in the system app instead.
    */
   async openCodeFile(file: string): Promise<void> {
+    await this.openFiles.openOnce(
+      file,
+      () => this.createCodeTab(file),
+      (leaf) => this.focusLeaf(leaf),
+    );
+  }
+
+  private async createCodeTab(file: string): Promise<void> {
+    const kind = decideFile(file).kind;
+    if (kind === "never" || kind === "hidden") {
+      new Notice(`VS Code Workbench: ${fileName(file)} is not opened in a Code tab; Obsidian's own view handles it.`);
+      return;
+    }
+    if (!(await this.fitsInCodeTab(file))) return;
     try {
       await this.ensureServer();
     } catch (e) {

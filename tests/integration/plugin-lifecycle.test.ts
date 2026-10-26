@@ -45,11 +45,14 @@ function makeApp(root: string): typeof app {
       adapter: new FileSystemAdapter(root),
       configDir: ".obsidian",
       getAbstractFileByPath: (p: string) => (fs.existsSync(path.join(root, p)) ? new TFile(p) : null),
+      on: (name: string, cb: (...args: any[]) => void) => ({ name, cb }),
     },
     workspace: {
+      onLayoutReady: (cb: () => void) => cb(),
       activeFile: null as TFile | null,
       leaves: [] as WorkspaceLeaf[],
       getActiveFile: () => a.workspace.activeFile,
+      getLeavesOfType: () => [] as WorkspaceLeaf[],
       getLeaf: () => {
         const l = new WorkspaceLeaf();
         a.workspace.leaves.push(l);

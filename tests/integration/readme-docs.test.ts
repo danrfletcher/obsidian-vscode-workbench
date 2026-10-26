@@ -42,4 +42,20 @@ describe("README", () => {
   it("documents the probe: no server, no port, no download", () => {
     expect(section("## Settings")).toMatch(/starts no server, opens no port and downloads nothing/);
   });
+
+  it("documents which files open: the scan, the rules, the guard, coexistence, one tab per file (PR-4)", () => {
+    const text = section("## Which files open");
+    expect(text).not.toBeNull();
+    for (const needle of [".obsidian", ".git", "node_modules", "svg", "csv", "txt", "json", "Markdown", "binaries", "exclude list", "2 MB", "2,097,152", "8 KB", "Code Files", "VSCode Editor", "Code Workbench", "notice naming the owner", "One tab per file", "symlink loop"]) {
+      expect(text, needle).toContain(needle);
+    }
+  });
+
+  it("states the extensionless limit and the fallback, so there is never a silent blank tab (G7)", () => {
+    const text = section("### Extensionless files and dotfiles");
+    expect(text).not.toBeNull();
+    for (const needle of ["Makefile", "Dockerfile", ".env", "best effort", "system's app", "never as a blank tab", "Detect all file extensions", "never lists dotfiles", "system-app"]) {
+      expect(text, needle).toContain(needle);
+    }
+  });
 });
