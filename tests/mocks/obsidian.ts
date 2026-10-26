@@ -9,6 +9,9 @@ export class Notice {
   }
 }
 
+/** Obsidian's `Platform`: tests flip `isDesktopApp` to prove a feature registers on desktop only. */
+export const Platform = { isDesktopApp: true };
+
 export class TFile {
   extension: string;
   constructor(public path: string) {
@@ -282,7 +285,9 @@ export interface MockApp {
 
 export class Plugin {
   static ribbon: Array<{ icon: string; title: string }> = [];
-  static commands: Array<{ id: string; name: string; callback: () => void }> = [];
+  static commands: Array<{ id: string; name: string; callback?: () => void; checkCallback?: (checking: boolean) => boolean | void }> = [];
+  /** Every element `addStatusBarItem` made, in order (removed ones stay in the list; check `isConnected`). */
+  static statusBarItems: HTMLElement[] = [];
   static views: string[] = [];
   /** Every successful `registerExtensions` call, in order. */
   static registrations: Array<{ extensions: string[]; viewType: string }> = [];
@@ -291,6 +296,7 @@ export class Plugin {
   static reset(): void {
     Plugin.ribbon = [];
     Plugin.commands = [];
+    Plugin.statusBarItems = [];
     Plugin.views = [];
     Plugin.registrations = [];
     Plugin.events = [];
@@ -313,8 +319,22 @@ export class Plugin {
     Plugin.ribbon.push({ icon, title });
     return {} as HTMLElement;
   }
-  addCommand(c: { id: string; name: string; callback: () => void }): void {
+  addCommand(c: { id: string; name: string; callback?: () => void; checkCallback?: (checking: boolean) => boolean | void }): void {
     Plugin.commands.push(c);
+  }
+  addStatusBarItem(): HTMLElement {
+    const el = (typeof document !== "undefined" ? document.createElement("div") : { classList: { add() {} }, setAttribute() {}, remove() {}, textContent: "" }) as HTMLElement;
+    if (typeof document !== "undefined") {
+      let bar = document.querySelector(".status-bar");
+      if (!bar) {
+        bar = document.createElement("div");
+        bar.className = "status-bar";
+        document.body.appendChild(bar);
+      }
+      bar.appendChild(el);
+    }
+    Plugin.statusBarItems.push(el);
+    return el;
   }
   registerView(type: string, _creator: unknown): void {
     Plugin.views.push(type);

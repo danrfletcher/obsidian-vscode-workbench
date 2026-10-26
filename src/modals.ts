@@ -201,3 +201,16 @@ export function promptRestartWithDirty(app: App, files: string[]): Promise<boole
     dismiss: false,
   }).ask();
 }
+
+/** Killing a running terminal shell (G10). true only for an explicit Kill; Cancel, Escape and clicking away keep the shell. */
+export function promptKillShell(app: App, title: string): Promise<boolean> {
+  return new ChoiceModal<boolean>(app, {
+    title: `Kill ${title}?`,
+    lines: [`${title} is still running. Killing it ends the shell and any program running in it, and its scrollback is lost.`],
+    choices: [
+      { label: "Cancel", value: false },
+      { label: "Kill shell", value: true, warning: true },
+    ],
+    dismiss: false,
+  }).ask();
+}

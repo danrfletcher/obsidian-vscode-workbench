@@ -1,4 +1,4 @@
-import { FileSystemAdapter, ItemView, Notice, Plugin, TFile, type TAbstractFile, type Tasks, type WorkspaceLeaf } from "obsidian";
+import { FileSystemAdapter, ItemView, Notice, Platform, Plugin, TFile, type TAbstractFile, type Tasks, type WorkspaceLeaf } from "obsidian";
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import { checkFile, refusalMessage } from "./binary-guard";
@@ -12,7 +12,7 @@ import { createClickInterceptor, readMode, type ClickLike, type ExtensionlessMod
 import { describeFailure, type StartFailure } from "./failure-messages";
 import { IdleTimer } from "./idle-timer";
 import { LicenceDeclinedError, LicenceGate } from "./licence";
-import { promptCloseDirty, promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard, type CloseDirtyRequest } from "./modals";
+import { promptCloseDirty, promptKillShell, promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard, type CloseDirtyRequest } from "./modals";
 import { OpenFiles } from "./open-file";
 import { PidFile, sweepOrphans } from "./pidfile";
 import { carryEdits as carryEditsOnDisk, readBaseline as readBaselineOnDisk, statSignature as statSignatureOnDisk, type CarryResult } from "./rename-carry";
@@ -158,30 +158,44 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     });
     this.addSettingTab(new WorkbenchSettingTab(this.app, this, this));
 
-    // The terminal drawer: a strip along the bottom of the window, one shell on the first reveal. It needs
-    // neither a Code tab nor the VS Code server. The page is drawn once the workspace is ready (below).
-    this.terminal = new TerminalFeature({
-      document,
-      window,
-      vaultRoot: () => this.vaultRoot(),
-      activeFile: () => this.activeFilePath(),
-      data: () => this.data_ as Record<string, unknown>,
-      save: () => this.saveData(this.data_),
-      shell: () => effectiveShell(this.workbenchSettings()),
-      runtimeDir: () => this.runtimeDir(),
-      registry: this.registry,
-      deviceStore: {
-        get: () => this.app.loadLocalStorage?.(DEVICE_ID_KEY),
-        set: (id) => this.app.saveLocalStorage?.(DEVICE_ID_KEY, id),
-      },
-    });
-    this.addCommand({
-      id: "toggle-terminal-drawer",
-      name: "Toggle terminal drawer",
-      // Ctrl, not Mod: on macOS Mod is Cmd, and Ctrl+` is the VS Code binding. Rebindable in Obsidian's hotkey settings.
-      hotkeys: [{ modifiers: ["Ctrl"], key: "`" }],
-      callback: () => this.terminal?.toggle(),
-    });
+    // The terminal drawer: a strip along the bottom of the window, one shell on the first reveal, more from the +
+    // button. It needs neither a Code tab nor the VS Code server, and it is desktop only (F1). The page is drawn
+    // once the workspace is ready (below).
+    if (Platform.isDesktopApp) {
+      this.terminal = new TerminalFeature({
+        document,
+        window,
+        vaultRoot: () => this.vaultRoot(),
+        activeFile: () => this.activeFilePath(),
+        data: () => this.data_ as Record<string, unknown>,
+        save: () => this.saveData(this.data_),
+        shell: () => effectiveShell(this.workbenchSettings()),
+        runtimeDir: () => this.runtimeDir(),
+        registry: this.registry,
+        deviceStore: {
+          get: () => this.app.loadLocalStorage?.(DEVICE_ID_KEY),
+          set: (id) => this.app.saveLocalStorage?.(DEVICE_ID_KEY, id),
+        },
+        nonCodeDrawer: () => this.workbenchSettings().nonCodeDrawer,
+        activeViewType: () => this.mainViewType(),
+        codeViewType: VIEW_TYPE_CODE,
+        addStatusBarItem: () => this.addStatusBarItem(),
+        confirmKill: (title) => promptKillShell(this.app, title),
+      });
+      this.addCommand({
+        id: "toggle-terminal-drawer",
+        name: "Toggle terminal drawer",
+        // Ctrl, not Mod: on macOS Mod is Cmd, and Ctrl+` is the VS Code binding. Rebindable in Obsidian's hotkey settings.
+        hotkeys: [{ modifiers: ["Ctrl"], key: "`" }],
+        // Over a note, canvas, graph or PDF with the non-code setting off the command is unavailable, so the hotkey does nothing (G11).
+        checkCallback: (checking: boolean) => {
+          const terminal = this.terminal;
+          if (!terminal || !terminal.hotkeyEnabled()) return false;
+          if (!checking) terminal.toggle();
+          return true;
+        },
+      });
+    }
 
     // Theme follows Obsidian light/dark (G6): the Machine settings are rewritten and every open tab is
     // switched in place, without a reload. Rapid toggling is coalesced by ThemeSync.
@@ -195,6 +209,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     const visibilityChanged = () => {
       for (const v of this.views) v.notifyVisible();
       void this.idle.evaluate();
+      // The tab the user is on decides whether the strip and drawer show (G11); a moved pane or sidebar changes the drawer's bounds.
+      this.terminal?.applyVisibility();
+      this.terminal?.layoutChanged();
     };
     this.registerEvent(this.app.workspace.on("active-leaf-change", visibilityChanged));
     this.registerEvent(this.app.workspace.on("layout-change", visibilityChanged));
@@ -305,6 +322,12 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   }
 
   /** The file in the active view: a Code tab's file, or the file of a note or other file view; null when the view has none. */
+  /** The view type of the tab the user is on in the main area; a sidebar being focused does not change it. */
+  private mainViewType(): string {
+    const leaf = this.app.workspace.getMostRecentLeaf?.() ?? null;
+    return leaf?.view?.getViewType?.() ?? "";
+  }
+
   private activeFilePath(): string | null {
     const ws = this.app.workspace as unknown as { getActiveViewOfType?: (t: unknown) => unknown; getActiveFile(): TFile | null };
     if (typeof ws.getActiveViewOfType !== "function") return ws.getActiveFile()?.path ?? null;
@@ -535,6 +558,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   async updateSettings(patch: Partial<WorkbenchSettings>): Promise<void> {
     Object.assign(this.data_, patch);
+    this.terminal?.applyVisibility(); // the non-code setting takes effect now, with no reload
     await this.saveData(this.data_);
   }
 

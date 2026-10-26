@@ -47,7 +47,7 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-/** A drawer with a fake terminal; `states` records what it asks to be saved. */
+/** A drawer with a fake terminal; `saved` records what it asks to be saved. */
 function makeUI(initial = { height: 300, open: false }) {
   const views: FakeTerminalView[] = [];
   const saved: Array<{ height: number; open: boolean }> = [];
@@ -57,8 +57,21 @@ function makeUI(initial = { height: 300, open: false }) {
     window,
     initial,
     onChange: (s) => saved.push({ ...s }),
-    onReveal: () => events.push("reveal"),
-    onRestart: () => events.push("restart"),
+    // What the feature does on a reveal: the first one adds a session, shown at once.
+    onReveal: () => {
+      events.push("reveal");
+      if (ui.sessionIds.length === 0) {
+        ui.addSession("s1", "zsh 1");
+        ui.setActive("s1");
+      }
+    },
+    onNewSession: () => events.push("new"),
+    onKillActive: () => events.push("kill"),
+    onSelect: (id) => {
+      events.push(`select:${id}`);
+      ui.setActive(id);
+    },
+    onRestart: (id) => events.push(`restart:${id}`),
     createTerminal: () => {
       const v = new FakeTerminalView();
       views.push(v);
@@ -302,7 +315,7 @@ describe("messages in the drawer (E9, E10)", () => {
   it("shows an error as a red alert in place of the terminal, with a way to try again", () => {
     const { ui, events } = makeUI();
     strip().click();
-    ui.showError("python3 was not found on your PATH");
+    ui.showError("s1", "python3 was not found on your PATH");
     const msg = document.querySelector(".vscw-message") as HTMLElement;
     expect(msg.hidden).toBe(false);
     expect(msg.classList.contains("vscw-error")).toBe(true);
@@ -312,7 +325,7 @@ describe("messages in the drawer (E9, E10)", () => {
     const retry = document.querySelector(".vscw-restart") as HTMLButtonElement;
     expect(retry.textContent).toBe("Try again");
     retry.click();
-    expect(events).toContain("restart");
+    expect(events).toContain("restart:s1");
   });
 
   it("the error style is red from Obsidian's own error colour", () => {
@@ -323,7 +336,7 @@ describe("messages in the drawer (E9, E10)", () => {
   it("an exited shell writes an 'exited' line into the terminal and offers a restart", () => {
     const { ui, views, events } = makeUI();
     strip().click();
-    ui.showExited(0);
+    ui.showExited("s1", 0);
     expect(views[0].text()).toContain("The shell has exited (code 0).");
     const msg = document.querySelector(".vscw-message") as HTMLElement;
     expect(msg.hidden).toBe(false);
@@ -331,14 +344,14 @@ describe("messages in the drawer (E9, E10)", () => {
     const restart = document.querySelector(".vscw-restart") as HTMLButtonElement;
     expect(restart.textContent).toBe("Restart shell");
     restart.click();
-    expect(events).toContain("restart");
+    expect(events).toContain("restart:s1");
   });
 
   it("a new shell clears the message and the old screen", () => {
     const { ui, views } = makeUI();
     strip().click();
-    ui.showError("oops");
-    ui.showStarting();
+    ui.showError("s1", "oops");
+    ui.showStarting("s1");
     expect((document.querySelector(".vscw-message") as HTMLElement).hidden).toBe(true);
     expect((document.querySelector(".vscw-terminal") as HTMLElement).classList.contains("vscw-hidden")).toBe(false);
     expect(views[0].resets).toBe(1);
@@ -348,8 +361,8 @@ describe("messages in the drawer (E9, E10)", () => {
     const { ui, views } = makeUI();
     const typed: string[] = [];
     const sizes: Array<[number, number]> = [];
-    ui.onInput((d) => typed.push(d));
-    ui.onTerminalResize((c, r) => sizes.push([c, r]));
+    ui.onInput((_id, d) => typed.push(d));
+    ui.onTerminalResize((_id, c, r) => sizes.push([c, r]));
     strip().click();
     views[0].type("ls\r");
     views[0].setCells(120, 33);
@@ -377,6 +390,12 @@ interface Rig {
   feature: TerminalFeature;
   vault: string;
   id: string;
+  /** What the shell kill question is answered with, and the titles it was asked about. */
+  confirm: { answer: boolean; asked: string[] };
+  /** The view type of the main-area tab, and the non-code setting: both change live. */
+  view: { type: string };
+  setting: { nonCodeDrawer: boolean };
+  statusBar: HTMLElement[];
 }
 
 function rig(opts: { data?: Record<string, unknown>; id?: string; preflight?: () => Promise<PreflightResult>; vault?: string } = {}): Rig {
@@ -386,7 +405,7 @@ function rig(opts: { data?: Record<string, unknown>; id?: string; preflight?: ()
   const views: FakeTerminalView[] = [];
   let active: string | null = "AWS SA Associate Mock Exams/scripts/estimate_time.py";
   const id = opts.id ?? "device-aaaa-1111";
-  const r = { saves: 0 } as Rig;
+  const r = { saves: 0, confirm: { answer: true, asked: [] }, view: { type: "markdown" }, setting: { nonCodeDrawer: true }, statusBar: [] } as unknown as Rig;
   const data = opts.data ?? {};
   const host: TerminalHost = {
     document,
@@ -401,6 +420,19 @@ function rig(opts: { data?: Record<string, unknown>; id?: string; preflight?: ()
     runtimeDir: () => path.join(vault, ".server"),
     registry: new ChildRegistry(null),
     deviceStore: { get: () => id, set: () => undefined },
+    nonCodeDrawer: () => r.setting.nonCodeDrawer,
+    activeViewType: () => r.view.type,
+    codeViewType: "vscode-workbench-code",
+    addStatusBarItem: () => {
+      const el = document.createElement("div");
+      document.body.appendChild(el);
+      r.statusBar.push(el);
+      return el;
+    },
+    confirmKill: async (title) => {
+      r.confirm.asked.push(title);
+      return r.confirm.answer;
+    },
   };
   const feature = new TerminalFeature(host, {
     createTerminal: () => {
@@ -461,7 +493,7 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
     await tick();
     expect(r.world.spawned).toHaveLength(1);
     expect(r.world.signals).toEqual([]);
-    expect(r.feature.shells.liveCount).toBe(1);
+    expect(r.feature.sessions.count).toBe(1);
     expect(r.views).toHaveLength(1);
   });
 
@@ -492,7 +524,7 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
     expect(r.views[0].text()).toContain("usage: estimate_time.py");
   });
 
-  it("an exited shell shows an exited line and a restart; revealing again does not leave a dead terminal", async () => {
+  it("an exited shell shows an exited line and a restart; revealing again leaves its tab as it is and the restart control starts a new shell", async () => {
     const r = rig();
     r.feature.mount();
     strip().click();
@@ -502,10 +534,15 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
     expect(r.views[0].text()).toContain("The shell has exited (code 0).");
     expect((document.querySelector(".vscw-restart") as HTMLElement).textContent).toBe("Restart shell");
     strip().click(); // hide
-    strip().click(); // reveal again
+    strip().click(); // reveal again: the tab is still there, and no second tab appears
+    await tick();
+    expect(r.world.spawned).toHaveLength(1);
+    expect(r.feature.sessions.sessions).toHaveLength(1);
+    (document.querySelector(".vscw-restart") as HTMLElement).click();
+    await tick();
     await tick();
     expect(r.world.spawned).toHaveLength(2);
-    expect(r.feature.shells.state).toEqual({ kind: "running" });
+    expect(r.feature.sessions.sessions[0].controller.state).toEqual({ kind: "running" });
     expect((document.querySelector(".vscw-message") as HTMLElement).hidden).toBe(true);
   });
 
@@ -522,7 +559,7 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
     expect(r.world.spawned).toHaveLength(2);
   });
 
-  it("a failed check shows the exact message in red, opens the drawer anyway, and the next reveal retries", async () => {
+  it("a failed check shows the exact message in red, opens the drawer anyway, and Try again retries", async () => {
     let result: PreflightResult = { ok: false, kind: "python-missing", message: "python3 was not found on your PATH, so the terminal cannot start." };
     const r = rig({ preflight: async () => result });
     r.feature.mount();
@@ -534,9 +571,9 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
     expect(msg.textContent).toContain("python3 was not found on your PATH, so the terminal cannot start.");
     expect(r.world.spawned).toHaveLength(0);
 
-    strip().click(); // hide
     result = GOOD;
-    strip().click(); // reveal: retries
+    (document.querySelector(".vscw-restart") as HTMLElement).click(); // Try again
+    await tick();
     await tick();
     expect(r.world.spawned).toHaveLength(1);
     expect((document.querySelector(".vscw-message") as HTMLElement).hidden).toBe(true);
@@ -552,7 +589,7 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
     expect(r.world.signals).toContainEqual([pid, "SIGTERM"]);
     await done;
     expect(root()).toBeNull();
-    expect(r.feature.shells.liveCount).toBe(0);
+    expect(r.feature.sessions.sessions).toHaveLength(0);
   });
 
   it("closing the drawer does not kill the shell", async () => {
@@ -562,7 +599,7 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
     await tick();
     strip().click();
     expect(r.world.signals).toEqual([]);
-    expect(r.feature.shells.liveCount).toBe(1);
+    expect(r.feature.sessions.count).toBe(1);
   });
 
   describe("per-device state in data.json", () => {
@@ -724,7 +761,7 @@ describe("the command (G8)", () => {
 
   it("registers 'Toggle terminal drawer' with Ctrl+` as its default hotkey", async () => {
     await load();
-    const command = Plugin.commands.find((c) => c.id === "toggle-terminal-drawer") as unknown as { name: string; hotkeys: Array<{ modifiers: string[]; key: string }>; callback: () => void };
+    const command = Plugin.commands.find((c) => c.id === "toggle-terminal-drawer") as unknown as { name: string; hotkeys: Array<{ modifiers: string[]; key: string }> };
     expect(command).toBeDefined();
     expect(command.name).toBe("Toggle terminal drawer");
     expect(command.hotkeys).toEqual([{ modifiers: ["Ctrl"], key: "`" }]);
@@ -736,9 +773,11 @@ describe("the command (G8)", () => {
     expect(root().classList.contains("vscw-open")).toBe(false);
     // Opening for real would start a real shell and a real xterm: that path is covered by the rig tests above.
     const toggle = vi.spyOn(TerminalFeature.prototype, "toggle").mockImplementation(() => undefined);
-    const command = Plugin.commands.find((c) => c.id === "toggle-terminal-drawer") as unknown as { callback: () => void };
-    command.callback();
-    command.callback();
+    const command = Plugin.commands.find((c) => c.id === "toggle-terminal-drawer") as unknown as { checkCallback: (checking: boolean) => boolean };
+    expect(command.checkCallback(true)).toBe(true); // asking whether it is available does not toggle
+    expect(toggle).not.toHaveBeenCalled();
+    command.checkCallback(false);
+    command.checkCallback(false);
     expect(toggle).toHaveBeenCalledTimes(2);
     vi.restoreAllMocks();
   });

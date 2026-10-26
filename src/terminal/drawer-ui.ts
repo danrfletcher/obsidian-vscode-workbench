@@ -1,16 +1,20 @@
 /**
  * The drawer itself: a strip along the bottom edge of the window, and the drawer that
- * slides up from it (G8), a top edge to drag (G9), and the red messages for a shell
- * that could not start (E9, E10) or has ended. The terminal inside is a TerminalView
- * made by a factory, so this file needs no xterm and runs under jsdom.
+ * slides up from it (G8), a top edge to drag (G9), one tab per shell session with + and
+ * trash (G10), and the red messages for a shell that could not start (E9, E10) or has
+ * ended. Each session has its own pane and its own terminal; switching tabs only shows
+ * another pane, so no shell restarts and no scrollback is cleared. The terminal inside is
+ * a TerminalView made by a factory, so this file needs no xterm and runs under jsdom.
  *
- * Geometry is driven by two CSS variables on <body>, so the drawer's height, the room
- * left under the workspace and the lifted status bar all move together in one transition:
+ * Geometry is driven by CSS variables on <body>, so the drawer's height, the room taken
+ * from the main pane area and the lifted status bar all move together in one transition:
  *   --vscw-height       the drawer's height when open (px)
- *   --vscw-open-height  that height while open, 0px while closed
+ *   --vscw-open-height  that height while open, 0px while closed or hidden
+ * The drawer's left edge and width come from the layout controller (layout.ts).
  */
 import { clampHeight } from "./drawer-geometry";
 import type { DrawerState } from "./drawer-state";
+import type { LayoutController } from "./layout";
 
 /** What the drawer needs from a terminal emulator (xterm in the plugin, a fake in tests). */
 export interface TerminalView {
@@ -41,9 +45,17 @@ export interface DrawerOptions {
   onChange(state: DrawerState): void;
   /** The drawer was revealed: make sure there is a shell. */
   onReveal(): void;
-  /** The user asked to start the shell again (after it exited or failed). */
-  onRestart(): void;
+  /** The + button. */
+  onNewSession(): void;
+  /** The trash button: end the active session. */
+  onKillActive(): void;
+  /** A tab was clicked. */
+  onSelect(id: string): void;
+  /** The user asked to start session `id`'s shell again (after it exited or failed). */
+  onRestart(id: string): void;
   createTerminal(host: HTMLElement): TerminalView;
+  /** Takes the drawer's open height and bounds into account for the main pane area. */
+  layout?: LayoutController;
 }
 
 export const STRIP_LABEL = "Terminal";
@@ -52,24 +64,36 @@ export const STRIP_HEIGHT = 22;
 
 type Message = { kind: "error"; text: string } | { kind: "exited"; text: string } | null;
 
+/** One session's pane: its terminal, its message line and its tab. */
+interface Pane {
+  id: string;
+  tab: HTMLElement;
+  label: HTMLElement;
+  pane: HTMLElement;
+  message: HTMLElement;
+  messageText: HTMLElement;
+  restart: HTMLButtonElement;
+  host: HTMLElement;
+  view: TerminalView;
+}
+
 export class DrawerUI {
   readonly root: HTMLElement;
   private readonly strip: HTMLButtonElement;
   private readonly drawer: HTMLElement;
   private readonly handle: HTMLElement;
-  private readonly message: HTMLElement;
-  private readonly messageText: HTMLElement;
-  private readonly restartButton: HTMLButtonElement;
-  private readonly host: HTMLElement;
-  private view: TerminalView | null = null;
+  private readonly tabs: HTMLElement;
+  private readonly panes: HTMLElement;
+  private readonly panesById = new Map<string, Pane>();
+  private activeId: string | null = null;
   private height: number;
   private isOpen: boolean;
+  private isHidden = false;
   private mounted = false;
   private drag: { startY: number; startHeight: number; pointerId: number | null } | null = null;
-  private pending: { cols: number; rows: number } | null = null;
   private readonly cleanups: Array<() => void> = [];
-  private inputCb: ((data: string) => void) | null = null;
-  private resizeCb: ((cols: number, rows: number) => void) | null = null;
+  private inputCb: ((id: string, data: string) => void) | null = null;
+  private resizeCb: ((id: string, cols: number, rows: number) => void) | null = null;
 
   constructor(private readonly opts: DrawerOptions) {
     const d = opts.document;
@@ -95,34 +119,24 @@ export class DrawerUI {
 
     const header = d.createElement("div");
     header.className = "vscw-header";
-    const title = d.createElement("span");
-    title.className = "vscw-title";
-    title.textContent = STRIP_LABEL;
+    this.tabs = d.createElement("div");
+    this.tabs.className = "vscw-tabs";
+    this.tabs.setAttribute("role", "tablist");
+    this.tabs.setAttribute("aria-label", "Terminal sessions");
     const actions = d.createElement("div");
     actions.className = "vscw-actions";
-    const close = d.createElement("button");
-    close.className = "vscw-close";
-    close.type = "button";
-    close.setAttribute("aria-label", "Close terminal drawer");
+    // The + and trash icons are drawn by the stylesheet, so the buttons hold no children.
+    const add = this.button("vscw-new", "New terminal");
+    const trash = this.button("vscw-trash", "Kill terminal");
+    const close = this.button("vscw-close", "Close terminal drawer");
     close.textContent = "\u00d7";
-    actions.appendChild(close);
-    header.append(title, actions);
+    actions.append(add, trash, close);
+    header.append(this.tabs, actions);
 
-    this.message = d.createElement("div");
-    this.message.className = "vscw-message";
-    this.message.hidden = true;
-    this.messageText = d.createElement("span");
-    this.messageText.className = "vscw-message-text";
-    this.restartButton = d.createElement("button");
-    this.restartButton.className = "vscw-restart";
-    this.restartButton.type = "button";
-    this.restartButton.textContent = "Restart shell";
-    this.message.append(this.messageText, this.restartButton);
+    this.panes = d.createElement("div");
+    this.panes.className = "vscw-panes";
 
-    this.host = d.createElement("div");
-    this.host.className = "vscw-terminal";
-
-    inner.append(this.handle, header, this.message, this.host);
+    inner.append(this.handle, header, this.panes);
     this.drawer.appendChild(inner);
 
     this.strip = d.createElement("button");
@@ -135,9 +149,19 @@ export class DrawerUI {
 
     this.listen(this.strip, "click", () => this.toggle());
     this.listen(close, "click", () => this.close());
-    this.listen(this.restartButton, "click", () => opts.onRestart());
+    this.listen(add, "click", () => opts.onNewSession());
+    this.listen(trash, "click", () => opts.onKillActive());
     this.listen(this.handle, "pointerdown", (ev) => this.beginDrag(ev as PointerEvent));
     this.listen(opts.window, "resize", () => this.onWindowResize());
+  }
+
+  private button(cls: string, label: string): HTMLButtonElement {
+    const b = this.opts.document.createElement("button");
+    b.className = cls;
+    b.type = "button";
+    b.setAttribute("aria-label", label);
+    b.title = label;
+    return b;
   }
 
   // --- Mounting -----------------------------------------------------------
@@ -146,16 +170,17 @@ export class DrawerUI {
     if (this.mounted) return;
     this.mounted = true;
     parent.appendChild(this.root);
-    this.opts.document.body.classList.add("vscw-terminal-on");
     this.apply();
-    if (this.isOpen) this.reveal();
+    if (this.isOpen && !this.isHidden) this.reveal();
   }
 
   unmount(): void {
     for (const off of this.cleanups.splice(0)) off();
     this.endDrag(false);
-    this.view?.dispose();
-    this.view = null;
+    for (const p of this.panesById.values()) p.view.dispose();
+    this.panesById.clear();
+    this.activeId = null;
+    this.opts.layout?.setOpenHeight(0);
     this.root.remove();
     const body = this.opts.document.body;
     body.classList.remove("vscw-terminal-on", "vscw-terminal-open", "vscw-terminal-dragging");
@@ -169,12 +194,30 @@ export class DrawerUI {
     return this.isOpen;
   }
 
+  /** The strip and drawer are off the page (the non-code setting is off over this view). */
+  get hidden(): boolean {
+    return this.isHidden;
+  }
+
   get currentHeight(): number {
     return this.height;
   }
 
+  /** The active session's terminal; null with no sessions. */
   get terminal(): TerminalView | null {
-    return this.view;
+    return this.activeId ? (this.panesById.get(this.activeId)?.view ?? null) : null;
+  }
+
+  terminalOf(id: string): TerminalView | null {
+    return this.panesById.get(id)?.view ?? null;
+  }
+
+  get sessionIds(): string[] {
+    return [...this.panesById.keys()];
+  }
+
+  get active(): string | null {
+    return this.activeId;
   }
 
   toggle(): void {
@@ -183,7 +226,7 @@ export class DrawerUI {
   }
 
   openDrawer(): void {
-    if (this.isOpen && this.view) return;
+    if (this.isOpen && this.panesById.size > 0) return;
     this.isOpen = true;
     // The window may have shrunk while the drawer was closed.
     this.height = clampHeight(this.height, this.opts.window.innerHeight);
@@ -200,93 +243,183 @@ export class DrawerUI {
     this.changed();
   }
 
-  /** The drawer is showing: create the terminal the first time, make sure a shell exists, give it focus. */
+  /** Show or take off the whole strip and drawer. The open state, the shells and their scrollback are untouched. */
+  setHidden(hidden: boolean): void {
+    if (this.isHidden === hidden) return;
+    this.isHidden = hidden;
+    if (hidden) this.endDrag(false);
+    this.apply();
+    if (!hidden) {
+      this.refit();
+      if (this.isOpen) this.terminal?.focus();
+    }
+  }
+
+  /** The drawer is showing: make sure there is a shell, give the active one focus. */
   private reveal(): void {
-    if (!this.view) this.createView();
     this.opts.onReveal();
-    this.view?.focus();
+    this.terminal?.focus();
   }
 
-  private createView(): void {
-    const view = this.opts.createTerminal(this.host);
-    this.view = view;
-    view.onInput((data) => this.inputCb?.(data));
-    view.onResize((cols, rows) => this.resizeCb?.(cols, rows));
+  // --- Sessions -------------------------------------------------------------
+
+  /** Add a session's tab, pane and terminal. It is not shown until `setActive`. */
+  addSession(id: string, title: string): void {
+    if (this.panesById.has(id)) return;
+    const d = this.opts.document;
+    const tab = d.createElement("div");
+    tab.className = "vscw-tab";
+    tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-selected", "false");
+    tab.dataset.session = id;
+    tab.tabIndex = 0;
+    const label = d.createElement("span");
+    label.className = "vscw-tab-label";
+    label.textContent = title;
+    tab.appendChild(label);
+    this.tabs.appendChild(tab);
+
+    const pane = d.createElement("div");
+    pane.className = "vscw-pane";
+    pane.hidden = true;
+    pane.dataset.session = id;
+    const message = d.createElement("div");
+    message.className = "vscw-message";
+    message.hidden = true;
+    const messageText = d.createElement("span");
+    messageText.className = "vscw-message-text";
+    const restart = d.createElement("button");
+    restart.className = "vscw-restart";
+    restart.type = "button";
+    restart.textContent = "Restart shell";
+    message.append(messageText, restart);
+    const host = d.createElement("div");
+    host.className = "vscw-terminal";
+    pane.append(message, host);
+    this.panes.appendChild(pane);
+
+    const view = this.opts.createTerminal(host);
+    view.onInput((data) => this.inputCb?.(id, data));
+    view.onResize((cols, rows) => this.resizeCb?.(id, cols, rows));
     view.onToggleKey(() => this.toggle());
-    view.fit();
+
+    const entry: Pane = { id, tab, label, pane, message, messageText, restart, host, view };
+    this.panesById.set(id, entry);
+    tab.addEventListener("click", () => this.opts.onSelect(id));
+    tab.addEventListener("keydown", (ev) => {
+      const k = (ev as KeyboardEvent).key;
+      if (k === "Enter" || k === " ") {
+        ev.preventDefault();
+        this.opts.onSelect(id);
+      }
+    });
+    restart.addEventListener("click", () => this.opts.onRestart(id));
   }
 
-  // --- The terminal and its messages --------------------------------------
+  /** Take a session's tab, pane and terminal away. The next tab is chosen by the caller (`setActive`). */
+  removeSession(id: string): void {
+    const p = this.panesById.get(id);
+    if (!p) return;
+    this.panesById.delete(id);
+    p.view.dispose();
+    p.tab.remove();
+    p.pane.remove();
+    if (this.activeId === id) this.activeId = null;
+  }
 
-  /** Where keystrokes typed into the terminal go. */
-  onInput(cb: (data: string) => void): void {
+  /** Show session `id`'s pane (null: none). The other panes stay as they are, hidden. */
+  setActive(id: string | null): void {
+    this.activeId = id !== null && this.panesById.has(id) ? id : null;
+    for (const p of this.panesById.values()) {
+      const on = p.id === this.activeId;
+      p.pane.hidden = !on;
+      p.tab.classList.toggle("vscw-active", on);
+      p.tab.setAttribute("aria-selected", String(on));
+    }
+    if (this.activeId) {
+      this.refit();
+      if (this.isOpen && !this.isHidden) this.terminal?.focus();
+    }
+  }
+
+  /** Where keystrokes typed into any session's terminal go. */
+  onInput(cb: (id: string, data: string) => void): void {
     this.inputCb = cb;
   }
 
-  /** Where the terminal's size goes when it changes. */
-  onTerminalResize(cb: (cols: number, rows: number) => void): void {
+  /** Where a terminal's size goes when it changes. */
+  onTerminalResize(cb: (id: string, cols: number, rows: number) => void): void {
     this.resizeCb = cb;
   }
 
-  write(data: Uint8Array | string): void {
-    this.view?.write(data);
+  write(id: string, data: Uint8Array | string): void {
+    this.panesById.get(id)?.view.write(data);
   }
 
-  /** A red message in place of the terminal (a shell that cannot start). */
-  showError(text: string): void {
-    this.setMessage({ kind: "error", text });
+  /** A red message in place of the session's terminal (a shell that cannot start). */
+  showError(id: string, text: string): void {
+    this.setMessage(id, { kind: "error", text });
   }
 
   /** The shell ended: a line in the terminal, and the restart control. */
-  showExited(code: number | null): void {
+  showExited(id: string, code: number | null): void {
     const text = code === null ? "The shell has exited." : `The shell has exited (code ${code}).`;
-    this.view?.write(`\r\n\x1b[2m[${text}]\x1b[0m\r\n`);
-    this.setMessage({ kind: "exited", text });
+    this.panesById.get(id)?.view.write(`\r\n\x1b[2m[${text}]\x1b[0m\r\n`);
+    this.setMessage(id, { kind: "exited", text });
   }
 
-  /** A new shell is starting: clear the old screen and the message. */
-  showStarting(): void {
-    this.setMessage(null);
-    this.view?.reset();
+  /** A new shell is starting in the session: clear the old screen and the message. */
+  showStarting(id: string): void {
+    this.setMessage(id, null);
+    this.panesById.get(id)?.view.reset();
   }
 
-  clearMessage(): void {
-    this.setMessage(null);
+  clearMessage(id: string): void {
+    this.setMessage(id, null);
   }
 
-  private setMessage(m: Message): void {
-    this.message.hidden = m === null;
-    this.message.classList.toggle("vscw-error", m?.kind === "error");
-    this.message.classList.toggle("vscw-exited", m?.kind === "exited");
-    this.message.setAttribute("role", m?.kind === "error" ? "alert" : "status");
-    this.messageText.textContent = m?.text ?? "";
-    this.restartButton.textContent = m?.kind === "error" ? "Try again" : "Restart shell";
+  private setMessage(id: string, m: Message): void {
+    const p = this.panesById.get(id);
+    if (!p) return;
+    p.message.hidden = m === null;
+    p.message.classList.toggle("vscw-error", m?.kind === "error");
+    p.message.classList.toggle("vscw-exited", m?.kind === "exited");
+    p.message.setAttribute("role", m?.kind === "error" ? "alert" : "status");
+    p.messageText.textContent = m?.text ?? "";
+    p.restart.textContent = m?.kind === "error" ? "Try again" : "Restart shell";
+    p.tab.classList.toggle("vscw-tab-error", m?.kind === "error");
+    p.tab.classList.toggle("vscw-tab-exited", m?.kind === "exited");
     // An error replaces the terminal: no blank terminal is left behind it.
-    this.host.classList.toggle("vscw-hidden", m?.kind === "error");
-    this.refit();
+    p.host.classList.toggle("vscw-hidden", m?.kind === "error");
+    if (id === this.activeId) this.refit();
   }
 
   refreshTheme(): void {
-    this.view?.refreshTheme();
+    for (const p of this.panesById.values()) p.view.refreshTheme();
+  }
+
+  /** Fit the active terminal to its pane (the drawer's width or height changed). */
+  refit(): void {
+    if (this.isOpen && !this.isHidden) this.terminal?.fit();
   }
 
   // --- Applying the state to the page ---------------------------------------
 
   private apply(): void {
     const body = this.opts.document.body;
+    const shown = this.isOpen && !this.isHidden;
+    body.classList.toggle("vscw-terminal-on", !this.isHidden);
     body.style.setProperty("--vscw-height", `${this.height}px`);
-    body.style.setProperty("--vscw-open-height", this.isOpen ? `${this.height}px` : "0px");
+    body.style.setProperty("--vscw-open-height", shown ? `${this.height}px` : "0px");
+    this.root.hidden = this.isHidden;
     this.root.classList.toggle("vscw-open", this.isOpen);
-    body.classList.toggle("vscw-terminal-open", this.isOpen);
+    body.classList.toggle("vscw-terminal-open", shown);
     this.strip.setAttribute("aria-expanded", String(this.isOpen));
+    this.opts.layout?.setOpenHeight(shown ? this.height : 0);
   }
 
   private changed(): void {
     this.opts.onChange({ height: this.height, open: this.isOpen });
-  }
-
-  private refit(): void {
-    if (this.isOpen) this.view?.fit();
   }
 
   // --- Dragging the top edge (G9, E14) ---------------------------------------

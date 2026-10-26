@@ -1,9 +1,9 @@
 /**
- * The drawer's one shell: when it starts, what state it is in, and how it ends. The
- * first reveal starts it (G12); hiding and revealing again keep the same live shell;
- * a shell that exited, or one that could not start (E9, E10), is started afresh by the
- * next reveal or the restart control. Starting is single-flight, so two reveals in a
- * row (a double click) create exactly one shell.
+ * One shell session of the drawer: when it starts, what state it is in, and how it ends.
+ * The session manager makes one controller per tab (session-manager.ts); hiding and
+ * revealing the drawer keep the same live shell, and a shell that exited, or one that could
+ * not start (E9, E10), is started afresh by the restart control. Starting is single-flight,
+ * so two `ensure()` calls in a row create exactly one shell.
  */
 import type { PreflightResult } from "./pty-preflight";
 import { PtySession, type SessionExit, type SessionOptions } from "./pty-session";
@@ -45,7 +45,7 @@ export class ShellController {
     return this.stateValue;
   }
 
-  /** The number of live shells: 0 or 1 in this PR. */
+  /** The number of live shells this controller runs: 0 or 1. */
   get liveCount(): number {
     return this.current?.running ? 1 : 0;
   }
