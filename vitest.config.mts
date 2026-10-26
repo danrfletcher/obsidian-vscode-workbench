@@ -1,7 +1,20 @@
 import { defineConfig } from "vitest/config";
 import { fileURLToPath } from "node:url";
+import * as fs from "node:fs";
 
 export default defineConfig({
+  plugins: [
+    {
+      // The PTY helper is imported as text, as esbuild's text loader does in the real build.
+      name: "py-as-text",
+      enforce: "pre",
+      load(id) {
+        const file = id.split("?")[0];
+        if (file.endsWith(".py")) return `export default ${JSON.stringify(fs.readFileSync(file, "utf8"))};`;
+        return null;
+      },
+    },
+  ],
   resolve: {
     alias: {
       obsidian: fileURLToPath(new URL("./tests/mocks/obsidian.ts", import.meta.url)),

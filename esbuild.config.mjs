@@ -1,5 +1,6 @@
 import esbuild from "esbuild";
 import { builtinModules } from "node:module";
+import * as fs from "node:fs";
 
 const production = process.argv[2] === "production";
 
@@ -10,6 +11,7 @@ const context = await esbuild.context({
   format: "cjs",
   target: "es2022",
   platform: "node",
+  loader: { ".py": "text" },
   logLevel: "info",
   sourcemap: production ? false : "inline",
   minify: production,
@@ -23,3 +25,6 @@ if (production) {
 } else {
   await context.watch();
 }
+
+// styles.css is what Obsidian loads: xterm's own stylesheet, then the plugin's.
+fs.writeFileSync("styles.css", `${fs.readFileSync("node_modules/@xterm/xterm/css/xterm.css", "utf8")}\n${fs.readFileSync("src/styles.css", "utf8")}`);

@@ -1,0 +1,214 @@
+/* VS Code Workbench: the terminal drawer. xterm's own stylesheet comes first in styles.css (esbuild.config.mjs). */
+
+body.vscw-terminal-on {
+  --vscw-strip-height: 22px;
+  --vscw-slide: 200ms;
+  --vscw-height: 300px;
+  --vscw-open-height: 0px;
+}
+
+/* Leave room for the strip and the open drawer, and lift the status bar above them, in step with the slide. */
+body.vscw-terminal-on .app-container {
+  box-sizing: border-box;
+  padding-bottom: calc(var(--vscw-strip-height) + var(--vscw-open-height));
+  transition: padding-bottom var(--vscw-slide) ease;
+}
+
+body.vscw-terminal-on .status-bar {
+  bottom: calc(var(--vscw-strip-height) + var(--vscw-open-height));
+  transition: bottom var(--vscw-slide) ease;
+}
+
+body.vscw-terminal-on.vscw-terminal-dragging .app-container,
+body.vscw-terminal-on.vscw-terminal-dragging .status-bar {
+  transition: none;
+}
+
+.vscw-root {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: var(--layer-status-bar, 20);
+  display: flex;
+  flex-direction: column;
+  background: var(--background-primary);
+  color: var(--text-normal);
+}
+
+/* The strip: always visible, along the bottom edge of the window. */
+.vscw-strip {
+  flex: none;
+  height: var(--vscw-strip-height, 22px);
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0 var(--size-4-3, 12px);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-top: 1px solid var(--background-modifier-border);
+  border-radius: 0;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller, 12px);
+  line-height: 1;
+  text-align: left;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.vscw-strip::before {
+  content: "\25B2";
+  font-size: 8px;
+  transition: transform var(--vscw-slide, 200ms) ease;
+}
+
+.vscw-root.vscw-open .vscw-strip::before {
+  transform: rotate(180deg);
+}
+
+.vscw-strip:hover,
+.vscw-strip:focus-visible {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+/* The drawer slides by its height; its content keeps the full height, anchored to the strip, so nothing reflows mid-slide. */
+.vscw-drawer {
+  position: relative;
+  height: var(--vscw-open-height, 0px);
+  overflow: hidden;
+  visibility: hidden;
+  transition:
+    height var(--vscw-slide, 200ms) ease,
+    visibility 0s linear var(--vscw-slide, 200ms);
+}
+
+.vscw-root.vscw-open .vscw-drawer {
+  visibility: visible;
+  transition:
+    height var(--vscw-slide, 200ms) ease,
+    visibility 0s;
+}
+
+.vscw-root.vscw-dragging .vscw-drawer {
+  transition: none;
+}
+
+.vscw-drawer-inner {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: var(--vscw-height, 300px);
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+}
+
+/* The top edge you drag: a few px taller than it looks, with the vertical-resize cursor. */
+.vscw-resize-handle {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 7px;
+  z-index: 2;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.vscw-resize-handle:hover,
+.vscw-root.vscw-dragging .vscw-resize-handle {
+  background: var(--interactive-accent);
+  opacity: 0.6;
+}
+
+.vscw-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--size-4-2, 8px);
+  height: 24px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller, 12px);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.vscw-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.vscw-close {
+  margin: 0;
+  padding: 0 6px;
+  height: 20px;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.vscw-close:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+.vscw-message {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 8px var(--size-4-3, 12px);
+  color: var(--text-normal);
+  font-size: var(--font-ui-small, 13px);
+  line-height: 1.4;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.vscw-message[hidden] {
+  display: none;
+}
+
+.vscw-message-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.vscw-message button {
+  flex: none;
+}
+
+/* A red message: red text on the page background, with a red edge, in light and dark. */
+.vscw-message.vscw-error {
+  color: var(--text-error, #d1242f);
+  border-left: 3px solid var(--text-error, #d1242f);
+  font-weight: var(--font-medium, 500);
+}
+
+.vscw-terminal {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0 var(--size-4-2, 8px) var(--size-4-1, 4px);
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.vscw-terminal.vscw-hidden {
+  display: none;
+}
+
+.vscw-terminal .xterm,
+.vscw-terminal .xterm-viewport {
+  height: 100%;
+}

@@ -1,4 +1,4 @@
-import { FileSystemAdapter, Notice, Plugin, TFile, type TAbstractFile, type Tasks, type WorkspaceLeaf } from "obsidian";
+import { FileSystemAdapter, ItemView, Notice, Plugin, TFile, type TAbstractFile, type Tasks, type WorkspaceLeaf } from "obsidian";
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import { checkFile, refusalMessage } from "./binary-guard";
@@ -33,9 +33,11 @@ import { verifyCliPath, type CliCheck } from "./instances/probe";
 import { appSupportRoot, describeCustom, type Instance, type ScanResult } from "./instances/scan";
 import { InstanceService } from "./instances/service";
 import { instanceUserDir, seedUserData } from "./server/user-data-seed";
-import { dataObject, readSettings, type WorkbenchSettings } from "./settings/data";
+import { dataObject, effectiveShell, readSettings, type WorkbenchSettings } from "./settings/data";
 import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
 import { workbenchOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
+import { DEVICE_ID_KEY } from "./terminal/drawer-state";
+import { TerminalFeature } from "./terminal/feature";
 import { TabRegistry } from "./tab-registry";
 import { decideFile, extensionOf, fileName, opensInCodeTab } from "./text-file-rules";
 import { isDarkBody, themeSwitchMessage, ThemeSync } from "./theme-map";
@@ -59,6 +61,8 @@ interface WorkbenchData extends Partial<WorkbenchSettings> {
   serverLicenceAccepted?: boolean;
   /** The last server build that started: lets an offline re-download after a VS Code update name the change. */
   lastServer?: { commit: string; version: string };
+  /** The terminal drawer's height and open state, per device: `{ [deviceId]: { height, open } }`. */
+  drawer?: unknown;
 }
 
 export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHost, SettingsHost {
@@ -93,6 +97,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private lastBuild: CodeBuild | null = null;
   /** The instance's settings and keybindings as copied at the last server start; the Code tab seeds its browser profile from it. */
   private copy: UserDataCopy | null = null;
+  private terminal: TerminalFeature | null = null;
   private instances = new InstanceService();
   private cachedBefore: ReadonlySet<string> = new Set();
   /** Tests only: replaces the reachability check that turns a failed download into "the network is unreachable". */
@@ -153,9 +158,39 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     });
     this.addSettingTab(new WorkbenchSettingTab(this.app, this, this));
 
+    // The terminal drawer: a strip along the bottom of the window, one shell on the first reveal. It needs
+    // neither a Code tab nor the VS Code server. The page is drawn once the workspace is ready (below).
+    this.terminal = new TerminalFeature({
+      document,
+      window,
+      vaultRoot: () => this.vaultRoot(),
+      activeFile: () => this.activeFilePath(),
+      data: () => this.data_ as Record<string, unknown>,
+      save: () => this.saveData(this.data_),
+      shell: () => effectiveShell(this.workbenchSettings()),
+      runtimeDir: () => this.runtimeDir(),
+      registry: this.registry,
+      deviceStore: {
+        get: () => this.app.loadLocalStorage?.(DEVICE_ID_KEY),
+        set: (id) => this.app.saveLocalStorage?.(DEVICE_ID_KEY, id),
+      },
+    });
+    this.addCommand({
+      id: "toggle-terminal-drawer",
+      name: "Toggle terminal drawer",
+      // Ctrl, not Mod: on macOS Mod is Cmd, and Ctrl+` is the VS Code binding. Rebindable in Obsidian's hotkey settings.
+      hotkeys: [{ modifiers: ["Ctrl"], key: "`" }],
+      callback: () => this.terminal?.toggle(),
+    });
+
     // Theme follows Obsidian light/dark (G6): the Machine settings are rewritten and every open tab is
     // switched in place, without a reload. Rapid toggling is coalesced by ThemeSync.
-    this.registerEvent(this.app.workspace.on("css-change", () => void this.themeSync.set(this.isDark())));
+    this.registerEvent(
+      this.app.workspace.on("css-change", () => {
+        void this.themeSync.set(this.isDark());
+        this.terminal?.themeChanged();
+      }),
+    );
     // A tab shown, hidden or closed changes what the idle clock sees; a tab left behind by an idle stop wakes the server.
     const visibilityChanged = () => {
       for (const v of this.views) v.notifyVisible();
@@ -188,6 +223,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     // The scan runs in the background in small slices; nothing waits for it.
     this.app.workspace.onLayoutReady(() => {
       if (this.unloaded) return;
+      this.terminal?.mount();
       this.registerEvent(this.app.vault.on("create", (f) => this.onFileAppeared(f)));
       this.registerEvent(this.app.vault.on("rename", (f) => this.onFileAppeared(f)));
       // Open Code tabs follow the vault (G3): a rename or move re-points the tab, a delete closes it. A modify is
@@ -232,6 +268,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.restoreCreates = null;
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_CODE);
     this.idle?.stop();
+    // The drawer's shell and its helper go too; the kill signals are sent before this returns.
+    void this.terminal?.dispose();
     // shutdown() sends its kill signals synchronously; unload does not wait for the exit.
     void this.manager?.shutdown();
   }
@@ -264,6 +302,16 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   onServerState(cb: (state: ServerState) => void): () => void {
     return this.manager.onChange((state) => cb(state));
+  }
+
+  /** The file in the active view: a Code tab's file, or the file of a note or other file view; null when the view has none. */
+  private activeFilePath(): string | null {
+    const ws = this.app.workspace as unknown as { getActiveViewOfType?: (t: unknown) => unknown; getActiveFile(): TFile | null };
+    if (typeof ws.getActiveViewOfType !== "function") return ws.getActiveFile()?.path ?? null;
+    const view = ws.getActiveViewOfType(ItemView);
+    if (view instanceof CodeView) return view.filePath;
+    const file = (view as { file?: { path?: unknown } | null } | null)?.file;
+    return typeof file?.path === "string" ? file.path : null;
   }
 
   private isDark(): boolean {

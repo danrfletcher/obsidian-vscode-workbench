@@ -3,3 +3,4 @@ main.js
 coverage/
 data.json
 .server/
+/styles.css
