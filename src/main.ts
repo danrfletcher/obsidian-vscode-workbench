@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import { checkFile, refusalMessage } from "./binary-guard";
 import { ChildRegistry } from "./child-registry";
+import { AUTO_SAVE_KEY, autoSaveMode, withAutoSaveDefault, type AutoSave } from "./dirty-guard";
 import { ownerOfExtension, type ViewRegistryLike } from "./coexistence";
 import { CodeView, VIEW_TYPE_CODE, baseName, type CodeViewHost, type EmbedElement } from "./code-view";
 import { ExtensionRegistry } from "./extension-registry";
@@ -11,9 +12,10 @@ import { createClickInterceptor, readMode, type ClickLike, type ExtensionlessMod
 import { describeFailure, type StartFailure } from "./failure-messages";
 import { IdleTimer } from "./idle-timer";
 import { LicenceDeclinedError, LicenceGate } from "./licence";
-import { promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard } from "./modals";
+import { promptCloseDirty, promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard, type CloseDirtyRequest } from "./modals";
 import { OpenFiles } from "./open-file";
 import { PidFile, sweepOrphans } from "./pidfile";
+import { carryEdits as carryEditsOnDisk, readBaseline as readBaselineOnDisk, statSignature as statSignatureOnDisk, type CarryResult } from "./rename-carry";
 import {
   ServerStartError,
   StartCancelledError,
@@ -33,8 +35,11 @@ import { InstanceService } from "./instances/service";
 import { instanceUserDir, seedUserData } from "./server/user-data-seed";
 import { dataObject, readSettings, type WorkbenchSettings } from "./settings/data";
 import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
-import { writeMachineSettings, type UserDataCopy } from "./settings";
-import { decideFile, extensionOf, fileName } from "./text-file-rules";
+import { workbenchOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
+import { TabRegistry } from "./tab-registry";
+import { decideFile, extensionOf, fileName, opensInCodeTab } from "./text-file-rules";
+import { isDarkBody, themeSwitchMessage, ThemeSync } from "./theme-map";
+import { trackObsidianCreates, trackObsidianDeletes, VaultSync } from "./vault-sync";
 
 /** Spike: opened by the ribbon icon when the active file is not a code file. */
 export const SPIKE_FILE = "AWS SA Associate Mock Exams/scripts/estimate_time.py";
@@ -59,6 +64,20 @@ interface WorkbenchData extends Partial<WorkbenchSettings> {
 export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHost, SettingsHost {
   private views = new Set<CodeView>();
   private openFiles = new OpenFiles<WorkspaceLeaf>(() => this.app.workspace.getLeavesOfType(VIEW_TYPE_CODE));
+  private tabRegistry = new TabRegistry<WorkspaceLeaf>(this.openFiles);
+  private vaultSync = new VaultSync<WorkspaceLeaf>({
+    registry: this.tabRegistry,
+    tabFor: (leaf) => [...this.views].find((v) => v.leaf === leaf),
+    eligible: (p) => opensInCodeTab(p, this.workbenchSettings().excludeExtensions),
+  });
+  private restoreDeletes: (() => void) | null = null;
+  private restoreCreates: (() => void) | null = null;
+  /** Follows Obsidian's light/dark: rewrites the Machine settings and switches the open tabs in place. */
+  private themeSync = new ThemeSync((dark) => this.applyTheme(dark), false);
+  /** The quit flow has decided to stop the server: closing tabs no longer asks (the quit prompt already did). */
+  private quitting = false;
+  /** Unsaved-changes prompts for tab closes run one after another ("close all" with several dirty files). */
+  private promptChain: Promise<unknown> = Promise.resolve();
   private extensionRegistry!: ExtensionRegistry;
   private scan: Promise<void> | null = null;
   private scanAgain = false;
@@ -134,15 +153,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     });
     this.addSettingTab(new WorkbenchSettingTab(this.app, this, this));
 
-    // Theme follows Obsidian light/dark: rewrite the machine settings and reload open tabs.
-    this.registerEvent(
-      this.app.workspace.on("css-change", () => {
-        const server = this.manager.serverInstance;
-        if (this.manager.state !== "running" || !server) return;
-        writeMachineSettings(server.serverDataDir, { dark: this.isDark() });
-        for (const v of this.views) v.reload();
-      }),
-    );
+    // Theme follows Obsidian light/dark (G6): the Machine settings are rewritten and every open tab is
+    // switched in place, without a reload. Rapid toggling is coalesced by ThemeSync.
+    this.registerEvent(this.app.workspace.on("css-change", () => void this.themeSync.set(this.isDark())));
     // A tab shown, hidden or closed changes what the idle clock sees; a tab left behind by an idle stop wakes the server.
     const visibilityChanged = () => {
       for (const v of this.views) v.notifyVisible();
@@ -177,6 +190,23 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       if (this.unloaded) return;
       this.registerEvent(this.app.vault.on("create", (f) => this.onFileAppeared(f)));
       this.registerEvent(this.app.vault.on("rename", (f) => this.onFileAppeared(f)));
+      // Open Code tabs follow the vault (G3): a rename or move re-points the tab, a delete closes it. A modify is
+      // deliberately not handled: an external change is left to VS Code (G4); the plugin adds no prompt and never touches the buffer.
+      this.registerEvent(
+        this.app.vault.on("rename", (f: TAbstractFile, oldPath: string) => {
+          if (typeof oldPath !== "string" || typeof f?.path !== "string") return;
+          this.vaultSync.onRename(f.path, oldPath);
+          // Something renamed onto the old path of a renamed file with unsaved edits: that path is no longer the tab's.
+          this.pathTaken(f.path);
+        }),
+      );
+      this.registerEvent(
+        this.app.vault.on("delete", (f: TAbstractFile) => {
+          if (typeof f?.path === "string") void this.vaultSync.onDelete(f.path);
+        }),
+      );
+      this.restoreDeletes = trackObsidianDeletes(this.app as never, this.vaultSync);
+      this.restoreCreates = trackObsidianCreates(this.app as never, (p) => this.pathTaken(p));
       // A file made outside Obsidian (a `touch` in a terminal) is picked up when the window next gets focus.
       this.registerDomEvent(window, "focus", () => {
         if (Date.now() - this.lastScanAt >= FOCUS_RESCAN_MS) void this.rescanExtensions();
@@ -196,6 +226,10 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   onunload(): void {
     this.unloaded = true;
+    this.restoreDeletes?.();
+    this.restoreDeletes = null;
+    this.restoreCreates?.();
+    this.restoreCreates = null;
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_CODE);
     this.idle?.stop();
     // shutdown() sends its kill signals synchronously; unload does not wait for the exit.
@@ -233,7 +267,80 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   }
 
   private isDark(): boolean {
-    return document.body.classList.contains("theme-dark");
+    return isDarkBody(document.body.classList);
+  }
+
+  /** Obsidian's theme changed to `dark`: write the Machine settings (the next load reads them) and switch every open tab in place. */
+  private async applyTheme(dark: boolean): Promise<void> {
+    const server = this.manager.serverInstance;
+    if (this.manager.state === "running" && server) writeMachineSettings(server.serverDataDir, { dark });
+    const message = themeSwitchMessage(dark);
+    await Promise.all([...this.views].map((v) => v.switchTheme(message)));
+  }
+
+  workbenchOverlay(): Record<string, unknown> {
+    return workbenchOverlay({ dark: this.isDark() });
+  }
+
+  autoSave(): AutoSave {
+    return autoSaveMode(this.copy?.settings[AUTO_SAVE_KEY]);
+  }
+
+  skipCloseGuard(): boolean {
+    return this.quitting || this.unloaded;
+  }
+
+  confirmClose(request: CloseDirtyRequest): Promise<"save" | "discard" | "cancel"> {
+    const ask = () => promptCloseDirty(this.app, request);
+    const p = this.promptChain.then(ask, ask);
+    this.promptChain = p.catch(() => undefined);
+    return p;
+  }
+
+  focusTab(leaf: WorkspaceLeaf): Promise<void> {
+    return this.focusLeaf(leaf);
+  }
+
+  openInNewTab(file: string): void {
+    void this.openCodeFile(file);
+  }
+
+  readBaseline(file: string): Promise<Buffer | null> {
+    return readBaselineOnDisk(this.vaultRoot(), file);
+  }
+
+  statSignature(file: string): Promise<string | null> {
+    return statSignatureOnDisk(this.vaultRoot(), file);
+  }
+
+  /** Another file took `path` (Obsidian created or renamed one there, or a tab opened it): the Code tabs renamed away from it stop carrying. */
+  private pathTaken(path: string, except?: WorkspaceLeaf): void {
+    for (const v of this.views) if (v.leaf !== except) v.pathTaken(path);
+  }
+
+  editsNotMoved(from: string, to: string): void {
+    new Notice(
+      `VS Code Workbench: ${baseName(to)} was renamed while it had unsaved edits, and ${from} holds a file the plugin cannot tie to this tab's save. Nothing was moved or overwritten: anything you saved from this tab is in ${from}, so copy it out from there.`,
+      15000,
+    );
+  }
+
+  /** Edits of a renamed file were saved to its old path: move them into the renamed file. Tells the user when it could not. */
+  async carryEdits(from: string, to: string, baseline: Buffer | null): Promise<CarryResult> {
+    let result: CarryResult;
+    try {
+      result = await carryEditsOnDisk(this.vaultRoot(), from, to, baseline);
+    } catch (e) {
+      console.warn("VS Code Workbench: could not move saved edits to the renamed file:", e instanceof Error ? e.message : e);
+      result = "conflict";
+    }
+    if (result === "conflict") {
+      new Notice(
+        `VS Code Workbench: ${baseName(to)} was renamed while it had unsaved edits, and it changed since. Your edits were saved to ${from}; nothing was overwritten.`,
+        15000,
+      );
+    }
+    return result;
   }
 
   /** The plugin-owned runtime dir: token file, server data, CLI data, pidfile. */
@@ -339,6 +446,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       downloadHostReachable: this.downloadHostReachable,
     });
     writeMachineSettings(server.serverDataDir, { dark: this.isDark() });
+    this.themeSync.markApplied(this.isDark());
     this.seedUserData(server.userDataDir, chosen);
     return server;
   }
@@ -359,7 +467,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     try {
       const result = seedUserData({ userDataDir, sourceUserDir: instanceUserDir(instance.userDataName, appSupportRoot()) });
       if (result.notice) new Notice(`VS Code Workbench: ${result.notice}`, 10000);
-      this.copy = { id: randomBytes(8).toString("hex"), settings: result.merged, keybindingsBase64: result.keybindingsBase64 };
+      // files.autoSave is written out: the web workbench defaults to afterDelay, the desktop to off (G2).
+      this.copy = { id: randomBytes(8).toString("hex"), settings: withAutoSaveDefault(result.merged), keybindingsBase64: result.keybindingsBase64 };
     } catch {
       this.copy = null;
       new Notice("VS Code Workbench: could not copy the instance's settings, so the editor starts without them.", 10000);
@@ -432,12 +541,21 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     while (dirty.length) {
       const names = dirty.map((v) => baseName(v.filePath));
       const choice = firstAsk ? await promptSaveOrDiscard(this.app, names) : await promptSaveFailed(this.app, names);
-      if (choice === "discard") break;
+      // No Cancel here (a deviation from E13's "Cancel aborts the stop"): this is one of Obsidian's quit tasks and
+      // Obsidian closes the window once the tasks finish, so a Cancel would not stop the quit; it would destroy the
+      // unsaved buffers and stop the server through `pagehide`. The prompt offers only Save and Discard.
+      if (choice === "discard") {
+        for (const v of dirty) v.abandonRename(); // given up: nothing at a renamed file's old path is moved
+        break;
+      }
       firstAsk = false;
       await Promise.all(dirty.map((v) => v.saveBuffers()));
       // Ask the tabs again rather than trust the save's answer: whatever is still dirty is never dropped silently.
       dirty = await this.dirtyViews();
     }
+    // A rename of a file with edits saved from its tab (Cmd+S, auto-save, the Save above) left them in the old path.
+    await Promise.all([...this.views].map((v) => v.settleRename()));
+    this.quitting = true;
     await this.manager.shutdown();
   }
 
@@ -474,6 +592,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       await this.focusLeaf(other);
       return false;
     }
+    this.pathTaken(file, leaf); // another tab now shows a file at a path a renamed tab's edits would be carried from
     const kind = decideFile(file).kind;
     if (kind === "never" || kind === "hidden") {
       this.openFiles.release(file, leaf);

@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --coverage",
     "check:render": "node tests/render/run.mjs",
-    "check:user-data": "node tests/render/user-data-check.mjs"
+    "check:user-data": "node tests/render/user-data-check.mjs",
+    "check:workbench": "node tests/render/workbench-check.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

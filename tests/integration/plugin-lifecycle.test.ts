@@ -100,6 +100,15 @@ function fakeView(o: { file?: string; visible?: boolean; dirty?: boolean; saves?
       return o.saves !== false;
     },
     notifyVisible: () => undefined,
+    settled: 0,
+    abandoned: 0,
+    settleRename: async () => {
+      v.settled++;
+    },
+    abandonRename: () => {
+      v.abandoned++;
+    },
+    pathTaken: () => undefined,
     reload: () => undefined,
   };
   plugin.trackView(v as never);
@@ -431,6 +440,46 @@ describe("quit", () => {
     expect(v.saved).toBe(1);
   });
 
+  it("the quit prompt has no Cancel: only Save and Discard, because Obsidian closes the window after the quit tasks whatever they answer (E13 deviation)", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    await plugin.openSpikeFile();
+    const v = fakeView({ dirty: true });
+    const quitting = quit();
+    await onModal(() => {
+      expect(lastModal().contentEl.buttons().map((b) => b.text).sort()).toEqual(["Discard changes", "Save"]);
+      press("Save");
+    });
+    await quitting;
+    expect(v.saved).toBe(1);
+    expect(v.abandoned).toBe(0);
+    expect(inner().manager.state).toBe("stopped");
+  });
+
+  it("the \"could not save\" prompt has no Cancel either: only Retry and Discard", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    await plugin.openSpikeFile();
+    const v = fakeView({ file: "untitled.py", dirty: true, saves: false });
+    const quitting = quit();
+    await onModal(() => press("Save"));
+    await onModal(() => {
+      expect(lastModal().contentEl.buttons().map((b) => b.text).sort()).toEqual(["Discard changes", "Retry"]);
+      v.dirty = false;
+      press("Retry");
+    });
+    await quitting;
+    expect(inner().manager.state).toBe("stopped");
+  });
+
+  it("the quit settles every tab's renamed-file edits before the server is stopped", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    await plugin.openSpikeFile();
+    const clean = fakeView({ file: "clean.py" });
+    const other = fakeView({ file: "other.py" });
+    await quit();
+    expect([clean.settled, other.settled]).toEqual([1, 1]);
+    expect(inner().manager.state).toBe("stopped");
+  });
+
   it("Discard quits without saving", async () => {
     await load({}, { serverLicenceAccepted: true });
     await plugin.openSpikeFile();
@@ -439,6 +488,7 @@ describe("quit", () => {
     await onModal(() => press("Discard changes"));
     await quitting;
     expect(v.saved).toBe(0);
+    expect(v.abandoned).toBe(1); // a discarded tab moves nothing out of a renamed file's old path (R6)
     expect(inner().manager.state).toBe("stopped");
   });
 

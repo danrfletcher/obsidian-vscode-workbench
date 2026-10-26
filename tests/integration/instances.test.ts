@@ -459,7 +459,8 @@ describe("the copy of the instance's settings (G16, G17)", () => {
     expect(plugin.userDataCopy()).toBeNull(); // nothing before a server has started
     await plugin.openSpikeFile();
     const copy = plugin.userDataCopy()!;
-    expect(copy.settings).toEqual(JSON.parse(read("settings.json")));
+    // The plugin-owned copy on disk, plus files.autoSave written out ("off", the desktop default, since the instance sets none).
+    expect(copy.settings).toEqual({ ...JSON.parse(read("settings.json")), "files.autoSave": "off" });
     expect(copy.settings).toMatchObject({ "editor.fontSize": 15 });
     expect(Buffer.from(copy.keybindingsBase64!, "base64").toString("utf8")).toBe(KEYS);
     const firstId = copy.id;
@@ -601,5 +602,83 @@ describe("extensions of other instances are never combined (F3)", () => {
         .join("\n");
       expect(code, f).not.toMatch(/extensions/i);
     }
+  });
+});
+
+describe("chrome settings and theme switching write nothing to another instance (F3, G5, G6)", () => {
+  const oldHome = process.env.HOME;
+  afterEach(() => {
+    process.env.HOME = oldHome;
+  });
+
+  it("settings.json, keybindings.json and the extension folders of both instances hash the same before and after start, ten theme toggles in a second, light again and a restart", async () => {
+    const home = tempDir();
+    process.env.HOME = home;
+    for (const [dir, ext] of [
+      [".ext-a", "alpha.one-1.0.0"],
+      [".ext-b", "beta.two-2.0.0"],
+    ]) {
+      fs.mkdirSync(path.join(home, dir, "extensions", ext), { recursive: true });
+      fs.writeFileSync(path.join(home, dir, "extensions", ext, "package.json"), "{}");
+    }
+    servingApp(STABLE, "com.microsoft.VSCode", "1.143.1", "code", ".ext-a", "Code");
+    servingApp(INSIDERS, "com.microsoft.VSCodeInsiders", "1.144.0-insider", "code", ".ext-b", "Code - Insiders");
+    // Both instances carry the very settings the plugin writes, with other values: a write would change them.
+    for (const name of ["Code", "Code - Insiders"]) {
+      const u = userDir(name);
+      fs.writeFileSync(path.join(u, "settings.json"), '{"workbench.colorTheme": "Solarized Dark", "workbench.activityBar.location": "default", "workbench.statusBar.visible": true}\n');
+      fs.writeFileSync(path.join(u, "keybindings.json"), '[{ "key": "cmd+k", "command": "noop" }]\n');
+    }
+    const guarded = [support, apps, path.join(home, ".ext-a"), path.join(home, ".ext-b")];
+    for (const d of guarded) makeReadOnly(d); // any write, rename, delete or chmod in them would fail
+    const before = guarded.map(treeDigest);
+
+    let dark = false;
+    vi.stubGlobal("document", { body: { classList: { contains: (c: string) => c === "theme-dark" && dark } } });
+    const told: boolean[] = [];
+    try {
+      await load();
+      await plugin.openSpikeFile();
+      plugin.trackView({ switchTheme: async (m: { dark: boolean }) => void told.push(m.dark), isVisible: () => true, isDirty: async () => false } as never);
+      const machine = () => JSON.parse(fs.readFileSync(path.join(inner().manager.serverInstance!.serverDataDir, "data", "Machine", "settings.json"), "utf8")) as Record<string, unknown>;
+      expect(machine()["workbench.colorTheme"]).toBe("Light Modern");
+      expect(machine()["workbench.statusBar.visible"]).toBe(false);
+      const cssChange = Plugin.events.filter((e) => e.name === "css-change");
+      expect(cssChange).toHaveLength(1);
+      for (let i = 0; i < 10; i++) {
+        dark = i % 2 === 1; // light, dark, ..., dark: ends dark
+        cssChange[0].cb();
+      }
+      await vi.waitFor(() => expect(machine()["workbench.colorTheme"]).toBe("Dark Modern"), { timeout: 3000 });
+      dark = false;
+      cssChange[0].cb();
+      await vi.waitFor(() => expect(machine()["workbench.colorTheme"]).toBe("Light Modern"), { timeout: 3000 });
+      expect(told.at(-1)).toBe(false);
+      await plugin.restartServer();
+      expect(machine()["workbench.activityBar.location"]).toBe("hidden");
+      expect(guarded.map(treeDigest)).toEqual(before);
+    } finally {
+      for (const d of guarded) makeWritable(d);
+    }
+  });
+
+  it("a corrupt or missing chrome-settings file in the user-data dir is rewritten at the next start, and the tab still opens", async () => {
+    bothMicrosoft();
+    await load();
+    await plugin.openSpikeFile();
+    const file = () => path.join(inner().manager.serverInstance!.serverDataDir, "data", "Machine", "settings.json");
+    const first = fs.readFileSync(file(), "utf8");
+    expect(JSON.parse(first)["workbench.activityBar.location"]).toBe("hidden");
+
+    fs.writeFileSync(file(), '{ "workbench.activityBar.location": "vis'); // cut off mid-write
+    await plugin.restartServer();
+    expect(inner().manager.state).toBe("running");
+    expect(fs.readFileSync(file(), "utf8")).toBe(first);
+
+    fs.rmSync(file());
+    await plugin.restartServer();
+    expect(inner().manager.state).toBe("running");
+    expect(fs.readFileSync(file(), "utf8")).toBe(first);
+    expect(serverPids().length).toBeGreaterThan(0);
   });
 });

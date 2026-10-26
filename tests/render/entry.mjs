@@ -1,10 +1,11 @@
 /**
- * Runs in the browser page. Shows one offline scenario with the plugin's own code (the real ChoiceModal and
- * promptReuseBuild; the Notice text is passed in from describeFailure), then measures the rendered DOM and
+ * Runs in the browser page. Shows one scenario with the plugin's own code (the real ChoiceModal and its
+ * prompts: promptReuseBuild, and the unsaved-changes prompts of the Code tabs; the Notice text is passed in
+ * from describeFailure), then measures the rendered DOM and
  * writes the result as JSON into <pre id="result">.
  */
 import { Notice } from "./obsidian-shim.mjs";
-import { promptReuseBuild } from "../../src/modals";
+import { promptReuseBuild, promptCloseDirty, promptSaveOrDiscard, promptSaveFailed, promptRestartWithDirty } from "../../src/modals";
 
 const TOL = 0.5;
 
@@ -58,6 +59,24 @@ function measure(root, label) {
   return { label, box: fmt(box), textLines: lines, ok: problems.length === 0, problems };
 }
 
+/** Open the prompt a scenario names, with the plugin's own modal code. */
+function openPrompt(sc) {
+  switch (sc.prompt ?? "reuse-build") {
+    case "reuse-build":
+      return promptReuseBuild({}, sc.change);
+    case "close-dirty":
+      return promptCloseDirty({}, sc.request);
+    case "quit-save-or-discard":
+      return promptSaveOrDiscard({}, sc.files);
+    case "quit-save-failed":
+      return promptSaveFailed({}, sc.files);
+    case "restart-with-dirty":
+      return promptRestartWithDirty({}, sc.files);
+    default:
+      throw new Error(`unknown prompt ${sc.prompt}`);
+  }
+}
+
 async function run(scenario) {
   const out = { scenario, window: `${window.innerWidth}x${window.innerHeight}`, results: [] };
   if (scenario.kind === "notice") {
@@ -65,7 +84,7 @@ async function run(scenario) {
     out.results.push(measure(document.querySelector(".notice"), "notice"));
     out.results.push(measure(document.querySelector(".notice-container"), "notice-container"));
   } else {
-    const answer = promptReuseBuild({}, scenario.change);
+    const answer = openPrompt(scenario);
     void answer;
     out.results.push(measure(document.querySelector(".modal"), "modal"));
     const buttons = [...document.querySelectorAll(".modal button")].map((b) => b.textContent);

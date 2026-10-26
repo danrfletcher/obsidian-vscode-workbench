@@ -2,8 +2,8 @@
  * Render check for the offline notices (checklist C38, "readable and not clipped").
  *
  * Not part of `npm test`: it needs Obsidian.app (for its own app.css) and Google Chrome. It builds the two
- * offline failure Notices (describeFailure) and the "use the last downloaded server" modal (promptReuseBuild)
- * into the DOM Obsidian builds, applies Obsidian's real app.css, loads each in headless Chrome at several
+ * offline failure Notices (describeFailure), the "use the last downloaded server" modal (promptReuseBuild) and
+ * the unsaved-changes prompts of the Code tabs (close, quit, restart; checklist C32) into the DOM Obsidian builds, applies Obsidian's real app.css, loads each in headless Chrome at several
  * window sizes in light and dark themes, and measures every text line against the window and against each
  * clipping ancestor. It exits 1 if anything is cut off or outside the window, and writes a screenshot of
  * each case.
@@ -86,6 +86,15 @@ const scenarios = [
   { name: "first-run-notice", kind: "notice", message: firstRun.message },
   { name: "redownload-notice", kind: "notice", message: redownload.message },
   { name: "reuse-offer-modal", kind: "modal", change: redownload.versionChange },
+  // The unsaved-changes prompts of the Code tabs (G2, E13, GP7 checkpoint 2), each with a long file name or
+  // list so the text has to wrap.
+  { name: "close-dirty-modal", kind: "modal", prompt: "close-dirty", request: { file: "estimate_time.py", state: "dirty" } },
+  { name: "close-dirty-long-name-modal", kind: "modal", prompt: "close-dirty", request: { file: "scripts/a_very_long_directory_name/with/several/levels/and_a_rather_long_file_name_for_the_editor.py", state: "dirty" } },
+  { name: "close-dirty-retry-modal", kind: "modal", prompt: "close-dirty", request: { file: "estimate_time.py", state: "dirty", failed: true } },
+  { name: "close-unreadable-modal", kind: "modal", prompt: "close-dirty", request: { file: "estimate_time.py", state: "unreadable" } },
+  { name: "quit-save-or-discard-modal", kind: "modal", prompt: "quit-save-or-discard", files: ["a.py", "b.ts", "Makefile", "scripts/estimate_time.py", "notes/ünï.ts", "seventh.rs"] },
+  { name: "quit-save-failed-modal", kind: "modal", prompt: "quit-save-failed", files: ["Untitled-1", "scripts/estimate_time.py"] },
+  { name: "restart-with-dirty-modal", kind: "modal", prompt: "restart-with-dirty", files: ["a.py", "scripts/estimate_time.py"] },
 ];
 const windows = [
   [1280, 800],

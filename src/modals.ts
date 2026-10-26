@@ -36,8 +36,11 @@ export class ChoiceModal<T> extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: this.o.title });
-    for (const line of this.o.lines) contentEl.createEl("p", { text: line });
+    // A file name has no spaces to break at, so a long one (the unsaved-changes prompts name the file in the
+    // title and the text) would run past the modal's edge; let it break anywhere instead.
+    const title = contentEl.createEl("h2", { text: this.o.title });
+    title.style.overflowWrap = "anywhere";
+    for (const line of this.o.lines) contentEl.createEl("p", { text: line }).style.overflowWrap = "anywhere";
     const row = contentEl.createDiv({ cls: "modal-button-container" });
     for (const c of this.o.choices) {
       const cls = c.cta ? "mod-cta" : c.warning ? "mod-warning" : undefined;
@@ -105,7 +108,11 @@ export function promptReuseBuild(app: App, change: { from: string; to: string })
   }).ask();
 }
 
-/** Quit with unsaved Code buffers. Escape saves: it never discards. */
+/**
+ * Quit with unsaved Code buffers. Save or Discard; Escape saves: it never discards. There is no Cancel:
+ * this prompt runs as one of Obsidian's quit tasks, and Obsidian closes the window once the tasks finish,
+ * so a Cancel could not stop the quit and would only drop the unsaved edits with the window.
+ */
 export function promptSaveOrDiscard(app: App, files: string[]): Promise<"save" | "discard"> {
   const list = files.length <= 5 ? files.join(", ") : `${files.slice(0, 5).join(", ")} and ${files.length - 5} more`;
   return new ChoiceModal<"save" | "discard">(app, {
@@ -119,20 +126,64 @@ export function promptSaveOrDiscard(app: App, files: string[]): Promise<"save" |
   }).ask();
 }
 
-/** Quit: some buffers were still unsaved after the save. Escape retries: it never discards. */
+/** Quit: some buffers were still unsaved after the save. Retry or Discard; Escape retries: it never discards. No Cancel, as above. */
 export function promptSaveFailed(app: App, files: string[]): Promise<"retry" | "discard"> {
   const list = files.length <= 5 ? files.join(", ") : `${files.slice(0, 5).join(", ")} and ${files.length - 5} more`;
   return new ChoiceModal<"retry" | "discard">(app, {
     title: "Some changes could not be saved",
     lines: [
-      `${list} ${files.length === 1 ? "is" : "are"} still unsaved. A new file without a name has to be saved from its tab first.`,
-      "Obsidian is not quitting yet. Retry saving, or discard these changes?",
+      `${list} ${files.length === 1 ? "is" : "are"} still unsaved. A new file without a name cannot be saved from here.`,
+      "Obsidian is quitting. Retry saving, or discard these changes?",
     ],
     choices: [
       { label: "Discard changes", value: "discard", warning: true },
       { label: "Retry", value: "retry", cta: true },
     ],
     dismiss: "retry",
+  }).ask();
+}
+
+export interface CloseDirtyRequest {
+  /** The file name shown in the prompt. */
+  file: string;
+  /** "dirty": the editor reports unsaved changes. "unreadable": the editor could not be asked. */
+  state: "dirty" | "unreadable";
+  /** A save was tried and the editor still holds unsaved changes. */
+  failed?: boolean;
+}
+
+/**
+ * Closing a Code tab whose editor holds unsaved changes (G2, E13). Cancel keeps the tab open; Escape and
+ * clicking away are Cancel, so they never discard. An editor that could not be asked is not offered Save
+ * (there is nothing to press it in); it can be closed anyway or kept.
+ */
+export function promptCloseDirty(app: App, req: CloseDirtyRequest): Promise<"save" | "discard" | "cancel"> {
+  let lines: string[];
+  let choices: Array<Choice<"save" | "discard" | "cancel">>;
+  if (req.state === "unreadable") {
+    lines = [
+      `The editor for ${req.file} is not ready, so Obsidian cannot tell whether it has unsaved changes.`,
+      "Close the tab anyway (unsaved changes would be lost), or keep it open?",
+    ];
+    choices = [
+      { label: "Keep open", value: "cancel" },
+      { label: "Close anyway", value: "discard", warning: true },
+    ];
+  } else {
+    lines = req.failed
+      ? [`${req.file} is still unsaved. A new file without a name has to be saved from its tab first.`, "Retry saving, discard the changes, or keep the tab open?"]
+      : [`${req.file} has unsaved changes. Save them before closing, discard them, or keep the tab open?`];
+    choices = [
+      { label: "Cancel", value: "cancel" },
+      { label: "Discard changes", value: "discard", warning: true },
+      { label: req.failed ? "Retry" : "Save", value: "save", cta: true },
+    ];
+  }
+  return new ChoiceModal<"save" | "discard" | "cancel">(app, {
+    title: req.state === "unreadable" ? "Close this Code tab?" : `Unsaved changes in ${req.file}`,
+    lines,
+    choices,
+    dismiss: "cancel",
   }).ask();
 }
 

@@ -18,14 +18,13 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { excludeGlobs, EXCLUDE_SETTING_KEYS } from "./server/user-data-seed";
+import { chromeSettings } from "./chrome-settings";
+import { excludeGlobs, EXCLUDE_SETTING_KEYS, writeAtomic } from "./server/user-data-seed";
+import { themeSettings } from "./theme-map";
+import { WORKBENCH_DB_NAME, WORKBENCH_DB_VERSION, WORKBENCH_SETTINGS_KEY, WORKBENCH_USERDATA_STORE } from "./workbench-db";
 
-// VS Code 1.143 names its built-in themes "Dark Modern" / "Light Modern". The older
-// "Default Dark Modern" / "Default Light Modern" ids are not recognised for light: the
-// workbench rewrites the Machine file back to "Dark Modern" when it loads (seen in the
-// Obsidian container run, PR-1 round 3).
-export const DARK_THEME = "Dark Modern";
-export const LIGHT_THEME = "Light Modern";
+// The theme ids (Dark Modern / Light Modern) live in ./theme-map.
+export { DARK_THEME, LIGHT_THEME } from "./theme-map";
 
 /**
  * Application-scoped switches that turn off extension auto-update, update checks,
@@ -42,16 +41,20 @@ export const BROWSER_APP_SETTINGS: Readonly<Record<string, unknown>> = {
   "update.showReleaseNotes": false,
 };
 
+/**
+ * The plugin's own theme and chrome settings (G5, G6). They are written to the Machine file at every server
+ * start and also laid over the browser profile's user settings on every load (`buildBrowserSeedScript`), so
+ * a `workbench.colorTheme` or layout setting copied from the chosen instance cannot override them.
+ */
+export function workbenchOverlay(opts: { dark: boolean }): Record<string, unknown> {
+  return { ...themeSettings(opts.dark), ...chromeSettings() };
+}
+
 export function buildMachineSettings(opts: { dark: boolean }): Record<string, unknown> {
   return {
-    // Theme follows Obsidian light/dark (applied at server start and on reload).
-    "workbench.colorTheme": opts.dark ? DARK_THEME : LIGHT_THEME,
-    // Chrome hiding: only the parts that have a settings switch.
-    "workbench.activityBar.location": "hidden",
-    "workbench.statusBar.visible": false,
-    "window.commandCenter": false,
-    "workbench.layoutControl.enabled": false,
-    "workbench.secondarySideBar.defaultVisibility": "hidden",
+    // Theme follows Obsidian light/dark (applied at server start; a running tab is switched live), and the
+    // chrome-hiding settings (src/chrome-settings.ts: only the parts that have a settings switch).
+    ...workbenchOverlay(opts),
     // Quiet start: no welcome page. Workspace Trust is left on: the one-time "Trust" click
     // is stored in the Code tab's browser profile (see docs/spike-decision.md).
     // `security.workspace.trust.enabled` was removed here: it has no effect from the
@@ -64,15 +67,34 @@ export function buildMachineSettings(opts: { dark: boolean }): Record<string, un
   };
 }
 
+/**
+ * Write the Machine settings file, regenerating it whole every time: whatever was there before (missing,
+ * corrupt, a folder where the file belongs) is replaced, so the output is the same bytes on every call. A
+ * write that cannot be done is logged and skipped, never thrown: the tab still opens, with the workbench's
+ * own defaults (F11). Only ever writes inside the plugin's own server data dir (F3).
+ */
 export function writeMachineSettings(serverDataDir: string, opts: { dark: boolean }): string {
   const file = path.join(serverDataDir, "data", "Machine", "settings.json");
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(buildMachineSettings(opts), null, 2));
+  const text = JSON.stringify(buildMachineSettings(opts), null, 2);
+  const attempt = () => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeAtomic(file, text);
+  };
+  try {
+    attempt();
+  } catch {
+    try {
+      fs.rmSync(file, { recursive: true, force: true }); // a corrupt or misplaced entry in the plugin's own folder
+      attempt();
+    } catch (e) {
+      console.warn("VS Code Workbench: could not write the workbench settings; the editor opens with its defaults:", e instanceof Error ? e.message : e);
+    }
+  }
   return file;
 }
 
 /** IndexedDB names the web workbench uses for its browser-side user data (VS Code 1.14x). */
-export const WORKBENCH_DB = { name: "vscode-web-db", version: 3, store: "vscode-userdata-store", settingsKey: "/User/settings.json" };
+export const WORKBENCH_DB = { name: WORKBENCH_DB_NAME, version: WORKBENCH_DB_VERSION, store: WORKBENCH_USERDATA_STORE, settingsKey: WORKBENCH_SETTINGS_KEY };
 
 /** The copy of the chosen instance's own settings and keybindings, for the browser profile. */
 export interface UserDataCopy {

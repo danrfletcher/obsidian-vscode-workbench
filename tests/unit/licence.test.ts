@@ -7,7 +7,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Modal } from "../mocks/obsidian";
 import { LicenceGate, SERVER_LICENCE_URL, type LicenceStore } from "../../src/licence";
-import { ChoiceModal, promptLicence } from "../../src/modals";
+import { ChoiceModal, promptCloseDirty, promptLicence } from "../../src/modals";
 
 /** A store backed by a JSON string, as data.json is: what is saved is read back by a "new" session. */
 function diskStore(disk: { json: string }): LicenceStore & { writes: number } {
@@ -156,5 +156,14 @@ describe("ChoiceModal", () => {
     const r = m.ask();
     (m as unknown as { close(): void }).close();
     await expect(r).resolves.toBe("save");
+  });
+
+  it("lets the title and the text break anywhere, so a long file name stays inside the modal (C32)", () => {
+    void promptCloseDirty(app, { file: "a_very_long_file_name_with_no_spaces_at_all.py", state: "dirty" });
+    const nodes = lastModal().contentEl.all();
+    const text = nodes.filter((n) => n.tag === "h2" || n.tag === "p");
+    expect(text.map((n) => n.tag)).toEqual(["h2", "p"]);
+    expect(text[0].text).toContain("a_very_long_file_name_with_no_spaces_at_all.py");
+    for (const n of text) expect(n.style.overflowWrap).toBe("anywhere");
   });
 });

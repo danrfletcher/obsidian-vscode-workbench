@@ -31,8 +31,14 @@ function stateFile(leaf: LeafLike): string | null {
   }
 }
 
+/** One claim: the tab and the path it was given (the path as the vault spells it). */
+export interface Claim<L> {
+  path: string;
+  leaf: L;
+}
+
 export class OpenFiles<L extends LeafLike> {
-  private readonly claims = new Map<string, L>();
+  private readonly claims = new Map<string, Claim<L>>();
   private readonly pending = new Map<string, Promise<void>>();
 
   /** @param codeLeaves every leaf that holds, or is about to hold, a Code tab (including ones not loaded yet) */
@@ -45,20 +51,45 @@ export class OpenFiles<L extends LeafLike> {
   claim(file: string, leaf: L): L | null {
     const other = this.existing(file, leaf);
     if (other) return other;
-    this.claims.set(fileKey(file), leaf);
+    this.claims.set(fileKey(file), { path: file, leaf });
     return null;
+  }
+
+  /** Every claim, in the order they were taken. */
+  entries(): Claim<L>[] {
+    return [...this.claims.values()];
+  }
+
+  /**
+   * The tab that showed `from` now shows `to`: the claim moves with it, in one step, so there is no moment
+   * when either path is unclaimed. False (nothing changes) when `leaf` does not hold `from`, or another
+   * tab already holds `to` (one tab per file).
+   */
+  move(from: string, to: string, leaf: L): boolean {
+    const fromKey = fileKey(from);
+    const toKey = fileKey(to);
+    if (this.claims.get(fromKey)?.leaf !== leaf) return false;
+    if (fromKey === toKey) {
+      this.claims.set(toKey, { path: to, leaf });
+      return true;
+    }
+    const other = this.claims.get(toKey);
+    if (other && other.leaf !== leaf) return false;
+    this.claims.delete(fromKey);
+    this.claims.set(toKey, { path: to, leaf });
+    return true;
   }
 
   /** Give a claim back (the tab closed, or moved to another file). A claim held by another leaf is left alone. */
   release(file: string, leaf: L): void {
     const key = fileKey(file);
-    if (this.claims.get(key) === leaf) this.claims.delete(key);
+    if (this.claims.get(key)?.leaf === leaf) this.claims.delete(key);
   }
 
   /** The leaf already showing `file`, other than `except`, or null. */
   existing(file: string, except?: L): L | null {
     const key = fileKey(file);
-    const claimed = this.claims.get(key);
+    const claimed = this.claims.get(key)?.leaf;
     if (claimed && claimed !== except) return claimed;
     for (const leaf of this.codeLeaves()) {
       if (leaf === except) continue;
