@@ -15,6 +15,7 @@ import { LayoutController } from "./layout";
 import { SessionManager, type SessionEvent } from "./session-manager";
 import { ShellCountItem } from "./shell-count";
 import { DRAWER_KEY, deviceId, readDrawerState, withDrawerState, type DeviceIdStore, type DrawerState } from "./drawer-state";
+import type { ShellProgress } from "../hotkey/drawer-toggle";
 import { installHelper } from "./helper-source";
 import { preflight as realPreflight, type PreflightResult } from "./pty-preflight";
 import { PtySession, realSessionDeps, type SessionDeps, type SessionOptions } from "./pty-session";
@@ -45,6 +46,8 @@ export interface TerminalHost {
   codeViewType: string;
   /** A new status-bar element (Obsidian's `addStatusBarItem`). */
   addStatusBarItem(): HTMLElement;
+  /** Give keyboard focus back to the editor of the active view (the drawer closed with focus in the terminal, GP5e). */
+  focusEditor?(): void;
   /** Ask whether to kill the running shell named `title`. true only for an explicit confirm; Cancel and Escape are false. */
   confirmKill(title: string): Promise<boolean>;
 }
@@ -135,6 +138,9 @@ export class TerminalFeature {
       onKillActive: () => this.killActive(),
       onSelect: (sessionId) => this.manager.activate(sessionId),
       onRestart: (sessionId) => void this.manager.restart(sessionId),
+      onClosed: (hadFocus) => {
+        if (hadFocus) this.host.focusEditor?.();
+      },
       createTerminal: this.overrides.createTerminal ?? createXtermView,
     });
     ui.onInput((sessionId, data) => this.manager.get(sessionId)?.controller.write(data));
@@ -153,6 +159,20 @@ export class TerminalFeature {
       nonCodeDrawer: this.host.nonCodeDrawer(),
       drawerOpen: this.ui?.open ?? false,
     });
+  }
+
+  /** The drawer is open (what was last asked for, shown or not). */
+  get isOpen(): boolean {
+    return this.ui?.open ?? false;
+  }
+
+  /** How far the active shell is, for the hotkey toggle's state (hotkey/drawer-toggle.ts). */
+  shellProgress(): ShellProgress {
+    const id = this.manager.activeId;
+    const kind = id ? this.manager.get(id)?.controller.state.kind : undefined;
+    if (!kind) return "none";
+    if (kind === "idle" || kind === "starting") return "starting";
+    return kind === "running" ? "running" : "ended";
   }
 
   /** The reveal command and its hotkey work over the current view. */

@@ -78,6 +78,7 @@ function world(opts: { autoSave?: "on" | "off"; answers?: Array<"save" | "discar
   const prompts: CloseDirtyRequest[] = [];
   const answers = [...(opts.answers ?? [])];
   const focused: WorkspaceLeaf[] = [];
+  const newTabs: string[] = [];
   const carried: Array<{ from: string; to: string; result: CarryResult }> = [];
   const notMoved: Array<{ from: string; to: string }> = [];
   const root = opts.root;
@@ -100,6 +101,7 @@ function world(opts: { autoSave?: "on" | "off"; answers?: Array<"save" | "discar
       return answers.shift() ?? "cancel";
     },
     focusTab: (l) => void focused.push(l),
+    openInNewTab: (f) => void newTabs.push(f),
     editsNotMoved: (from, to) => void notMoved.push({ from, to }),
     // The real on-disk move (src/rename-carry.ts) against the temp vault, recording what it decided.
     ...(root
@@ -133,7 +135,7 @@ function world(opts: { autoSave?: "on" | "off"; answers?: Array<"save" | "discar
   const taken = (p: string) => {
     for (const v of views.values()) v.pathTaken(p);
   };
-  return { openTab, open, registry, sync, prompts, focused, leaves, carried, notMoved, taken };
+  return { openTab, open, registry, sync, prompts, focused, newTabs, leaves, carried, notMoved, taken };
 }
 
 beforeEach(() => {
@@ -283,6 +285,65 @@ describe("closing a Code tab with unsaved edits (G2, E13)", () => {
     t.leaf.detach(); // the original again: no prompt, no hold
     expect(t.leaf.detached).toBe(true);
     expect(w.prompts).toEqual([]);
+  });
+});
+
+describe("a file chosen in the quick switcher while this Code tab is active (G1, C23)", () => {
+  it("a clean tab goes to the chosen file in place: no prompt, the old claim moves, no extra tab", async () => {
+    const w = world();
+    const t = await w.openTab("a.py");
+    await t.view.setState({ file: "b.py" }, {} as never);
+    expect(w.prompts).toEqual([]);
+    expect(w.newTabs).toEqual([]);
+    expect(w.open.entries().map((c) => c.path)).toEqual(["b.py"]);
+  });
+
+  it("a dirty tab asks once, and on Cancel keeps its file and its unsaved text while the chosen file opens in a new tab", async () => {
+    const w = world({ answers: ["cancel"] });
+    const t = await w.openTab("a.py");
+    t.embed().dirty = true;
+    await t.view.setState({ file: "b.py" }, {} as never);
+    expect(w.prompts).toEqual([{ file: "a.py", state: "dirty", failed: false }]);
+    expect(w.newTabs).toEqual(["b.py"]);
+    expect(t.view.filePath).toBe("a.py");
+    expect(w.open.entries().map((c) => c.path)).toEqual(["a.py"]);
+    expect(t.embed().dirty).toBe(true); // the buffer is untouched
+    expect(t.embed().keys).toBe(0); // nothing pressed, nothing saved
+    expect(t.leaf.detached).toBe(false);
+  });
+
+  it("Save writes the buffer before the tab moves on; Discard is the user's own choice and moves on without saving", async () => {
+    const saved = world({ answers: ["save"] });
+    const a = await saved.openTab("a.py");
+    const before = a.embed(); // the page the tab had before it moved on
+    before.dirty = true;
+    await a.view.setState({ file: "b.py" }, {} as never);
+    expect(saved.prompts).toHaveLength(1);
+    expect(before.keys).toBeGreaterThan(0);
+    expect(before.dirty).toBe(false);
+    expect(saved.newTabs).toEqual([]);
+    expect(a.view.filePath).toBe("b.py");
+
+    const discarded = world({ answers: ["discard"] });
+    const d = await discarded.openTab("a.py");
+    const old = d.embed();
+    old.dirty = true;
+    await d.view.setState({ file: "b.py" }, {} as never);
+    expect(discarded.prompts).toHaveLength(1);
+    expect(old.keys).toBe(0);
+    expect(discarded.newTabs).toEqual([]);
+    expect(d.view.filePath).toBe("b.py");
+  });
+
+  it("choosing the file the dirty tab already shows asks nothing and leaves the buffer alone", async () => {
+    const w = world();
+    const t = await w.openTab("a.py");
+    t.embed().dirty = true;
+    await t.view.setState({ file: "a.py" }, {} as never);
+    expect(w.prompts).toEqual([]);
+    expect(w.newTabs).toEqual([]);
+    expect(t.embed().dirty).toBe(true);
+    expect(t.embed().keys).toBe(0);
   });
 });
 

@@ -56,6 +56,11 @@ export interface CodeViewHost {
   focusTab?(leaf: WorkspaceLeaf): void | Promise<void>;
   /** The plugin's own theme and chrome settings for this load, laid over the browser profile's user settings (G5, G6). */
   workbenchOverlay?(): Record<string, unknown>;
+  /**
+   * A tab made its embed (webview or iframe): let the hotkey bridge watch it. Returns the function that stops watching,
+   * called when the embed is replaced or the tab closes. Absent (or a no-op) when the bridge is off.
+   */
+  attachEmbed?(frame: HTMLElement): () => void;
   /** True while Obsidian is quitting or the plugin is unloading: tabs then close without asking (quit asks once for all of them). */
   skipCloseGuard?(): boolean;
   /** Open a file in a new Code tab (the file a tab was asked to navigate to while its own unsaved edits were kept). */
@@ -209,6 +214,8 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
   /** setState has asked the host to admit the file and is waiting for the answer. */
   private admitting = false;
   private domReady = false;
+  /** Stops the hotkey bridge watching the current embed. */
+  private detachBridge: (() => void) | null = null;
   /** Counts loadWorkbench calls, so a restart can tell whether the "running" event already reloaded this tab. */
   private loadCount = 0;
   /** The file the embed was last pointed at. Differs from `file` after a rename that has not been applied to the embed yet. */
@@ -327,6 +334,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     this.unsubscribe?.();
     this.unsubscribe = null;
     this.host.untrackView(this);
+    this.dropBridge();
     this.frame?.remove();
     this.frame = null;
     // Any way of closing ends here (saved, auto-saved, closed without asking at quit): edits saved to the old path
@@ -375,10 +383,22 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
 
   /** Close this tab: its server is gone and could not be brought back. The reason is already in a Notice. */
   private closeDeadTab(): void {
+    this.dropBridge();
     this.frame?.remove();
     this.frame = null;
     this.stale = false;
     this.detachNow();
+  }
+
+  private dropBridge(): void {
+    const off = this.detachBridge;
+    this.detachBridge = null;
+    off?.();
+  }
+
+  /** Give keyboard focus to the embedded editor (after the terminal drawer closes, GP5e). */
+  focusEmbed(): void {
+    (this.frame as HTMLElement | null)?.focus?.();
   }
 
   /** Reload the embedded workbench (used after a theme change). */
@@ -585,6 +605,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     this.crashed = false;
     this.stale = false;
     this.domReady = false;
+    this.dropBridge();
     this.contentEl.empty();
     this.frame = null;
     this.banner = null;
@@ -613,6 +634,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
       el.setAttribute("src", isWebview ? `${server.baseUrl}/` : url);
       this.contentEl.appendChild(el);
       this.frame = el;
+      this.detachBridge = this.host.attachEmbed?.(el) ?? null;
       if (isWebview) {
         await runInWebview(
           el as WebviewLike,

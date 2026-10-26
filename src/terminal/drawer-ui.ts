@@ -54,6 +54,8 @@ export interface DrawerOptions {
   /** The user asked to start session `id`'s shell again (after it exited or failed). */
   onRestart(id: string): void;
   createTerminal(host: HTMLElement): TerminalView;
+  /** The drawer closed. `hadFocus` is true when keyboard focus was inside it (the terminal), so the caller can hand it back to the editor (GP5e). */
+  onClosed?(hadFocus: boolean): void;
   /** Takes the drawer's open height and bounds into account for the main pane area. */
   layout?: LayoutController;
 }
@@ -237,10 +239,13 @@ export class DrawerUI {
 
   close(): void {
     if (!this.isOpen) return;
+    const active = this.opts.document.activeElement;
+    const hadFocus = !!active && this.root.contains(active);
     this.isOpen = false;
     this.endDrag(false);
     this.apply();
     this.changed();
+    this.opts.onClosed?.(hadFocus);
   }
 
   /** Show or take off the whole strip and drawer. The open state, the shells and their scrollback are untouched. */

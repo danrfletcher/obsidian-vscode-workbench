@@ -32,6 +32,9 @@ import { chooseInstance } from "./instances/choose";
 import { verifyCliPath, type CliCheck } from "./instances/probe";
 import { appSupportRoot, describeCustom, type Instance, type ScanResult } from "./instances/scan";
 import { InstanceService } from "./instances/service";
+import { DrawerToggle } from "./hotkey/drawer-toggle";
+import { EmbedKeyRelay, type RelayFrame } from "./hotkey/embed-key-relay";
+import { resolveChords, type BridgeAction, type HotkeyLike } from "./hotkey/hotkey-bridge";
 import { instanceUserDir, seedUserData } from "./server/user-data-seed";
 import { dataObject, effectiveShell, readSettings, type WorkbenchSettings } from "./settings/data";
 import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
@@ -64,6 +67,9 @@ interface WorkbenchData extends Partial<WorkbenchSettings> {
   /** The terminal drawer's height and open state, per device: `{ [deviceId]: { height, open } }`. */
   drawer?: unknown;
 }
+
+/** How often the bridged chords are compared with Obsidian's hotkey settings, so a rebinding is followed live. */
+const CHORD_SYNC_MS = 1000;
 
 export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHost, SettingsHost {
   private views = new Set<CodeView>();
@@ -98,6 +104,10 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   /** The instance's settings and keybindings as copied at the last server start; the Code tab seeds its browser profile from it. */
   private copy: UserDataCopy | null = null;
   private terminal: TerminalFeature | null = null;
+  /** The hotkey bridge: carries Ctrl+` and the quick switcher out of the embed (G8, G1). Null until onload; inactive when the spike decision is `no`. */
+  private keyRelay: EmbedKeyRelay | null = null;
+  private bridgeToggle: DrawerToggle | null = null;
+  private chordTimer: ReturnType<typeof setInterval> | null = null;
   private instances = new InstanceService();
   private cachedBefore: ReadonlySet<string> = new Set();
   /** Tests only: replaces the reachability check that turns a failed download into "the network is unreachable". */
@@ -181,7 +191,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
         codeViewType: VIEW_TYPE_CODE,
         addStatusBarItem: () => this.addStatusBarItem(),
         confirmKill: (title) => promptKillShell(this.app, title),
+        focusEditor: () => this.focusActiveEditor(),
       });
+      this.bridgeToggle = new DrawerToggle(this.terminal);
       this.addCommand({
         id: "toggle-terminal-drawer",
         name: "Toggle terminal drawer",
@@ -197,6 +209,19 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       });
     }
 
+    // The hotkey bridge (E12): installed only when the recorded spike decision allows it. It follows the hotkeys
+    // Obsidian has for the two bridged commands, checked every second and when the active tab changes.
+    this.keyRelay = new EmbedKeyRelay({
+      window,
+      serverOrigin: () => this.manager.current?.baseUrl ?? null,
+      chords: () => resolveChords((id) => this.hotkeysOf(id), this.isMac()),
+      onAction: (action, frame) => this.onBridgedKey(action, frame),
+    });
+    if (this.keyRelay.install()) {
+      this.chordTimer = setInterval(() => this.keyRelay?.sync(), CHORD_SYNC_MS);
+      (this.chordTimer as { unref?: () => void }).unref?.();
+    }
+
     // Theme follows Obsidian light/dark (G6): the Machine settings are rewritten and every open tab is
     // switched in place, without a reload. Rapid toggling is coalesced by ThemeSync.
     this.registerEvent(
@@ -209,6 +234,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     const visibilityChanged = () => {
       for (const v of this.views) v.notifyVisible();
       void this.idle.evaluate();
+      this.keyRelay?.sync();
       // The tab the user is on decides whether the strip and drawer show (G11); a moved pane or sidebar changes the drawer's bounds.
       this.terminal?.applyVisibility();
       this.terminal?.layoutChanged();
@@ -285,6 +311,11 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.restoreCreates = null;
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_CODE);
     this.idle?.stop();
+    if (this.chordTimer) clearInterval(this.chordTimer);
+    this.chordTimer = null;
+    this.keyRelay?.dispose();
+    this.keyRelay = null;
+    this.bridgeToggle = null;
     // The drawer's shell and its helper go too; the kill signals are sent before this returns.
     void this.terminal?.dispose();
     // shutdown() sends its kill signals synchronously; unload does not wait for the exit.
@@ -301,6 +332,41 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   embedElement(): EmbedElement {
     return this.data_.embed ?? "webview";
+  }
+
+  attachEmbed(frame: HTMLElement): () => void {
+    return this.keyRelay?.attach(frame as unknown as RelayFrame) ?? (() => undefined);
+  }
+
+  // --- the hotkey bridge ----------------------------------------------------
+
+  private isMac(): boolean {
+    return Platform.isMacOS ?? (typeof process !== "undefined" && process.platform === "darwin");
+  }
+
+  /** The hotkeys Obsidian has for a command: the user's own if any were set (even none), else the default. */
+  private hotkeysOf(commandId: string): readonly HotkeyLike[] {
+    const manager = (this.app as unknown as { hotkeyManager?: { getHotkeys?(id: string): HotkeyLike[] | undefined; getDefaultHotkeys?(id: string): HotkeyLike[] | undefined } }).hotkeyManager;
+    return manager?.getHotkeys?.(commandId) ?? manager?.getDefaultHotkeys?.(commandId) ?? [];
+  }
+
+  /** A bridged chord was pressed inside the embed. Only the action name arrived; nothing is logged. */
+  private onBridgedKey(action: BridgeAction, frame: RelayFrame): void {
+    if (action === "toggle-terminal") {
+      this.bridgeToggle?.press(frame);
+      return;
+    }
+    // The quick switcher: the embed gives up focus first so the switcher's search box gets the typing.
+    frame.blur?.();
+    (this.app as unknown as { commands?: { executeCommandById?(id: string): boolean } }).commands?.executeCommandById?.("switcher:open");
+  }
+
+  /** Keyboard focus back to the editor of the tab the user is on (the drawer closed with focus in the terminal). */
+  private focusActiveEditor(): void {
+    const ws = this.app.workspace as unknown as { getActiveViewOfType?: (t: unknown) => unknown };
+    const view = ws.getActiveViewOfType?.(ItemView);
+    if (view instanceof CodeView) view.focusEmbed();
+    else (view as { editor?: { focus?(): void } } | null | undefined)?.editor?.focus?.();
   }
 
   trackView(view: CodeView): void {
