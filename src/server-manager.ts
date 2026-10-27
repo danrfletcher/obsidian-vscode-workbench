@@ -7,7 +7,7 @@
  *   starting -> failed                                   (start error: notice shown by the host)
  *
  * Start is single-flight: two Code tabs opening while the server starts share
- * one start. Every start asks for a fresh server (new port, new token). A crash
+ * one start. Every start asks for a fresh server (new token, and the vault's stable port when it is free, else a new port). A crash
  * is never restarted automatically: the banner in the tab asks the user, so a
  * server that keeps dying cannot loop.
  */

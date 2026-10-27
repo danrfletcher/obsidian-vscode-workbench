@@ -3,6 +3,9 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { BROWSER_APP_SETTINGS, USER_DATA_MARKER_KEY, buildBrowserSeedScript, buildMachineSettings, writeMachineSettings, type UserDataCopy } from "../../src/settings";
 import { excludeGlobs } from "../../src/server/user-data-seed";
+import { STOP_TEXT, describeExtensionsSection, describePort, renderExtensionsSection, type PortStatus, type SpikeResult } from "../../src/settings/extensions-section";
+import { SPIKE_RESULT } from "../../src/settings/spike-result";
+import { FakeNode } from "../mocks/obsidian";
 import { tempDir } from "../helpers";
 
 describe("writeMachineSettings", () => {
@@ -271,5 +274,116 @@ describe("buildBrowserSeedScript when VS Code's database is not what the plugin 
     const indexedDB = { open: () => { const r: { result: unknown; onsuccess?: () => void } = { result: db }; queueMicrotask(() => r.onsuccess?.()); return r; } };
     expect(await script()(indexedDB, fakeStorage(), TextEncoder, TextDecoder)).toBe("error:SecurityError");
     expect(real.state.closed).toBe(1);
+  });
+});
+
+describe("the Extensions section of the settings tab", () => {
+  const OK: SpikeResult = {
+    measuredOn: "2026-10-27",
+    vscodeVersion: "1.145.0-insider",
+    stablePort: { stable: true, result: "Same origin after a restart.", decision: "Store one port per vault." },
+    trustRecord: { found: true, location: "db-x / ItemTable / content.trust.model.key", result: "Written by the Trust click.", decision: "Seed it in PR-2." },
+    settingsRoute: { arrives: true, route: "the IndexedDB write", result: "fontSize 12px to 23px.", decision: "PR-6 builds on the IndexedDB write." },
+    turboConsoleLog: { state: "active", cause: "Restricted Mode kept it from activating", result: "Activation logged after trust.", decision: "Trust is the fix." },
+  };
+  const PORT: PortStatus = { stored: 51789, current: 51789, note: null };
+  const draw = (result: SpikeResult | null, port: PortStatus = PORT) => {
+    const el = new FakeNode("div");
+    renderExtensionsSection(el as unknown as HTMLElement, describeExtensionsSection(result, port));
+    const rows = el.all().filter((n) => n.cls?.includes("workbench-extensions-row"));
+    return {
+      el,
+      text: el.all().map((n) => n.text).join("\n"),
+      row: (name: string) => rows.find((r) => r.children[0]?.text === name),
+      tone: (name: string) => rows.find((r) => r.children[0]?.text === name)?.children[1],
+    };
+  };
+
+  it("measured OK: the decision for each of the four questions, the date and the port in use", () => {
+    const d = draw(OK);
+    expect(d.text).toContain("Extensions");
+    expect(d.row("Measured")?.children[1].text).toBe("2026-10-27, on VS Code 1.145.0-insider.");
+    expect(d.row("Stable port")?.children[1].text).toBe("Same origin after a restart. Decision: Store one port per vault.");
+    expect(d.row("Stable port in use")?.children[1].text).toBe("Port 51789 (stored), in use by the running server.");
+    expect(d.row("Trust record")?.children[1].text).toBe("Found at db-x / ItemTable / content.trust.model.key. Written by the Trust click. Decision: Seed it in PR-2.");
+    expect(d.row("Settings and keybindings")?.children[1].text).toBe("Route: the IndexedDB write. fontSize 12px to 23px. Decision: PR-6 builds on the IndexedDB write.");
+    expect(d.row("Turbo Console Log")?.children[1].text).toBe("active. Cause: Restricted Mode kept it from activating. Activation logged after trust. Decision: Trust is the fix.");
+    expect(d.text).not.toContain("STOP");
+    expect(d.text).not.toContain("not found");
+  });
+
+  it("STOP: the settings route row shows the stop text, in the error colour, and the others are unaffected", () => {
+    const stop: SpikeResult = { ...OK, settingsRoute: { arrives: false, route: null, result: "No route moved editor.fontSize.", decision: "STOP: ask Dan." } };
+    const d = draw(stop);
+    const row = d.tone("Settings and keybindings")!;
+    expect(row.text).toBe(`${STOP_TEXT} No route moved editor.fontSize.`);
+    expect(row.text.startsWith("STOP:")).toBe(true);
+    expect(d.row("Settings and keybindings")?.cls).toContain("workbench-error");
+    expect(row.style.color).toBeFalsy();
+    expect(d.row("Trust record")?.children[1].text).toContain("Found at");
+  });
+
+  it("trust record not found: the row says \"not found\" and claims no location or format", () => {
+    const d = draw({ ...OK, trustRecord: { found: false, location: null, result: "No key with trust in its name changed.", decision: "Build nothing on it." } });
+    const row = d.tone("Trust record")!;
+    expect(row.text).toBe("not found. No key with trust in its name changed. Decision: Build nothing on it.");
+    expect(row.text).not.toContain("Found at");
+    expect(d.row("Trust record")?.cls).toContain("workbench-warning");
+    expect(row.style.color).toBeFalsy();
+  });
+
+  it("no record yet: one line saying so, and the port still shown", () => {
+    const d = draw(null, { stored: null, current: null, note: null });
+    expect(d.row("Extension spike")?.children[1].text).toBe("No spike result recorded yet.");
+    expect(d.row("Stable port in use")?.children[1].text).toContain("None stored yet");
+    expect(d.row("Trust record")).toBeUndefined();
+  });
+
+  it("a failing Turbo Console Log shows the separate finding with its real cause", () => {
+    const d = draw({ ...OK, turboConsoleLog: { state: "failed", cause: "Cannot find module 'x' (extension host log)", result: "Activated, then threw.", decision: "Fix that first." } });
+    expect(d.tone("Turbo Console Log")?.text).toBe("failed. Cause: Cannot find module 'x' (extension host log). Activated, then threw. Decision: Fix that first.");
+  });
+
+  it("no text is drawn in a tone colour: --text-success is 2.6:1 on white, so the tone is a row class (a bar) and the text keeps the theme's own colour", () => {
+    const stop: SpikeResult = { ...OK, settingsRoute: { ...OK.settingsRoute, arrives: false }, trustRecord: { ...OK.trustRecord, found: false } };
+    for (const result of [OK, stop]) {
+      const d = draw(result);
+      expect(d.el.all().map((n) => n.style.color).filter(Boolean)).toEqual([]);
+    }
+    const d = draw(OK);
+    for (const name of ["Stable port", "Trust record", "Settings and keybindings", "Turbo Console Log"]) expect(d.row(name)?.cls).toContain("workbench-ok");
+    expect(d.row("Measured")?.cls).toContain("workbench-info");
+  });
+
+  it("styles.css gives each tone its bar colour from a theme variable", () => {
+    const css = fs.readFileSync(path.join(process.cwd(), "src/styles.css"), "utf8");
+    for (const [tone, v] of [["ok", "--text-success"], ["warning", "--text-warning"], ["error", "--text-error"]]) {
+      expect(css).toMatch(new RegExp(`\\.workbench-extensions-row\\.workbench-${tone}\\s*\\{[^}]*border-left-color:\\s*var\\(${v}\\)`));
+    }
+    expect(css).not.toMatch(/\.workbench-message[^{]*\{[^}]*color:/);
+  });
+
+  it.each<[string, PortStatus, string]>([
+    ["nothing stored, no server", { stored: null, current: null, note: null }, "None stored yet: the first server start picks a free port and stores it."],
+    ["nothing stored, server running", { stored: null, current: 52000, note: null }, "Server running on port 52000; it will be stored as this vault's stable port."],
+    ["stored, no server", { stored: 51789, current: null, note: null }, "Stored port 51789. No server is running; the next start tries this port first."],
+    ["stored and in use", { stored: 51789, current: 51789, note: null }, "Port 51789 (stored), in use by the running server."],
+    ["stored but another port in use, with the reason", { stored: 51789, current: 52000, note: "Another program has it." }, "Stored port 51789; the running server is on 52000 this time. Another program has it."],
+  ])("the port line: %s", (_n, port, text) => {
+    const row = describePort(port);
+    expect(row.text).toBe(text);
+    expect(row.tone).toBe(port.note ? "warning" : "info");
+  });
+
+  it("the recorded result shipped in SPIKE_RESULT has all four questions answered, a date, and no STOP", () => {
+    expect(SPIKE_RESULT).not.toBeNull();
+    const r = SPIKE_RESULT!;
+    expect(r.measuredOn).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    for (const q of [r.stablePort, r.trustRecord, r.settingsRoute, r.turboConsoleLog]) {
+      expect(q.result.length).toBeGreaterThan(0);
+      expect(q.decision.length).toBeGreaterThan(0);
+    }
+    expect(r.settingsRoute.arrives).toBe(true);
+    expect(r.settingsRoute.decision).not.toContain("STOP");
   });
 });

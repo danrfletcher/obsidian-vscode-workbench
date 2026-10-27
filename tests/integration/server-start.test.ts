@@ -4,6 +4,7 @@
  */
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as net from "node:net";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerStartError, StartCancelledError, WorkbenchServer, checkServeWebSupport, findFreePort as freePort, type CodeBuild } from "../../src/server";
@@ -169,6 +170,70 @@ describe("stop", () => {
     await s.stop();
     const r = await s.ensureStarted();
     expect(await get(r.port, `/?tkn=${r.token}`)).toBe(302);
+  });
+});
+
+describe("the stable port", () => {
+  const picks: Array<{ port: number; usedStored: boolean; note: string | null }> = [];
+  const track = (p: (typeof picks)[number]) => void picks.push(p);
+  beforeEach(() => void (picks.length = 0));
+
+  it("stored port free: the server listens on it, and again after a stop and a start", async () => {
+    const stored = await freePort();
+    const s = make({}, { storedPort: stored, onPortPick: track });
+    const first = await s.ensureStarted();
+    expect(first.port).toBe(stored);
+    await s.stop();
+    const second = await s.ensureStarted();
+    expect(second.port).toBe(stored);
+    expect(second.token).not.toBe(first.token);
+    expect(picks).toEqual([
+      { port: stored, usedStored: true, note: null },
+      { port: stored, usedStored: true, note: null },
+    ]);
+  });
+
+  it("stored port held by a running server of ours: the second server starts on a free port and says so", async () => {
+    const stored = await freePort();
+    const a = make({}, { storedPort: stored, onPortPick: track });
+    expect((await a.ensureStarted()).port).toBe(stored);
+    const b = new WorkbenchServer({
+      build,
+      runtimeDir: path.join(tempDir(), ".server"),
+      acceptLicense: true,
+      pollIntervalMs: 25,
+      env: { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile },
+      storedPort: stored,
+      onPortPick: track,
+    });
+    servers.push(b);
+    const second = await b.ensureStarted();
+    expect(second.port).not.toBe(stored);
+    expect(picks[1].usedStored).toBe(false);
+    expect(picks[1].note).toContain(`stored port ${stored} is not available: a VS Code server of this plugin already holds it`);
+    expect(await get(stored, `/?tkn=${(a.current as { token: string }).token}`)).toBe(302); // the first server is untouched
+  });
+
+  it("stored port held by another process: the server still starts, on a free port, and the other process keeps its port", async () => {
+    const other = net.createServer((sock) => sock.destroy());
+    await new Promise<void>((r) => other.listen(0, "127.0.0.1", r));
+    const stored = (other.address() as net.AddressInfo).port;
+    try {
+      const s = make({}, { storedPort: stored, onPortPick: track });
+      const r = await s.ensureStarted();
+      expect(r.port).not.toBe(stored);
+      expect(await get(r.port, `/?tkn=${r.token}`)).toBe(302);
+      expect(picks[0].note).toContain(`stored port ${stored} is not available: another program is using it`);
+      expect(other.listening).toBe(true);
+    } finally {
+      await new Promise<void>((r) => other.close(() => r()));
+    }
+  });
+
+  it("no stored port: a free port is picked and reported with no note", async () => {
+    const s = make({}, { onPortPick: track });
+    const r = await s.ensureStarted();
+    expect(picks).toEqual([{ port: r.port, usedStored: false, note: null }]);
   });
 });
 

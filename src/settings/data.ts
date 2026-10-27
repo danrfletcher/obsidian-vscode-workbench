@@ -18,6 +18,12 @@ export interface WorkbenchSettings {
   nonCodeDrawer: boolean;
   /** The shell the drawer starts; "" = the default (`$SHELL`, else `/bin/zsh`). */
   shellPath: string;
+  /**
+   * The loopback port this vault's VS Code server tries first, so the workbench's origin (and anything the
+   * browser stores per origin) can stay the same across restarts. null = none stored yet: the first start
+   * takes a free port and stores it. Only a whole number from 1024 to 65535 counts; anything else reads as null.
+   */
+  stablePort: number | null;
 }
 
 export const DEFAULT_SETTINGS: Readonly<WorkbenchSettings> = {
@@ -26,7 +32,11 @@ export const DEFAULT_SETTINGS: Readonly<WorkbenchSettings> = {
   excludeExtensions: [],
   nonCodeDrawer: true,
   shellPath: "",
+  stablePort: null,
 };
+
+export const MIN_STABLE_PORT = 1024;
+export const MAX_STABLE_PORT = 65535;
 
 export const FALLBACK_SHELL = "/bin/zsh";
 
@@ -77,6 +87,11 @@ function stringOrNull(v: unknown): string | null {
   return typeof v === "string" && v.trim() !== "" ? v : null;
 }
 
+/** A stored port: a whole number in 1024..65535, else null (missing, a string, a fraction, out of range). */
+export function portOrNull(v: unknown): number | null {
+  return typeof v === "number" && Number.isInteger(v) && v >= MIN_STABLE_PORT && v <= MAX_STABLE_PORT ? v : null;
+}
+
 /** The settings out of whatever `loadData()` returned. Never throws. */
 export function readSettings(raw: unknown): WorkbenchSettings {
   const o: Record<string, unknown> = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
@@ -86,6 +101,7 @@ export function readSettings(raw: unknown): WorkbenchSettings {
     excludeExtensions: normaliseExtensionList(o.excludeExtensions),
     nonCodeDrawer: typeof o.nonCodeDrawer === "boolean" ? o.nonCodeDrawer : DEFAULT_SETTINGS.nonCodeDrawer,
     shellPath: typeof o.shellPath === "string" ? o.shellPath.trim() : DEFAULT_SETTINGS.shellPath,
+    stablePort: portOrNull(o.stablePort),
   };
 }
 

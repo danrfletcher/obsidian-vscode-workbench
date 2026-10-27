@@ -6,6 +6,7 @@
  * with unsaved buffers, restart, and the offline re-download offer.
  */
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileSystemAdapter, Modal, Notice, Plugin, Tasks, TFile, WorkspaceLeaf, FakeNode, type MockApp } from "../mocks/obsidian";
@@ -655,8 +656,73 @@ describe("quit", () => {
   });
 });
 
+describe("the stable port (extension spike)", () => {
+  /** A listener on a free loopback port, standing in for another program (or a second Obsidian window's server). */
+  async function occupy(): Promise<{ port: number; close(): Promise<void> }> {
+    const srv = net.createServer((sock) => sock.destroy()); // accepts a probe's connect, then hangs up
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    return { port: (srv.address() as net.AddressInfo).port, close: () => new Promise<void>((r) => srv.close(() => r())) };
+  }
+  const status = () => plugin.portStatus();
+
+  it("the first start stores the port it used; the next load of the plugin starts on the same port", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    expect(inner().data_.stablePort).toBeUndefined();
+    await plugin.openSpikeFile();
+    const first = inner().manager.current!.port;
+    await vi.waitFor(() => expect(inner().data_.stablePort).toBe(first));
+    plugin.onunload();
+    await vi.waitFor(() => expect(listenersOn(first)).toEqual([]), { timeout: 5000 });
+    await load({}, { serverLicenceAccepted: true, stablePort: first });
+    await plugin.openSpikeFile();
+    expect(inner().manager.current!.port).toBe(first);
+    expect(status()).toEqual({ stored: first, current: first, note: null });
+  });
+
+  it("data.json cannot be saved: the server still starts and runs on the port it picked", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    (plugin as unknown as { saveData: () => Promise<void> }).saveData = async () => {
+      throw new Error("disk full");
+    };
+    await plugin.openSpikeFile();
+    const running = inner().manager.current!;
+    expect(inner().manager.state).toBe("running");
+    expect(status()).toMatchObject({ current: running.port });
+    await vi.waitFor(() => expect(inner().data_.stablePort).toBe(running.port)); // kept in memory for this session
+  });
+
+  it("the stored port is held by another process: the server starts on a free port, the stored value is kept, and settings says so", async () => {
+    const other = await occupy();
+    try {
+      await load({}, { serverLicenceAccepted: true, stablePort: other.port });
+      await plugin.openSpikeFile();
+      const running = inner().manager.current!;
+      expect(running.port).not.toBe(other.port);
+      expect(inner().data_.stablePort).toBe(other.port);
+      expect(status().note).toContain(`stored port ${other.port} is not available`);
+      expect(status().note).toContain(`Using port ${running.port}`);
+      expect(listenersOn(other.port)).toEqual([process.pid]); // the other program still has its port
+    } finally {
+      await other.close();
+    }
+  });
+
+  it.each([
+    ["out of range", 70000],
+    ["below 1024", 80],
+    ["not a number", "8080"],
+    ["a fraction", 5000.5],
+  ])("a stored port that is %s reads as none: the server starts and a valid port is stored", async (_n, bad) => {
+    await load({}, { serverLicenceAccepted: true, stablePort: bad });
+    expect(status().stored).toBeNull();
+    await plugin.openSpikeFile();
+    const running = inner().manager.current!;
+    await vi.waitFor(() => expect(inner().data_.stablePort).toBe(running.port));
+  });
+});
+
 describe("restart", () => {
-  it("from the settings button: a new port and token, tabs told to reload", async () => {
+  it("from the settings button: a new token on the same stable port, tabs told to reload", async () => {
     await load({}, { serverLicenceAccepted: true });
     await plugin.openSpikeFile();
     const before = inner().manager.current!;
@@ -664,7 +730,9 @@ describe("restart", () => {
     plugin.onServerState((s) => states.push(s));
     await plugin.restartServer();
     const after = inner().manager.current!;
-    expect(after.port).not.toBe(before.port);
+    // The first start stored its port; the restart stopped that server first, so the port is free again.
+    expect(inner().data_.stablePort).toBe(before.port);
+    expect(after.port).toBe(before.port);
     expect(after.token).not.toBe(before.token);
     expect(states).toContain("running");
     expect(serverPids()).toHaveLength(2);
@@ -713,6 +781,33 @@ describe("restart", () => {
     expect(page.removed).toBe(true);
     expect(before).toHaveLength(1);
     await vi.waitFor(() => expect(isAlive(before[0])).toBe(false), { timeout: 3000 });
+  });
+
+  it("a corrupt stablePort in data.json: the settings tab still opens, shows the Extensions section, and says no port is stored", async () => {
+    await load({}, { serverLicenceAccepted: true, stablePort: { not: "a port" } });
+    const tab = Plugin.settingTabs[0] as { display(): void; containerEl: { textContent(): string } };
+    const { Setting } = await import("../mocks/obsidian");
+    Setting.reset();
+    expect(() => tab.display()).not.toThrow();
+    const text = tab.containerEl.textContent();
+    expect(text).toContain("Extensions");
+    expect(text).toContain("Stable port in use");
+    expect(text).toContain("None stored yet");
+    expect(text).toContain("Turbo Console Log");
+    expect(Setting.all.find((x) => x.name === "Restart server")).toBeDefined();
+  });
+
+  it("the settings tab's Extensions section reads the port when it is opened, not on a timer", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    const tab = Plugin.settingTabs[0] as { display(): void; containerEl: { textContent(): string } };
+    tab.display();
+    expect(tab.containerEl.textContent()).toContain("None stored yet");
+    await plugin.openSpikeFile();
+    const port = inner().manager.current!.port;
+    await vi.waitFor(() => expect(inner().data_.stablePort).toBe(port));
+    expect(tab.containerEl.textContent()).toContain("None stored yet"); // unchanged until opened again
+    tab.display();
+    expect(tab.containerEl.textContent()).toContain(`Port ${port} (stored), in use by the running server.`);
   });
 
   it("the settings tab has a Restart server button wired to it", async () => {

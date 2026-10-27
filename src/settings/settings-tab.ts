@@ -4,6 +4,7 @@ import type { CliCheck } from "../instances/probe";
 import { CUSTOM_ID, KNOWN_BUILDS, type Instance, type ScanResult } from "../instances/scan";
 import type { ServerState } from "../server-manager";
 import { addExtension, defaultShell, type WorkbenchSettings } from "./data";
+import { describeExtensionsSection, renderExtensionsSection, type PortStatus, type SpikeResult } from "./extensions-section";
 
 export interface SettingsHost {
   restartServer(): Promise<void>;
@@ -16,6 +17,10 @@ export interface SettingsHost {
   verifyCustomCli(input: string): Promise<CliCheck>;
   /** A hand-edited `codeCliPath` in data.json, which overrides the choice made here. */
   codeCliOverride(): string | undefined;
+  /** The stable port: stored, in use, and why the stored one was passed over. */
+  portStatus(): PortStatus;
+  /** What the extension spike recorded; null = nothing recorded yet. */
+  spikeResult(): SpikeResult | null;
 }
 
 type Tone = "error" | "warning" | "ok" | "info";
@@ -57,7 +62,7 @@ interface InstanceViewState {
   customResult: { tone: Tone; text: string } | null;
 }
 
-/** The settings tab: instances, custom CLI, excludes, the drawer toggle, the shell and Restart server. */
+/** The settings tab: instances, custom CLI, excludes, the drawer toggle, the shell, the extension spike result and Restart server. */
 export class WorkbenchSettingTab extends PluginSettingTab {
   /** Bumped by every display(): an answer that belongs to an older display is dropped. */
   private renderId = 0;
@@ -79,6 +84,8 @@ export class WorkbenchSettingTab extends PluginSettingTab {
     this.loadInstances(containerEl.createDiv(), render, { appliesNextStart: false, customResult: null });
     this.renderExcludes(containerEl.createDiv());
     this.renderDrawerAndShell(containerEl);
+    // Read once, here: the section shows the recorded result and the port as they are when settings opens.
+    renderExtensionsSection(containerEl.createDiv(), describeExtensionsSection(this.host.spikeResult(), this.host.portStatus()));
     this.renderRestart(containerEl);
   }
 
@@ -257,7 +264,7 @@ export class WorkbenchSettingTab extends PluginSettingTab {
     new Setting(el)
       .setName("Restart server")
       .setDesc(
-        `Stops the VS Code server and starts a fresh one on a new port with a new secret. Open Code tabs reload, and unsaved changes in them are lost. Server state: ${this.host.serverState()}.`,
+        `Stops the VS Code server and starts a fresh one with a new secret, on this vault's stable port when it is free. Open Code tabs reload, and unsaved changes in them are lost. Server state: ${this.host.serverState()}.`,
       )
       .addButton((button) =>
         button.setButtonText("Restart server").onClick(async () => {

@@ -309,11 +309,70 @@ export function findFreePort(): Promise<number> {
 /** Ports of servers this process started and that are still up: a new start never reuses one. */
 const heldPorts = new Set<number>();
 
-/** A free loopback port that no server of ours still holds. */
-export async function pickPort(pick: () => Promise<number> = findFreePort): Promise<number> {
+/**
+ * Whether nothing is using `port` on loopback. A connect that gets any answer but "refused" means something
+ * is listening (this also catches a program bound to every interface, which a bind on 127.0.0.1 alone can
+ * miss); otherwise the port must be bindable. Never rejects: a probe that cannot tell counts as "not free".
+ */
+export function portIsFree(port: number, connect: (o: net.NetConnectOpts) => net.Socket = net.connect, timeoutMs = 1000): Promise<boolean> {
+  const inUse = new Promise<boolean>((resolve) => {
+    const sock = connect({ host: LOOPBACK_HOST, port });
+    sock.setTimeout(timeoutMs, () => {
+      sock.destroy();
+      resolve(true);
+    });
+    sock.once("connect", () => {
+      sock.destroy();
+      resolve(true);
+    });
+    // Only a refused connection proves nobody listens; a reset or any other error means something answered.
+    sock.once("error", (e: NodeJS.ErrnoException) => resolve(e.code !== "ECONNREFUSED"));
+  });
+  return inUse.then((listening) =>
+    listening
+      ? false
+      : new Promise<boolean>((resolve) => {
+          const srv = net.createServer();
+          srv.once("error", () => resolve(false));
+          srv.listen(port, LOOPBACK_HOST, () => srv.close(() => resolve(true)));
+        }),
+  );
+}
+
+/** The port a start will use, and, when the stored one could not be used, why (shown in settings). */
+export interface PortPick {
+  port: number;
+  /** The stored port was free and is the one in use. */
+  usedStored: boolean;
+  /** Set when a stored port was passed over: says which port, why, and that the stored value is kept. */
+  note: string | null;
+}
+
+/**
+ * The port for a start. The stored (stable) port is used when no server of ours holds it and nothing else
+ * listens on it; otherwise a free port is picked and the result says so. A stored port never makes the start
+ * fail. A free port is never one a server of ours still holds.
+ */
+export async function pickPort(
+  pick: () => Promise<number> = findFreePort,
+  stored: number | null = null,
+  isFree: (port: number) => Promise<boolean> = portIsFree,
+): Promise<PortPick> {
+  let note: string | null = null;
+  if (stored !== null) {
+    const why = heldPorts.has(stored)
+      ? "a VS Code server of this plugin already holds it"
+      : (await isFree(stored))
+        ? null
+        : "another program is using it (for example a second Obsidian window on this vault)";
+    if (why === null) return { port: stored, usedStored: true, note: null };
+    note = `The stored port ${stored} is not available: ${why}.`;
+  }
   for (let i = 0; i < 20; i++) {
     const port = await pick();
-    if (!heldPorts.has(port)) return port;
+    if (!heldPorts.has(port)) {
+      return { port, usedStored: false, note: note === null ? null : `${note} Using port ${port} for this start; the stored port is kept.` };
+    }
   }
   throw new ServerStartError("Could not find a free port on 127.0.0.1.", null, "", { kind: "port-bind" });
 }
@@ -509,6 +568,10 @@ export interface ServerOptions {
   downloadHostReachable?: () => Promise<boolean>;
   /** Replaces the free-port lookup (tests). */
   findPort?: () => Promise<number>;
+  /** The vault's stable port (settings `stablePort`), tried before a free one; null = none stored. */
+  storedPort?: number | null;
+  /** Called with the port chosen for each start, before the child is spawned. */
+  onPortPick?: (pick: PortPick) => void;
 }
 
 export interface RunningServer {
@@ -599,8 +662,10 @@ export class WorkbenchServer {
 
     const token = createTokenFile(tokenFile);
     shareExtensions(build.extensionsDir, this.serverDataDir);
-    const port = await pickPort(this.opts.findPort);
+    const picked = await pickPort(this.opts.findPort, this.opts.storedPort ?? null);
+    const port = picked.port;
     if (this.stopRequested) throw new StartCancelledError(); // stop() came in before the spawn: nothing to kill
+    this.opts.onPortPick?.(picked);
     const args = buildServeWebArgs({
       port,
       tokenFile,

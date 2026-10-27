@@ -25,6 +25,7 @@ import {
   findNewestBuild,
   removePartialDownloads,
   type CodeBuild,
+  type PortPick,
   type RunningServer,
 } from "./server";
 import { ServerManager, type ServerState, type StartOptions } from "./server-manager";
@@ -36,6 +37,8 @@ import { EmbedKeyRelay, type RelayFrame } from "./hotkey/embed-key-relay";
 import { resolveChords, type BridgeAction, type HotkeyLike } from "./hotkey/hotkey-bridge";
 import { instanceUserDir, seedUserData } from "./server/user-data-seed";
 import { dataObject, effectiveShell, readSettings, type WorkbenchSettings } from "./settings/data";
+import { type PortStatus, type SpikeResult } from "./settings/extensions-section";
+import { SPIKE_RESULT } from "./settings/spike-result";
 import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
 import { workbenchOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
 import { DEVICE_ID_KEY } from "./terminal/drawer-state";
@@ -109,6 +112,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private chordTimer: ReturnType<typeof setInterval> | null = null;
   private instances = new InstanceService();
   private cachedBefore: ReadonlySet<string> = new Set();
+  /** Why the last start did not use the stored stable port (null when it did, or none is stored). */
+  private portNote: string | null = null;
   /** Tests only: replaces the reachability check that turns a failed download into "the network is unreachable". */
   private downloadHostReachable?: () => Promise<boolean>;
 
@@ -590,6 +595,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       registry: this.registry,
       workspace: this.vaultRoot(),
       downloadHostReachable: this.downloadHostReachable,
+      storedPort: this.workbenchSettings().stablePort,
+      onPortPick: (pick) => this.notePort(pick),
     });
     writeMachineSettings(server.serverDataDir, { dark: this.isDark() });
     this.themeSync.markApplied(this.isDark());
@@ -625,6 +632,16 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return this.copy;
   }
 
+  /**
+   * The port a start picked. With no stable port stored yet, the first one picked is stored (it is per vault:
+   * data.json lives in this vault's plugin folder). A stored port that could not be used is kept as it is, and
+   * the reason is shown in settings.
+   */
+  private notePort(pick: PortPick): void {
+    this.portNote = pick.note;
+    if (this.workbenchSettings().stablePort === null) void this.updateSettings({ stablePort: pick.port }).catch(() => undefined);
+  }
+
   // --- SettingsHost -------------------------------------------------------
 
   workbenchSettings(): WorkbenchSettings {
@@ -635,6 +652,14 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     Object.assign(this.data_, patch);
     this.terminal?.applyVisibility(); // the non-code setting takes effect now, with no reload
     await this.saveData(this.data_);
+  }
+
+  portStatus(): PortStatus {
+    return { stored: this.workbenchSettings().stablePort, current: this.manager.current?.port ?? null, note: this.portNote };
+  }
+
+  spikeResult(): SpikeResult | null {
+    return SPIKE_RESULT;
   }
 
   scanInstances(): Promise<ScanResult> {
@@ -650,7 +675,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   }
 
   /**
-   * Stop the server and start a fresh one (new port, new token); open Code tabs
+   * Stop the server and start a fresh one (new token; the stable port when it is free, else a new port); open Code tabs
    * reload. Works from every state, the failed one included. Asks first when a
    * running server holds unsaved buffers. Resolves once running; rejects if it cannot start.
    */

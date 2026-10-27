@@ -309,3 +309,27 @@ body.vscw-terminal-on.vscw-terminal-dragging .status-bar {
 .vscw-terminal .xterm-viewport {
   height: 100%;
 }
+
+/* Settings > Extensions: the recorded spike result. Wraps long paths and keys instead of clipping them. */
+.workbench-extensions-row {
+  padding: 0.5em 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.workbench-extensions-row .workbench-message {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+/* The tone is a bar, not text colour: the text stays in the normal description colour so it is readable in both themes. */
+.workbench-extensions-row {
+  padding-left: 0.75em;
+  border-left: 3px solid var(--background-modifier-border);
+}
+.workbench-extensions-row.workbench-ok {
+  border-left-color: var(--text-success);
+}
+.workbench-extensions-row.workbench-warning {
+  border-left-color: var(--text-warning);
+}
+.workbench-extensions-row.workbench-error {
+  border-left-color: var(--text-error);
+}
