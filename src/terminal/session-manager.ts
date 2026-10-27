@@ -59,9 +59,13 @@ export class SessionManager {
     return this.list.find((s) => s.id === id);
   }
 
-  /** The number of shells that are running now (a shell that exited, failed or is still starting is not counted). */
+  /**
+   * The number of shells that exist and are alive or on their way (G18, PR-7 R2): running, or still starting (the
+   * preflight and the helper spawn), so the status item never reads one lower than the tabs that have a process
+   * or are about to. A shell that exited or failed to start (E10) is not counted.
+   */
   get count(): number {
-    return this.list.filter((s) => s.controller.state.kind === "running").length;
+    return this.list.filter((s) => s.controller.state.kind === "running" || s.controller.state.kind === "starting").length;
   }
 
   onEvent(cb: (e: SessionEvent) => void): void {

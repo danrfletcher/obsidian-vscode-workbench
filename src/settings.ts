@@ -110,16 +110,30 @@ export interface UserDataCopy {
 export const USER_DATA_MARKER_KEY = "obsidian-vscode-workbench.user-data";
 
 /**
+ * What the seed script answers (see `buildBrowserSeedScript`); the Code tab logs it, so a seed that stops
+ * working shows up in the console instead of as marketplace and telemetry traffic coming back.
+ *  - seeded:           the settings (and, with a copy, the keybindings) were written.
+ *  - kept:             the profile's settings.json is not plain JSON (hand-edited with comments, say) and no new copy
+ *                      was due, so it was left alone; the off switches are not re-applied until the next start.
+ *  - version-mismatch: the workbench's database is at another version than this plugin knows (VS Code changed it).
+ *  - no-store:         the database has no user-data store (VS Code renamed it).
+ *  - error:<name>:     anything else the page refused.
+ */
+export type SeedOutcome = "seeded" | "kept" | "version-mismatch" | "no-store" | `error:${string}`;
+
+/**
  * A script for the workbench's origin (run through `webview.executeJavaScript`
  * before the workbench itself loads) that merges `settings` into the browser
- * profile's user settings.json. Keys already there are kept except the ones
- * given; a file that is not a plain JSON object (hand-edited with comments, say)
- * is left alone. Resolves to "seeded" or "kept".
+ * profile's user settings.json. Resolves to a `SeedOutcome`.
  *
- * With `copy`, the instance's settings and keybindings are also put there, once per
- * `copy.id` (recorded in localStorage): the copied keys replace what is in the profile,
- * `settings` (the off switches) win over the copy, and keybindings.json is replaced by
- * the copy or removed when the instance has none.
+ * Without `copy` (or on a tab reload within one server start), keys already in the profile are kept except
+ * the ones given, and a file that is not a plain JSON object is left alone ("kept").
+ *
+ * With `copy`, the instance's settings and keybindings are put there once per `copy.id` (recorded in
+ * localStorage), and that replaces the profile's settings.json whole: whatever was in it, a key removed from the
+ * instance's settings, a key set inside the tab, a file that no longer parses, is gone, as the README says.
+ * `settings` (the off switches) win over the copy, and keybindings.json is replaced by the copy or removed
+ * when the instance has none.
  */
 export function buildBrowserSeedScript(settings: Readonly<Record<string, unknown>> = BROWSER_APP_SETTINGS, copy?: UserDataCopy | null): string {
   const db = WORKBENCH_DB;
@@ -129,13 +143,19 @@ export function buildBrowserSeedScript(settings: Readonly<Record<string, unknown
   const copy = ${JSON.stringify(copy ?? null)};
   const markerKey = ${JSON.stringify(USER_DATA_MARKER_KEY)};
   const stores = ["vscode-userdata-store", "vscode-logs-store", "vscode-filehandles-store"];
-  const db = await new Promise((resolve, reject) => {
-    const r = indexedDB.open(${JSON.stringify(db.name)}, ${db.version});
-    r.onupgradeneeded = () => { for (const s of stores) if (!r.result.objectStoreNames.contains(s)) r.result.createObjectStore(s); };
-    r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-  });
+  let db;
   try {
+    db = await new Promise((resolve, reject) => {
+      const r = indexedDB.open(${JSON.stringify(db.name)}, ${db.version});
+      r.onupgradeneeded = () => { for (const s of stores) if (!r.result.objectStoreNames.contains(s)) r.result.createObjectStore(s); };
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+    });
+  } catch (e) {
+    return e && e.name === "VersionError" ? "version-mismatch" : "error:" + ((e && e.name) || "open");
+  }
+  try {
+    if (!db.objectStoreNames.contains(${JSON.stringify(db.store)})) return "no-store";
     const existing = await new Promise((resolve, reject) => {
       const q = db.transaction(${JSON.stringify(db.store)}).objectStore(${JSON.stringify(db.store)}).get(${JSON.stringify(db.settingsKey)});
       q.onsuccess = () => resolve(q.result);
@@ -143,13 +163,13 @@ export function buildBrowserSeedScript(settings: Readonly<Record<string, unknown
     });
     const applyCopy = copy !== null && (typeof localStorage === "undefined" || localStorage.getItem(markerKey) !== copy.id);
     let merged = Object.assign({}, applyCopy ? copy.settings : {}, ours);
-    if (existing !== undefined) {
+    if (existing !== undefined && !applyCopy) {
       const text = typeof existing === "string" ? existing : new TextDecoder().decode(existing);
       if (text.trim() !== "") {
         let current;
         try { current = JSON.parse(text); } catch (e) { return "kept"; }
         if (current === null || typeof current !== "object" || Array.isArray(current)) return "kept";
-        merged = Object.assign({}, current, applyCopy ? copy.settings : {}, ours);
+        merged = Object.assign({}, current, ours);
       }
     }
     await new Promise((resolve, reject) => {
@@ -165,6 +185,8 @@ export function buildBrowserSeedScript(settings: Readonly<Record<string, unknown
     });
     if (applyCopy && typeof localStorage !== "undefined") localStorage.setItem(markerKey, copy.id);
     return "seeded";
+  } catch (e) {
+    return "error:" + ((e && e.name) || "seed");
   } finally {
     db.close();
   }

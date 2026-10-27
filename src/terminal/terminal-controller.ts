@@ -79,7 +79,14 @@ export class ShellController {
     const old = this.current;
     this.current = null;
     if (old) await old.kill();
-    if (this.starting) await this.starting;
+    if (this.starting) {
+      await this.starting;
+      // The start we waited for made a shell of its own and put it in `current`. Restart replaces it below, so it
+      // is killed here; otherwise the new one would overwrite it and leave this shell running with no owner (PR-6 R2).
+      const made = this.current as PtySession | null; // assigned by start() while we awaited
+      this.current = null;
+      if (made) await made.kill();
+    }
     this.deps.startDir.release();
     this.setState({ kind: "idle" });
     await this.ensure();

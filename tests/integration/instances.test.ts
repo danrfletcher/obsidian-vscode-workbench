@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileSystemAdapter, Notice, Plugin, Setting, TFile, WorkspaceLeaf, type FakeNode, type MockApp } from "../mocks/obsidian";
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
 import { FAKE_CODE, isAlive, tempDir } from "../helpers";
-import { makeApp as makeBundle, makeReadOnly, makeWritable, treeDigest } from "../instance-helpers";
+import { HANG_SCRIPT, makeApp as makeBundle, makeReadOnly, makeWritable, treeDigest } from "../instance-helpers";
 
 const PLUGIN_DIR = ".obsidian/plugins/obsidian-vscode-workbench";
 const HERE = path.dirname(FAKE_CODE);
@@ -92,7 +92,7 @@ async function load(data: Record<string, unknown> | null = {}, env: Record<strin
   await plugin.onload();
 }
 
-const inner = () => plugin as unknown as { manager: import("../../src/server-manager").ServerManager; data_: Record<string, unknown>; instances: { started: number } };
+const inner = () => plugin as unknown as { manager: import("../../src/server-manager").ServerManager; data_: Record<string, unknown>; instances: { started: number; resolved: number } };
 const stored = () => (plugin as unknown as { pluginData: Record<string, unknown> }).pluginData;
 const launches = () => (fs.existsSync(launchLog) ? fs.readFileSync(launchLog, "utf8").split("\n").filter(Boolean) : []);
 const serveLaunches = () => launches().filter((l) => !l.includes("|serve-web --help"));
@@ -201,6 +201,41 @@ describe("which instance a Code tab runs on", () => {
     expect(calls.length).toBeGreaterThan(0);
     for (const c of calls) expect(c).toMatch(/\|serve-web --help$/);
     expect(serverPids()).toEqual([]);
+  });
+});
+
+describe("the server start probes only the build it needs (PR-3 R2)", () => {
+  it("a VSCodium that hangs on serve-web --help is never run by a start that uses VS Code Insiders, and the start is not delayed", async () => {
+    bothMicrosoft();
+    // The hanging CLI would cost 5 s (its probe timeout) if the start probed every build.
+    makeBundle(apps, { name: CODIUM, bundleId: "com.vscodium", version: "1.140.0", cli: "codium", script: HANG_SCRIPT });
+    process.env.HANG_PIDFILE = path.join(tempDir(), "hang.pid");
+    try {
+      await load();
+      const started = Date.now();
+      await plugin.openSpikeFile();
+      expect(Date.now() - started).toBeLessThan(3000);
+      expect(inner().manager.state).toBe("running");
+      expect(fs.existsSync(process.env.HANG_PIDFILE)).toBe(false); // the hanging script never ran
+      expect(inner().instances.resolved).toBe(1);
+      expect(inner().instances.started).toBe(0); // no full scan
+      expect(launches().every((l) => l.startsWith(`${INSIDERS}|`))).toBe(true);
+    } finally {
+      delete process.env.HANG_PIDFILE;
+    }
+  });
+
+  it("a saved build that no longer passes falls back to the default for the start, and the saved id is left as it was", async () => {
+    bothMicrosoft();
+    fs.writeFileSync(path.join(apps, STABLE, "Contents/Resources/app/bin/code"), "#!/bin/sh\necho no >&2\nexit 1\n");
+    await load();
+    const scan = await (plugin as unknown as { scanInstances(): Promise<{ instances: Array<{ id: string }> }> }).scanInstances();
+    expect(scan.instances).toHaveLength(1); // only Insiders passes now
+    await plugin.updateSettings({ instanceId: `vscode:${path.join(apps, STABLE)}` });
+    await plugin.openSpikeFile();
+    expect(inner().manager.state).toBe("running");
+    expect(serveLaunches().map((l) => l.split("|")[0])).toEqual([INSIDERS]);
+    expect(stored().instanceId).toBe(`vscode:${path.join(apps, STABLE)}`);
   });
 });
 
@@ -316,10 +351,12 @@ describe("the settings tab", () => {
         await vi.waitFor(() => expect(Setting.all.some((s) => s.dropdown?.options.some((o) => o.value === "custom"))).toBe(true), { timeout: 5000 });
         return {};
       })()) };
+      // Verify selects the new entry: nothing has to be picked from the dropdown afterwards (PR-3 R3)
+      expect(stored().instanceId).toBe("custom");
       const dd = Setting.all.filter((s) => s.name === "VS Code instance").pop()!.dropdown!;
       expect(dd.options.map((o) => o.label)).toContain("Custom");
-      await dd.handler!("custom");
-      expect(stored().instanceId).toBe("custom");
+      expect(dd.value).toBe("custom");
+      expect(t.text()).toContain("Verified and selected");
       await plugin.openSpikeFile();
       expect(serveLaunches().map((l) => l.split("|")[0])).toEqual(["custom"]);
     });

@@ -17,6 +17,10 @@
  *    Ctrl elsewhere);
  *  - the key is compared by the character it produces (`event.key`, lower-cased), not by position, so a layout
  *    that has the backtick elsewhere still matches the chord Obsidian shows;
+ *  - where the produced character cannot be trusted, the physical key is used instead: when Alt/Option is held
+ *    (on macOS Alt+O types "ø") or the layout reports a dead key ("Dead", "Unidentified"). The chord's key is then
+ *    taken as the US-layout position (`PageChord.code`: KeyO, Digit1, Backquote), so a rebound Alt chord and
+ *    Ctrl+` on a dead-backtick layout still match (PR-8 R7);
  *  - a matched chord is consumed (default prevented, propagation stopped) so VS Code does not also act on it
  *    (no backtick typed, no Open File dialog); auto-repeat events are consumed but report nothing, so a held key
  *    acts once per physical press; keys during IME composition are never touched.
@@ -47,6 +51,16 @@ export interface PageChord {
   shift: boolean;
   /** Lower-case `event.key`. */
   key: string;
+  /** The `event.code` of that key on a US layout (KeyO, Digit1, Backquote), or "" when the key is not a letter, digit or backtick. */
+  code?: string;
+}
+
+/** The US-layout `event.code` of a chord key: letters, digits and the backtick; "" for anything else. */
+export function codeForKey(key: string): string {
+  if (/^[a-z]$/.test(key)) return "Key" + key.toUpperCase();
+  if (/^[0-9]$/.test(key)) return "Digit" + key;
+  if (key === "`") return "Backquote";
+  return "";
 }
 
 export interface ChordConfig {
@@ -67,6 +81,7 @@ export function toPageChord(action: BridgeAction, hotkey: HotkeyLike, isMac: boo
     alt: mods.has("Alt"),
     shift: mods.has("Shift"),
     key: hotkey.key.toLowerCase(),
+    code: codeForKey(hotkey.key.toLowerCase()),
   };
 }
 
@@ -90,7 +105,7 @@ export function resolveChords(lookup: HotkeyLookup, isMac: boolean): ChordConfig
 
 /** Two configs that bridge the same chords. Used to push to a page only when something changed. */
 export function configSignature(config: ChordConfig): string {
-  return JSON.stringify(config.chords.map((c) => [c.action, c.ctrl, c.meta, c.alt, c.shift, c.key]).sort());
+  return JSON.stringify(config.chords.map((c) => [c.action, c.ctrl, c.meta, c.alt, c.shift, c.key, c.code ?? ""]).sort());
 }
 
 /** What the page logs (webview) when it reports an action; the host reads only lines starting with this. */
@@ -132,7 +147,8 @@ export function buildRelayScript(config: ChordConfig, nonce?: string): string {
       var key = typeof ev.key === "string" ? ev.key.toLowerCase() : "";
       for (var i = 0; i < chords.length; i++) {
         var c = chords[i];
-        if (c.key !== key) continue;
+        // The produced character, unless Alt is held or the key is dead: then the physical key (PR-8 R7).
+        if (c.key !== key && !(!!c.code && ev.code === c.code && (ev.altKey || key === "dead" || key === "unidentified" || key === ""))) continue;
         if (!!ev.ctrlKey !== c.ctrl || !!ev.metaKey !== c.meta || !!ev.altKey !== c.alt || !!ev.shiftKey !== c.shift) continue;
         ev.preventDefault();
         ev.stopImmediatePropagation();

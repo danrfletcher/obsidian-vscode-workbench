@@ -91,4 +91,25 @@ describe("sweepOrphans with real processes", () => {
     expect(result.gone.map((e) => e.pid)).toEqual([pid]);
     expect(fs.existsSync(pf.file)).toBe(false);
   });
+
+  it("kills the server that outlived its wrapper (re-parented), found by this vault's token-file path", async () => {
+    const dir = tempDir();
+    const { port, wrapper, server } = await startOrphanServer(dir);
+    const tokenFile = path.join(dir, "connection-token");
+    const pf = new PidFile(path.join(dir, "pids.json"));
+    pf.add({ pid: wrapper, label: "vscode-server", match: tokenFile, findByMatch: true, startedAt: Date.now(), workspace: dir, group: true });
+    process.kill(wrapper, "SIGKILL"); // the wrapper dies; the server it started is re-parented and keeps listening
+    await vi.waitFor(() => expect(isAlive(wrapper)).toBe(false), { timeout: 5000 });
+    expect(isAlive(server)).toBe(true);
+    expect(listenersOn(port).length).toBeGreaterThan(0);
+
+    const result = await sweepOrphans(pf.file);
+
+    expect(result.gone.map((e) => e.pid)).toEqual([wrapper]);
+    expect(result.stragglers).toContain(server);
+    await vi.waitFor(() => {
+      expect(isAlive(server)).toBe(false);
+      expect(listenersOn(port)).toEqual([]);
+    }, { timeout: 5000 });
+  });
 });

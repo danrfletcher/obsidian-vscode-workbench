@@ -5,7 +5,7 @@
  * ResizeObserver, so those are stubbed; what is checked is our wiring, not xterm's drawing.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createXtermView } from "../../src/terminal/xterm-view";
+import { createXtermView, type ToggleChord } from "../../src/terminal/xterm-view";
 
 let observed: Array<{ cb: () => void; disconnected: boolean }>;
 
@@ -33,11 +33,13 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function mount() {
+function mount(toggleChords?: () => readonly ToggleChord[]) {
   const host = document.createElement("div");
   document.body.appendChild(host);
-  return { host, view: createXtermView(host) };
+  return { host, view: createXtermView(host, toggleChords ? { toggleChords } : {}) };
 }
+
+const chord = (key: string, o: Partial<ToggleChord> = {}): ToggleChord => ({ ctrl: false, meta: false, alt: false, shift: false, key, ...o });
 
 describe("createXtermView", () => {
   it("opens an xterm inside the host and reports its cell grid", () => {
@@ -106,5 +108,68 @@ describe("createXtermView", () => {
     const { view } = mount();
     expect(() => view.fit()).not.toThrow();
     view.dispose();
+  });
+
+  describe("the close key follows the hotkey the user set (PR-8 R3)", () => {
+    const press = (textarea: HTMLTextAreaElement, init: KeyboardEventInit) => {
+      const ev = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+      textarea.dispatchEvent(ev);
+      return ev;
+    };
+
+    it("after a rebinding, the new chord closes the drawer from the terminal and the old Ctrl+` goes to the shell", () => {
+      let chords: ToggleChord[] = [chord("`", { ctrl: true })];
+      const { host, view } = mount(() => chords);
+      const toggled: number[] = [];
+      view.onToggleKey(() => toggled.push(1));
+      const textarea = host.querySelector("textarea") as HTMLTextAreaElement;
+      expect(press(textarea, { key: "`", code: "Backquote", ctrlKey: true }).defaultPrevented).toBe(true);
+      expect(toggled).toEqual([1]);
+      chords = [chord("j", { ctrl: true, shift: true })]; // the user rebinds in Settings > Hotkeys; no remount
+      const old = press(textarea, { key: "`", code: "Backquote", ctrlKey: true });
+      expect(toggled).toEqual([1]);
+      expect(old.defaultPrevented).toBe(false);
+      expect(press(textarea, { key: "J", code: "KeyJ", ctrlKey: true, shiftKey: true }).defaultPrevented).toBe(true);
+      expect(toggled).toEqual([1, 1]);
+      view.dispose();
+    });
+
+    it("a command with two hotkeys closes on either; one with none closes on neither", () => {
+      let chords: ToggleChord[] = [chord("`", { ctrl: true }), chord("k", { meta: true })];
+      const { host, view } = mount(() => chords);
+      const toggled: number[] = [];
+      view.onToggleKey(() => toggled.push(1));
+      const textarea = host.querySelector("textarea") as HTMLTextAreaElement;
+      press(textarea, { key: "k", code: "KeyK", metaKey: true });
+      press(textarea, { key: "`", code: "Backquote", ctrlKey: true });
+      expect(toggled).toEqual([1, 1]);
+      chords = [];
+      press(textarea, { key: "k", code: "KeyK", metaKey: true });
+      press(textarea, { key: "`", code: "Backquote", ctrlKey: true });
+      expect(toggled).toEqual([1, 1]);
+      view.dispose();
+    });
+
+    it("an Alt chord matches where Option changes the character ('ø'), by the key's position", () => {
+      const { host, view } = mount(() => [chord("o", { ctrl: true, alt: true, code: "KeyO" })]);
+      const toggled: number[] = [];
+      view.onToggleKey(() => toggled.push(1));
+      const textarea = host.querySelector("textarea") as HTMLTextAreaElement;
+      press(textarea, { key: "ø", code: "KeyO", ctrlKey: true, altKey: true });
+      expect(toggled).toEqual([1]);
+      press(textarea, { key: "ö", code: "KeyO", ctrlKey: true }); // no Alt: the character decides
+      expect(toggled).toEqual([1]);
+      view.dispose();
+    });
+
+    it("modifiers must match exactly: Ctrl+Shift+` is not Ctrl+`", () => {
+      const { host, view } = mount(() => [chord("`", { ctrl: true })]);
+      const toggled: number[] = [];
+      view.onToggleKey(() => toggled.push(1));
+      const textarea = host.querySelector("textarea") as HTMLTextAreaElement;
+      press(textarea, { key: "~", code: "Backquote", ctrlKey: true, shiftKey: true });
+      expect(toggled).toEqual([]);
+      view.dispose();
+    });
   });
 });

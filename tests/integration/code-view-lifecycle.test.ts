@@ -14,7 +14,7 @@ import { OpenFiles } from "../../src/open-file";
 import { carryEdits, readBaseline, statSignature, type CarryResult } from "../../src/rename-carry";
 import { TabRegistry } from "../../src/tab-registry";
 import { opensInCodeTab } from "../../src/text-file-rules";
-import { trackObsidianDeletes, VaultSync } from "../../src/vault-sync";
+import { OBSIDIAN_DELETE_GRACE_MS, trackObsidianDeletes, VaultSync } from "../../src/vault-sync";
 import { tempDir } from "../helpers";
 
 class Embed extends FakeNode {
@@ -25,6 +25,8 @@ class Embed extends FakeNode {
   /** Pressing Save All clears the dirty flag, as the real workbench does. */
   savesOnKeys = true;
   dirtyAnswer: (() => Promise<unknown>) | null = null;
+  /** What the workbench's tab for this file reads while the page as a whole is dirty: "clean", "dirty", or "none" (no such tab). */
+  fileTab: "clean" | "dirty" | "none" = "none";
   private fired: Record<string, Array<() => void>> = {};
   setAttribute(k: string, v: string) {
     this.attrs[k] = v;
@@ -39,6 +41,7 @@ class Embed extends FakeNode {
   }
   executeJavaScript(code: string) {
     if (code === DIRTY_SCRIPT) return this.dirtyAnswer ? this.dirtyAnswer() : Promise.resolve(this.dirty);
+    if (code.includes("data-resource-name")) return Promise.resolve(this.fileTab); // fileDirtyScript
     return Promise.resolve("seeded");
   }
   sendInputEvent() {
@@ -69,7 +72,9 @@ interface Tab {
   embed: () => Embed;
 }
 
-function world(opts: { autoSave?: "on" | "off"; answers?: Array<"save" | "discard" | "cancel">; root?: string } = {}) {
+function world(
+  opts: { autoSave?: "on" | "off"; answers?: Array<"save" | "discard" | "cancel">; root?: string; afterCarry?: () => void } = {},
+) {
   const leaves: Array<WorkspaceLeaf & { detached?: boolean }> = [];
   const open = new OpenFiles<WorkspaceLeaf>(() => leaves.filter((l) => !(l as { detached?: boolean }).detached));
   const registry = new TabRegistry<WorkspaceLeaf>(open);
@@ -111,6 +116,7 @@ function world(opts: { autoSave?: "on" | "off"; answers?: Array<"save" | "discar
           carryEdits: async (from: string, to: string, baseline: Buffer | null) => {
             const result = await carryEdits(root, from, to, baseline);
             carried.push({ from, to, result });
+            opts.afterCarry?.(); // the user keeps typing while the move is under way
             return result;
           },
         }
@@ -445,6 +451,151 @@ describe("vault events (G3, G4)", () => {
     await vi.waitFor(() => expect(a.embed().srcs.at(-1)).toContain("b.py"));
   });
 
+  it("a save made inside the embed applies the held-back rename on its own, without a tab switch (PR-5 R4)", async () => {
+    const root = tempDir();
+    fs.writeFileSync(path.join(root, "a.py"), "old\n");
+    const w = world({ root });
+    const t = await w.openTab("a.py");
+    t.embed().dirty = true;
+    fs.renameSync(path.join(root, "a.py"), path.join(root, "b.py"));
+    w.sync.onRename("b.py", "a.py");
+    await new Promise((r) => setTimeout(r, 30));
+    const first = t.embed();
+    // the user presses Cmd+S in the workbench: the file is written at the old path and the buffer reads clean.
+    fs.writeFileSync(path.join(root, "a.py"), "edited\n");
+    first.dirty = false;
+    // no notifyVisible(), no layout-change, no active-leaf event
+    await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"), { timeout: 4000 });
+    expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited\n");
+    expect(fs.existsSync(path.join(root, "a.py"))).toBe(false);
+    expect(w.leaves).toHaveLength(1);
+  });
+
+  it("text typed while the held-back rename is being carried is not thrown away by the reload; the next save still ends up in the renamed file (PR-1 R1)", async () => {
+    const root = tempDir();
+    fs.writeFileSync(path.join(root, "a.py"), "old\n");
+    let typed: (() => void) | null = null;
+    const w = world({ root, afterCarry: () => typed?.() });
+    const t = await w.openTab("a.py");
+    const first = t.embed();
+    first.dirty = true;
+    first.onSave = () => fs.writeFileSync(path.join(root, "a.py"), "edited again\n"); // the buffer stays bound to a.py
+    fs.renameSync(path.join(root, "a.py"), path.join(root, "b.py"));
+    w.sync.onRename("b.py", "a.py");
+    await new Promise((r) => setTimeout(r, 30));
+    // Cmd+S: written at the old path, the buffer reads clean. The next watch tick starts the carry...
+    fs.writeFileSync(path.join(root, "a.py"), "edited\n");
+    first.dirty = false;
+    // ...and during it the user types again.
+    typed = () => {
+      first.dirty = true;
+      typed = null;
+    };
+    await vi.waitFor(() => expect(w.carried).toHaveLength(1), { timeout: 4000 });
+    await new Promise((r) => setTimeout(r, 1500)); // more watch ticks: the buffer is dirty, so nothing may reload
+    expect(t.embed()).toBe(first);
+    expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true);
+    expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited\n"); // the first save was carried
+    expect(fs.existsSync(path.join(root, "a.py"))).toBe(false);
+    // the user saves the new text: it lands in a.py, is carried into b.py, and only then does the embed reload
+    expect(await t.view.saveBuffers()).toBe(true);
+    await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"), { timeout: 4000 });
+    expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited again\n");
+    expect(fs.existsSync(path.join(root, "a.py"))).toBe(false);
+    expect(w.carried.map((c) => c.result)).toEqual(["carried", "carried"]);
+    expect(w.leaves).toHaveLength(1);
+  });
+
+  it("a save of the renamed file while ANOTHER editor of the page stays unsaved is carried at once, and every later save too (PR-5 R4, T40, T41)", async () => {
+    // The page-wide probe stays true while any editor is dirty (another file's edits, or a buffer the workbench restored),
+    // but the renamed file's own tab reads clean after its save. The text is carried into the renamed file without waiting
+    // for the other editor; the embed is reloaded only once the whole page is saved.
+    const root = tempDir();
+    fs.writeFileSync(path.join(root, "a.py"), "old\n");
+    const w = world({ root });
+    const t = await w.openTab("a.py");
+    const first = t.embed();
+    first.dirty = true; // the page is dirty, whoever's edits these are
+    first.fileTab = "dirty"; // and this file's own buffer is one of them
+    fs.renameSync(path.join(root, "a.py"), path.join(root, "b.py"));
+    w.sync.onRename("b.py", "a.py");
+    await new Promise((r) => setTimeout(r, 1300)); // a watch look sees this file's tab dirty
+    fs.writeFileSync(path.join(root, "a.py"), "edited\n"); // Cmd+S in the renamed file's buffer
+    first.fileTab = "clean"; // the other editor keeps the page dirty
+    await vi.waitFor(() => expect(w.carried).toHaveLength(1), { timeout: 4000 });
+    expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true); // no reload: the other editor's text would go with it
+    expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited\n");
+    expect(fs.existsSync(path.join(root, "a.py"))).toBe(false);
+    // the buffer is still bound to a.py: type again and save again, and that is carried as well, not left in a recreated a.py
+    first.fileTab = "dirty";
+    await new Promise((r) => setTimeout(r, 1300));
+    fs.writeFileSync(path.join(root, "a.py"), "edited again\n");
+    first.fileTab = "clean";
+    await vi.waitFor(() => expect(w.carried).toHaveLength(2), { timeout: 4000 });
+    expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited again\n");
+    expect(fs.existsSync(path.join(root, "a.py"))).toBe(false);
+    expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true);
+    first.dirty = false; // the other editor is saved: now the embed moves to the renamed file
+    await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"), { timeout: 4000 });
+    expect(w.notMoved).toEqual([]);
+    expect(w.carried.map((c) => c.result)).toEqual(["carried", "carried"]);
+    expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited again\n");
+    expect(w.leaves).toHaveLength(1);
+  }, 15000);
+
+  it("an edit that stays unsaved in the renamed file's own tab is not carried while another editor is unsaved either", async () => {
+    const root = tempDir();
+    fs.writeFileSync(path.join(root, "a.py"), "old\n");
+    const w = world({ root });
+    const t = await w.openTab("a.py");
+    const first = t.embed();
+    first.dirty = true;
+    first.fileTab = "dirty";
+    fs.renameSync(path.join(root, "a.py"), path.join(root, "b.py"));
+    w.sync.onRename("b.py", "a.py");
+    await new Promise((r) => setTimeout(r, 2500)); // several watch looks: this file's tab is dirty throughout
+    expect(w.carried).toEqual([]);
+    expect(w.notMoved).toEqual([]);
+    expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true);
+    expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("old\n");
+  });
+
+  it("with no tab to read for the renamed file, a save while ANOTHER editor stays unsaved is not carried, but nothing is lost and the user is told (PR-5 R4, T35)", async () => {
+    // Tab strip hidden by a setting, so only the page-wide probe is left: it stays true while any editor is dirty. A
+    // save of the renamed file's own buffer then never shows as a dirty-to-clean change, so it cannot be told from a
+    // write by something else (R10) and is not carried. The text is in the old path, the renamed file is untouched,
+    // and the notice says so.
+    const root = tempDir();
+    fs.writeFileSync(path.join(root, "a.py"), "old\n");
+    const w = world({ root });
+    const t = await w.openTab("a.py");
+    const first = t.embed();
+    first.dirty = true;
+    fs.renameSync(path.join(root, "a.py"), path.join(root, "b.py"));
+    w.sync.onRename("b.py", "a.py");
+    await new Promise((r) => setTimeout(r, 1300)); // a watch look sees the dirty buffer
+    fs.writeFileSync(path.join(root, "a.py"), "edited\n"); // Cmd+S on the renamed file's buffer; another editor stays dirty
+    await new Promise((r) => setTimeout(r, 1300)); // a watch look sees the old path change while the probe still reads dirty
+    expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true); // still held back
+    first.dirty = false; // the other editor is saved too
+    await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"), { timeout: 4000 });
+    expect(w.carried).toEqual([]);
+    expect(w.notMoved).toEqual([{ from: "a.py", to: "b.py" }]);
+    expect(fs.readFileSync(path.join(root, "a.py"), "utf8")).toBe("edited\n"); // the typed text is still on disk
+    expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("old\n"); // never overwritten on a guess
+  });
+
+  it("while the edits are still unsaved the watch leaves the embed alone", async () => {
+    const w = world();
+    const t = await w.openTab("a.py");
+    t.embed().dirty = true;
+    const first = t.embed();
+    w.sync.onRename("b.py", "a.py");
+    await new Promise((r) => setTimeout(r, 1500)); // a watch tick has passed
+    expect(t.embed()).toBe(first);
+    expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true);
+  });
+
   describe("unsaved edits follow a rename: where the saved bytes end up (G3)", () => {
     /** A temp vault with `a.py`; the tab's save writes to the path its buffer is bound to, as VS Code does. */
     async function renamed(opts: { answers?: Array<"save" | "discard" | "cancel">; to?: string } = {}) {
@@ -586,15 +737,11 @@ describe("vault events (G3, G4)", () => {
       expect(w.carried).toEqual([{ from: "a.py", to: "b.py", result: "carried" }]);
     });
 
-    it("Cmd+S in the tab (no help from the plugin) is seen by the periodic look, so closing later still carries (R8)", async () => {
+    it("Cmd+S in the tab (no help from the plugin) is seen by the periodic look, which carries the edits and reloads onto the renamed file (R8, PR-5 R4)", async () => {
       const { w, t, read, root } = await renamed();
       fs.writeFileSync(path.join(root, "a.py"), "edited\n"); // the workbench's own save
       t.embed().dirty = false;
-      await new Promise((r) => setTimeout(r, 1300)); // one look of the watch
-      expect(w.carried).toEqual([]); // nothing was settled yet
-      t.embed().dirty = false;
-      t.view.notifyVisible();
-      await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"));
+      await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"), { timeout: 4000 }); // one look of the watch, no notifyVisible
       expect(read("b.py")).toBe("edited\n");
       expect(read("a.py")).toBeNull();
       expect(w.carried).toEqual([{ from: "a.py", to: "b.py", result: "carried" }]);
@@ -759,8 +906,6 @@ describe("vault events (G3, G4)", () => {
     const w = world();
     const leaf = new MockLeaf() as unknown as WorkspaceLeaf & { detached: boolean };
     const gate: { release: () => void } = { release: () => undefined };
-    const slow = world();
-    void slow;
     const view = new CodeView(leaf as never, {
       vaultRoot: () => "/vault",
       embedElement: () => "webview",
@@ -803,6 +948,43 @@ describe("vault events (G3, G4)", () => {
     expect(w.prompts).toEqual([]);
     expect(w.open.entries()).toEqual([]);
     restore();
+  });
+
+  it("a delete event that Obsidian fires after the delete call settled is still Obsidian's own: the tab closes with no prompt (PR-5 R3)", async () => {
+    const w = world({ answers: ["cancel"] });
+    const t = await w.openTab("a.py");
+    t.embed().dirty = true;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const app = { vault: { delete: async (_f: { path: string }) => undefined } }; // settles without the event
+      const restore = trackObsidianDeletes(app, w.sync);
+      await app.vault.delete({ path: "a.py" });
+      await vi.advanceTimersByTimeAsync(300); // the file watcher's event arrives afterwards
+      await w.sync.onDelete("a.py");
+      expect(t.leaf.detached).toBe(true);
+      expect(w.prompts).toEqual([]);
+      restore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("after the grace period a delete of the same path counts as an outside delete again: a dirty tab stays open", async () => {
+    const w = world();
+    const t = await w.openTab("a.py");
+    t.embed().dirty = true;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const app = { vault: { delete: async (_f: { path: string }) => undefined } };
+      const restore = trackObsidianDeletes(app, w.sync);
+      await app.vault.delete({ path: "a.py" });
+      await vi.advanceTimersByTimeAsync(OBSIDIAN_DELETE_GRACE_MS + 10);
+      await w.sync.onDelete("a.py");
+      expect(t.leaf.detached).toBe(false);
+      restore();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("an external delete closes a clean tab", async () => {

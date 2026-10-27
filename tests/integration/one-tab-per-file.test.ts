@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileSystemAdapter, Modal, Notice, Plugin, TFile, WorkspaceLeaf, type MockApp } from "../mocks/obsidian";
 import VSCodeWorkbenchPlugin from "../../src/main";
+import { CodeView } from "../../src/code-view";
 import { FAKE_CODE, isAlive, tempDir } from "../helpers";
 
 const VIEW = "vscode-workbench-code";
@@ -377,5 +378,169 @@ describe("the binary and huge-file guard at open (E6)", () => {
     for (const f of files) await plugin.openCodeFile(f);
     expect(live().map((l) => l.file)).toEqual(files);
     expect(Notice.messages.filter((m) => !/downloading the VS Code server/.test(m))).toEqual([]);
+  });
+});
+
+/**
+ * PR-4 R7: the same rules through the REAL CodeView. The leaf here builds a CodeView the way Obsidian's view
+ * registry does (`new CodeView(leaf, plugin)`, onOpen, then setState with the saved state) and nothing replaces
+ * setState, so the view's own leaf-reuse paths (the same file again, a tab moved to another file, a close) run.
+ */
+describe("the real CodeView (PR-4 R7)", () => {
+  /** A webview stand-in: reports dom-ready once its src is set, and reads as a clean buffer. */
+  class FakeEmbed {
+    attrs: Record<string, string> = {};
+    style: Record<string, string> = {};
+    private listeners: Record<string, Array<() => void>> = {};
+    setAttribute(k: string, v: string) {
+      this.attrs[k] = v;
+      if (k === "src" && !this.attrs.fired) {
+        this.attrs.fired = "1";
+        setTimeout(() => this.fire("dom-ready"), 0);
+      }
+    }
+    addEventListener(n: string, fn: () => void) {
+      (this.listeners[n] ??= []).push(fn);
+    }
+    removeEventListener() {}
+    fire(n: string) {
+      for (const fn of this.listeners[n]?.splice(0) ?? []) fn();
+    }
+    async executeJavaScript(code: string) {
+      return code.includes("tab.dirty") ? false : "seeded"; // DIRTY_SCRIPT: clean
+    }
+    focused = 0;
+    focus() {
+      this.focused += 1;
+    }
+    remove() {}
+  }
+  class FakeContent {
+    children: unknown[] = [];
+    style: Record<string, string> = {};
+    addClass() {}
+    empty() {
+      this.children = [];
+    }
+    appendChild(c: unknown) {
+      this.children.push(c);
+    }
+    createDiv() {
+      return new FakeContent();
+    }
+    createEl() {
+      return new FakeContent();
+    }
+    remove() {}
+    isShown() {
+      return true;
+    }
+  }
+
+  class RealLeaf extends WorkspaceLeaf {
+    view: CodeView | null = null;
+    get file(): string | null {
+      return this.view?.filePath || null;
+    }
+    async setViewState(s: { type: string; state?: unknown }): Promise<void> {
+      this.viewState = s;
+      if (s.type !== VIEW) return;
+      if (!this.view) {
+        this.view = new CodeView(this as never, plugin as never);
+        (this.view as unknown as { contentEl: unknown }).contentEl = new FakeContent();
+        await this.view.onOpen();
+      }
+      await this.view.setState(s.state, {} as never);
+      if (this.detached) return;
+      this.viewState = { type: VIEW, state: this.view.getState() };
+    }
+    detach(): void {
+      if (this.detached) return;
+      super.detach();
+      void this.view?.onClose();
+    }
+  }
+
+  const realLive = () => created.filter((l) => !l.detached && l.viewState?.type === VIEW) as unknown as RealLeaf[];
+
+  async function loadReal(): Promise<void> {
+    await load({ embed: "webview" });
+    app.workspace.getLeaf = () => {
+      const l = new RealLeaf();
+      created.push(l as never);
+      return l as never;
+    };
+    vi.stubGlobal("document", { body: { classList: { contains: () => false } }, createElement: () => new FakeEmbed() });
+  }
+
+  const openReal = async (file: string): Promise<RealLeaf> => {
+    const leaf = app.workspace.getLeaf("tab") as unknown as RealLeaf;
+    await leaf.setViewState({ type: VIEW, state: { file } });
+    return leaf;
+  };
+
+  it("the same file given to a second real tab: that tab closes itself and the first stays, focused", async () => {
+    const f = write("a.py");
+    await loadReal();
+    await plugin.openCodeFile(f);
+    const first = realLive()[0];
+    expect(first.file).toBe(f);
+    const second = await openReal(f);
+    expect(second.detached).toBe(true);
+    expect(realLive()).toEqual([first]);
+    expect(revealed[revealed.length - 1]).toBe(first as never);
+  });
+
+  it("given the same file again, a tab that already shows it is left alone (no second load)", async () => {
+    const f = write("a.py");
+    await loadReal();
+    await plugin.openCodeFile(f);
+    const first = realLive()[0];
+    const frame = (first.view as unknown as { frame: FakeEmbed }).frame;
+    await first.setViewState({ type: VIEW, state: { file: f } });
+    expect((first.view as unknown as { frame: FakeEmbed }).frame).toBe(frame);
+    expect(realLive()).toEqual([first]);
+  });
+
+  it("a tab moved to another file gives the first file back: opening it again makes a tab, and the moved tab owns the new file", async () => {
+    const a = write("a.py");
+    const b = write("b.py");
+    await loadReal();
+    await plugin.openCodeFile(a);
+    const leaf = realLive()[0];
+    await leaf.setViewState({ type: VIEW, state: { file: b } }); // navigated in place; the buffer is clean
+    expect(leaf.file).toBe(b);
+    await plugin.openCodeFile(a);
+    expect(realLive()).toHaveLength(2);
+    expect(realLive().map((l) => l.file).sort()).toEqual([a, b]);
+    // b is claimed by the moved tab now: a second tab for it is refused
+    const dup = await openReal(b);
+    expect(dup.detached).toBe(true);
+    expect(realLive()).toHaveLength(2);
+  });
+
+  it("hiding the drawer from the terminal over a Code tab focuses the real CodeView's embed (GP5e, PR-8 R4)", async () => {
+    const f = write("a.py");
+    await loadReal();
+    await plugin.openCodeFile(f);
+    const tab = realLive()[0];
+    const embed = (tab.view as unknown as { frame: FakeEmbed }).frame;
+    (app.workspace as unknown as { getActiveViewOfType: () => unknown }).getActiveViewOfType = () => tab.view; // the real CodeView, not a plain object
+    const before = embed.focused;
+    (plugin as unknown as { focusActiveEditor(): void }).focusActiveEditor();
+    expect(embed.focused).toBe(before + 1);
+  });
+
+  it("a tab closed through the real view gives its file back", async () => {
+    const f = write("a.py");
+    await loadReal();
+    await plugin.openCodeFile(f);
+    const first = realLive()[0];
+    first.detach();
+    await vi.waitFor(() => expect(first.detached).toBe(true));
+    await vi.waitFor(() => expect((plugin as unknown as { openFiles: { existing(f: string): unknown } }).openFiles.existing(f)).toBeNull());
+    await plugin.openCodeFile(f);
+    expect(realLive()).toHaveLength(1);
+    expect(realLive()[0]).not.toBe(first);
   });
 });

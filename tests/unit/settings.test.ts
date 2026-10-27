@@ -189,8 +189,21 @@ describe("buildBrowserSeedScript with the copy of the instance's settings and ke
       { "/User/settings.json": new TextEncoder().encode(JSON.stringify({ "editor.fontSize": 9, "editor.tabSize": 3 })), "/User/keybindings.json": new TextEncoder().encode("[]") },
       { ...copy, id: "start-2", keybindingsBase64: null },
     );
-    expect(JSON.parse(r.text as string)).toEqual({ "editor.tabSize": 3, ...copy.settings, ...BROWSER_APP_SETTINGS });
+    // the copy replaces the profile's file whole: a key set inside the tab (editor.tabSize) or removed from the instance is gone
+    expect(JSON.parse(r.text as string)).toEqual({ ...copy.settings, ...BROWSER_APP_SETTINGS });
     expect(r.keybindings).toBeUndefined();
+  });
+
+  it("drops a key the instance removed since the last start, instead of keeping it in the profile (PR-3 R4)", async () => {
+    const storage = fakeStorage();
+    const first = await runSeed(undefined, { ...copy, settings: { "editor.fontSize": 23, "editor.rulers": [80] } }, storage);
+    expect(JSON.parse(first.text as string)["editor.rulers"]).toEqual([80]);
+    const second = await runSeed(
+      { "/User/settings.json": new TextEncoder().encode(first.text as string) },
+      { ...copy, id: "start-2", settings: { "editor.fontSize": 23 } },
+      storage,
+    );
+    expect(JSON.parse(second.text as string)).toEqual({ "editor.fontSize": 23, ...BROWSER_APP_SETTINGS });
   });
 
   it("applies a copy once per server start: a tab reload keeps what the user changed in the tab", async () => {
@@ -205,10 +218,58 @@ describe("buildBrowserSeedScript with the copy of the instance's settings and ke
     expect(JSON.parse(third.text as string)["editor.fontSize"]).toBe(23);
   });
 
-  it("leaves a profile settings file it cannot parse alone, keybindings included, and does not mark the copy as applied", async () => {
-    const r = await runSeed({ "/User/settings.json": new TextEncoder().encode('{ // hand edited\n}') }, copy);
+  it("replaces a profile settings file that no longer parses when a new copy is due, so the copy still reaches the editor (PR-3 R5)", async () => {
+    const r = await runSeed({ "/User/settings.json": new TextEncoder().encode('{ // hand edited in the tab\n}') }, copy);
+    expect(r.outcome).toBe("seeded");
+    expect(JSON.parse(r.text as string)).toEqual({ ...copy.settings, ...BROWSER_APP_SETTINGS });
+    expect(r.keybindings).toBe(kb);
+    expect(r.storage.map.get(USER_DATA_MARKER_KEY)).toBe("start-1");
+  });
+
+  it("on a tab reload within one start, a file that no longer parses is kept and the outcome says so (PR-3 R5)", async () => {
+    const storage = fakeStorage();
+    storage.setItem(USER_DATA_MARKER_KEY, "start-1"); // this start's copy is already applied
+    const r = await runSeed({ "/User/settings.json": new TextEncoder().encode('{ // hand edited\n}') }, copy, storage);
     expect(r.outcome).toBe("kept");
-    expect(r.keybindings).toBeUndefined();
-    expect(r.storage.map.has(USER_DATA_MARKER_KEY)).toBe(false);
+    expect(r.text).toContain("// hand edited");
+  });
+});
+
+describe("buildBrowserSeedScript when VS Code's database is not what the plugin expects (PR-1 R9)", () => {
+  const script = () => new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${buildBrowserSeedScript(BROWSER_APP_SETTINGS, null)}`) as (...a: unknown[]) => Promise<string>;
+
+  it("answers version-mismatch when the database is already at a newer version", async () => {
+    const indexedDB = {
+      open: () => {
+        const r: { error: unknown; onerror?: () => void } = { error: { name: "VersionError" } };
+        queueMicrotask(() => r.onerror?.());
+        return r;
+      },
+    };
+    expect(await script()(indexedDB, fakeStorage(), TextEncoder, TextDecoder)).toBe("version-mismatch");
+  });
+
+  it("answers no-store when the database has no user-data store", async () => {
+    let closed = 0;
+    const indexedDB = {
+      open: () => {
+        const r: { result: unknown; onsuccess?: () => void } = { result: { objectStoreNames: { contains: () => false }, close: () => void closed++ } };
+        queueMicrotask(() => r.onsuccess?.());
+        return r;
+      },
+    };
+    expect(await script()(indexedDB, fakeStorage(), TextEncoder, TextDecoder)).toBe("no-store");
+    expect(closed).toBe(1);
+  });
+
+  it("answers error:<name> for anything else the page refuses, and still closes the database", async () => {
+    const real = fakeIndexedDB({ "/User/settings.json": "{}" });
+    const db = (real.indexedDB.open("x", 3) as { result: { transaction: unknown } }).result;
+    db.transaction = () => {
+      throw Object.assign(new Error("denied"), { name: "SecurityError" });
+    };
+    const indexedDB = { open: () => { const r: { result: unknown; onsuccess?: () => void } = { result: db }; queueMicrotask(() => r.onsuccess?.()); return r; } };
+    expect(await script()(indexedDB, fakeStorage(), TextEncoder, TextDecoder)).toBe("error:SecurityError");
+    expect(real.state.closed).toBe(1);
   });
 });

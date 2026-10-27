@@ -5,7 +5,7 @@
  * logged it again on every request, with no reason anywhere in the output.)
  */
 import { describe, expect, it } from "vitest";
-import { downloadFailureSignal, isLogNoise } from "../../src/server";
+import { checkDownloadHostReachable, downloadFailureSignal, isLogNoise } from "../../src/server";
 
 describe("downloadFailureSignal", () => {
   it.each([
@@ -28,5 +28,31 @@ describe("isLogNoise", () => {
     ["fatal: the fake server broke", false],
   ])("%s -> %s", (line, noise) => {
     expect(isLogNoise(line)).toBe(noise);
+  });
+});
+
+describe("checkDownloadHostReachable", () => {
+  it("answers false at the timeout when the name lookup never returns (offline, getaddrinfo still retrying) (PR-2 R7)", async () => {
+    const started = Date.now();
+    const reachable = await checkDownloadHostReachable("update.example.invalid", 80, () => undefined);
+    expect(reachable).toBe(false);
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+
+  it("answers false when the lookup fails, and ignores a lookup that finishes after the timeout", async () => {
+    expect(await checkDownloadHostReachable("x", 1000, (_h, cb) => cb(new Error("ENOTFOUND") as NodeJS.ErrnoException, ""))).toBe(false);
+    let late!: () => void;
+    const reachable = await checkDownloadHostReachable("x", 30, (_h, cb) => {
+      late = () => cb(null, "127.0.0.1");
+    });
+    expect(reachable).toBe(false);
+    late(); // must not open a connection or resolve twice
+  });
+
+  it("answers false when the lookup succeeds but nothing accepts the connection on 443", async () => {
+    // Nothing listens on port 443 of loopback here, so the connect is refused at once.
+    const started = Date.now();
+    expect(await checkDownloadHostReachable("x", 1000, (_h, cb) => cb(null, "127.0.0.1"))).toBe(false);
+    expect(Date.now() - started).toBeLessThan(1500);
   });
 });

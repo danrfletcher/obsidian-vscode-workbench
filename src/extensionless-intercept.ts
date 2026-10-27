@@ -13,8 +13,12 @@
  * The mode is the spike decision (`docs/spike-decision.md`, header key
  * `extensionless`): `intercept` opens a Code tab; `system-app` is the fallback
  * for when interception does not work, which hands the file to the system app
- * with a notice instead of leaving a blank tab. A Code tab that cannot open also
- * falls back to the system app.
+ * with a notice instead of leaving a blank tab. When a Code tab cannot be made
+ * (`openInCodeTab` rejects: Obsidian refuses the new tab) the file falls back to
+ * the system app too. `openInCodeTab` does not reject for the failures the
+ * plugin handles itself: a declined licence opens the system app, and a start
+ * failure or a refused file (binary, over the size limit) shows its own notice
+ * and opens no tab, so there is never a blank tab either way.
  */
 import { decideFile } from "./text-file-rules";
 
@@ -33,6 +37,11 @@ export const FILE_ROW_SELECTOR = ".nav-file-title[data-path]";
 /** The part of a DOM click event the interceptor uses. */
 export interface ClickLike {
   button: number;
+  /** Modifier keys: a click with any of them is a gesture of Obsidian's (multi-select, open in a new tab). */
+  shiftKey?: boolean;
+  ctrlKey?: boolean;
+  metaKey?: boolean;
+  altKey?: boolean;
   target: unknown;
   preventDefault(): void;
   stopPropagation(): void;
@@ -45,7 +54,7 @@ interface RowLike {
 export interface InterceptHost {
   mode(): ExtensionlessMode;
   excluded(): readonly string[];
-  /** Open the file in a Code tab. Rejects when it cannot. */
+  /** Open the file in a Code tab. Rejects only when the tab itself cannot be made; see the header comment. */
   openInCodeTab(vaultPath: string): Promise<void>;
   openInSystemApp(vaultPath: string): void;
   notice(message: string): void;
@@ -65,6 +74,8 @@ export const SYSTEM_APP_NOTICE =
 export function createClickInterceptor(host: InterceptHost): (ev: ClickLike) => void {
   return (ev) => {
     if (ev.button !== 0) return;
+    // Only a plain click: shift-, ctrl-, cmd- and alt-clicks keep Obsidian's own meaning on these rows.
+    if (ev.shiftKey || ev.ctrlKey || ev.metaKey || ev.altKey) return;
     const p = rowPath(ev.target);
     if (!p || decideFile(p, host.excluded()).kind !== "extensionless") return;
 

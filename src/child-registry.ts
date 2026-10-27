@@ -13,6 +13,8 @@ export interface RegisteredChild {
   match: string;
   workspace?: string;
   group?: boolean;
+  /** `match` is unique to this program (see PidEntry.findByMatch): the sweep also hunts down its children by it. */
+  findByMatch?: boolean;
   /**
    * Stop this child and everything under it. Signals should go out
    * synchronously (before the first await); the promise settles once it is gone.
@@ -35,6 +37,7 @@ export class ChildRegistry {
       startedAt: Date.now(),
       workspace: child.workspace,
       group: child.group,
+      findByMatch: child.findByMatch,
     });
     return () => this.unregister(child.pid);
   }
