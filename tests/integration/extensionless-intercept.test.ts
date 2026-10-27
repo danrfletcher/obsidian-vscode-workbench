@@ -22,12 +22,12 @@ import { parseDecision } from "../decision";
 import { FAKE_CODE, REPO_ROOT, isAlive, tempDir } from "../helpers";
 
 /** A click on the explorer row for `vaultPath` (or on something that is not a row). */
-function click(vaultPath: string | null, o: { button?: number; inRow?: boolean } = {}) {
+function click(vaultPath: string | null, o: { button?: number; inRow?: boolean; shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; altKey?: boolean } = {}) {
   const row = vaultPath === null ? null : { getAttribute: (n: string) => (n === "data-path" ? vaultPath : null) };
   const target = {
     closest: (selector: string) => (selector === FILE_ROW_SELECTOR && (o.inRow ?? true) ? row : null),
   };
-  const ev = { button: o.button ?? 0, target, preventDefault: vi.fn(), stopPropagation: vi.fn() };
+  const ev = { button: o.button ?? 0, shiftKey: o.shiftKey, ctrlKey: o.ctrlKey, metaKey: o.metaKey, altKey: o.altKey, target, preventDefault: vi.fn(), stopPropagation: vi.fn() };
   return ev;
 }
 
@@ -95,6 +95,10 @@ describe("the interceptor leaves everything else to Obsidian", () => {
     ["an excluded-extension file (still has an extension)", click("a.zig")],
     ["a right click", click("Makefile", { button: 2 })],
     ["a middle click", click("Makefile", { button: 1 })],
+    ["a shift-click (range select)", click("Makefile", { shiftKey: true })],
+    ["a ctrl-click", click("Makefile", { ctrlKey: true })],
+    ["a cmd-click (open in a new tab)", click("Makefile", { metaKey: true })],
+    ["an alt-click", click("Makefile", { altKey: true })],
     ["a click outside the explorer rows", click("Makefile", { inRow: false })],
     ["a click on nothing", click(null)],
   ])("%s", async (_n, ev) => {
@@ -244,6 +248,17 @@ describe("through the plugin (explorer click)", () => {
     expect(Notice.messages).toContain(SYSTEM_APP_NOTICE);
     expect(created).toHaveLength(0);
     expect(serverPids()).toEqual([]); // nothing was started for a file that goes to the system app
+  });
+
+  it.each([["shiftKey"], ["ctrlKey"], ["metaKey"], ["altKey"]] as const)("a click with %s held reaches Obsidian untouched and opens nothing (PR-4 R6)", async (key) => {
+    await load();
+    const ev = click("Makefile", { [key]: true });
+    clickInDocument(ev);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(ev.preventDefault).not.toHaveBeenCalled();
+    expect(ev.stopPropagation).not.toHaveBeenCalled();
+    expect(created).toHaveLength(0);
+    expect(serverPids()).toEqual([]);
   });
 
   it("a click on a file with an extension is left to Obsidian", async () => {

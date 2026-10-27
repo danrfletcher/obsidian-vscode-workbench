@@ -8,17 +8,20 @@ import {
   KEY_MESSAGE_PREFIX,
   PAGE_STATE_KEY,
   buildRelayScript,
+  codeForKey,
   configSignature,
   resolveChords,
   toPageChord,
   type ChordConfig,
   type HotkeyLike,
+  type PageChord,
 } from "../../src/hotkey/hotkey-bridge";
 
 const TOGGLE_ID = "obsidian-vscode-workbench:toggle-terminal-drawer";
 
 interface KeyInit {
   key: string;
+  code?: string;
   ctrlKey?: boolean;
   metaKey?: boolean;
   altKey?: boolean;
@@ -32,6 +35,7 @@ class FakeKey {
   stopped = 0;
   constructor(readonly init: KeyInit) {}
   get key() { return this.init.key; }
+  get code() { return this.init.code; }
   get ctrlKey() { return !!this.init.ctrlKey; }
   get metaKey() { return !!this.init.metaKey; }
   get altKey() { return !!this.init.altKey; }
@@ -72,12 +76,12 @@ const lookupOf = (table: Record<string, HotkeyLike[]>) => (id: string) => table[
 
 describe("toPageChord: Obsidian hotkeys to page chords", () => {
   it.each([
-    ["Mod on macOS is Cmd", hk("o", "Mod"), true, { ctrl: false, meta: true, alt: false, shift: false, key: "o" }],
-    ["Mod elsewhere is Ctrl", hk("o", "Mod"), false, { ctrl: true, meta: false, alt: false, shift: false, key: "o" }],
-    ["Ctrl stays Ctrl on macOS", hk("`", "Ctrl"), true, { ctrl: true, meta: false, alt: false, shift: false, key: "`" }],
-    ["Meta stays Meta elsewhere", hk("k", "Meta"), false, { ctrl: false, meta: true, alt: false, shift: false, key: "k" }],
-    ["all four modifiers", hk("P", "Ctrl", "Meta", "Alt", "Shift"), true, { ctrl: true, meta: true, alt: true, shift: true, key: "p" }],
-    ["no modifiers", hk("F9"), true, { ctrl: false, meta: false, alt: false, shift: false, key: "f9" }],
+    ["Mod on macOS is Cmd", hk("o", "Mod"), true, { ctrl: false, meta: true, alt: false, shift: false, key: "o", code: "KeyO" }],
+    ["Mod elsewhere is Ctrl", hk("o", "Mod"), false, { ctrl: true, meta: false, alt: false, shift: false, key: "o", code: "KeyO" }],
+    ["Ctrl stays Ctrl on macOS", hk("`", "Ctrl"), true, { ctrl: true, meta: false, alt: false, shift: false, key: "`", code: "Backquote" }],
+    ["Meta stays Meta elsewhere", hk("k", "Meta"), false, { ctrl: false, meta: true, alt: false, shift: false, key: "k", code: "KeyK" }],
+    ["all four modifiers", hk("P", "Ctrl", "Meta", "Alt", "Shift"), true, { ctrl: true, meta: true, alt: true, shift: true, key: "p", code: "KeyP" }],
+    ["no modifiers", hk("F9"), true, { ctrl: false, meta: false, alt: false, shift: false, key: "f9", code: "" }],
   ])("%s", (_name, hotkey, isMac, expected) => {
     expect(toPageChord("open-switcher", hotkey, isMac as boolean)).toEqual({ action: "open-switcher", ...(expected as object) });
   });
@@ -86,6 +90,43 @@ describe("toPageChord: Obsidian hotkeys to page chords", () => {
     expect(toPageChord("open-switcher", { modifiers: ["Mod"], key: "" }, true)).toBeNull();
     expect(toPageChord("open-switcher", { modifiers: "Mod" as never, key: "o" }, true)).toBeNull();
     expect(toPageChord("open-switcher", null as never, true)).toBeNull();
+  });
+});
+
+describe("keys whose produced character is not the chord's key (PR-8 R7)", () => {
+  const cfg = (...chords: Array<Partial<PageChord> & { key: string }>): ChordConfig => ({
+    chords: chords.map((c) => ({ action: "toggle-terminal", ctrl: false, meta: false, alt: false, shift: false, code: codeForKey(c.key), ...c })),
+  });
+
+  it("codeForKey: letters, digits and the backtick have a US position; other keys have none", () => {
+    expect([codeForKey("o"), codeForKey("1"), codeForKey("`"), codeForKey("f9"), codeForKey("[")]).toEqual(["KeyO", "Digit1", "Backquote", "", ""]);
+  });
+
+  it("a rebound Alt chord matches on macOS, where Alt+O types the character 'ø'", () => {
+    const p = page(cfg({ key: "o", alt: true, ctrl: true }));
+    const ev = p.press({ key: "ø", code: "KeyO", ctrlKey: true, altKey: true });
+    expect(ev.prevented).toBe(1);
+    expect(p.actions()).toEqual(["toggle-terminal"]);
+  });
+
+  it("Ctrl+` matches on a layout where the backtick is a dead key (event.key is 'Dead')", () => {
+    const p = page(cfg({ key: "`", ctrl: true }));
+    const ev = p.press({ key: "Dead", code: "Backquote", ctrlKey: true });
+    expect(ev.prevented).toBe(1);
+    expect(p.actions()).toEqual(["toggle-terminal"]);
+  });
+
+  it("the position is only the fallback: without Alt or a dead key a different character on that key does not match", () => {
+    const p = page(cfg({ key: "o", ctrl: true }));
+    expect(p.press({ key: "ö", code: "KeyO", ctrlKey: true }).prevented).toBe(0); // a layout where this key types ö
+    expect(p.actions()).toEqual([]);
+  });
+
+  it("the fallback still needs the exact modifiers, and a chord with no US position never falls back", () => {
+    const p = page(cfg({ key: "o", alt: true, ctrl: true }, { key: "f9", action: "open-switcher" }));
+    expect(p.press({ key: "ø", code: "KeyO", altKey: true }).prevented).toBe(0); // Ctrl missing
+    expect(p.press({ key: "Dead", code: "F9" }).prevented).toBe(0);
+    expect(p.actions()).toEqual([]);
   });
 });
 
@@ -174,8 +215,8 @@ describe("the page script", () => {
     ["Cmd+P (quick open)", { key: "p", metaKey: true }],
     ["Cmd+S (save)", { key: "s", metaKey: true }],
     ["Ctrl+Space (IntelliSense)", { key: " ", ctrlKey: true }],
-    ["plain typing, a letter", { key: "o" }],
-    ["plain typing, a backtick", { key: "`" }],
+    ["plain typing, a letter", { key: "o", code: "KeyO" }],
+    ["plain typing, a backtick", { key: "`", code: "Backquote" }],
     ["Enter", { key: "Enter" }],
     ["Cmd+Shift+O (a different chord from Cmd+O)", { key: "o", metaKey: true, shiftKey: true }],
     ["Cmd+Alt+O", { key: "o", metaKey: true, altKey: true }],

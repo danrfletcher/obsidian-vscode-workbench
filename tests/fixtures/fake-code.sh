@@ -5,11 +5,12 @@
 #                                     like the real wrapper (which does NOT forward SIGTERM,
 #                                     so killing only this shell would orphan the server).
 # Env: FAKE_CODE_NODE (node binary), FAKE_CODE_MODE, FAKE_CODE_PIDFILE, FAKE_CODE_ARGSFILE,
-#      FAKE_CODE_DOWNLOAD_REQUESTS.
+#      FAKE_CODE_DOWNLOAD_REQUESTS, FAKE_CODE_HELP_DELAY (seconds `serve-web --help` takes to answer).
 here=$(dirname "$0")
 node_bin=${FAKE_CODE_NODE:-node}
 
 if [ "$1" = "serve-web" ] && [ "$2" = "--help" ]; then
+  if [ -n "$FAKE_CODE_HELP_DELAY" ]; then sleep "$FAKE_CODE_HELP_DELAY"; fi
   if [ "$FAKE_CODE_MODE" = "no-serve-web" ]; then
     echo "error: unrecognized subcommand 'serve-web'" >&2
     exit 2

@@ -21,7 +21,7 @@ import { preflight as realPreflight, type PreflightResult } from "./pty-prefligh
 import { PtySession, realSessionDeps, type SessionDeps, type SessionOptions } from "./pty-session";
 import { ShellStartDir } from "./shell-cwd";
 import { ShellController, type ShellState } from "./terminal-controller";
-import { createXtermView } from "./xterm-view";
+import { createXtermView, DEFAULT_TOGGLE_CHORDS, type ToggleChord } from "./xterm-view";
 
 export interface TerminalHost {
   document: Document;
@@ -48,13 +48,15 @@ export interface TerminalHost {
   addStatusBarItem(): HTMLElement;
   /** Give keyboard focus back to the editor of the active view (the drawer closed with focus in the terminal, GP5e). */
   focusEditor?(): void;
+  /** The chords Obsidian has for "Toggle terminal drawer" now, so the terminal closes the drawer on the rebound key too. Absent: Ctrl+`. */
+  toggleChords?(): readonly ToggleChord[];
   /** Ask whether to kill the running shell named `title`. true only for an explicit confirm; Cancel and Escape are false. */
   confirmKill(title: string): Promise<boolean>;
 }
 
 /** Replacements for the real xterm, preflight and process spawn (tests only). */
 export interface TerminalOverrides {
-  createTerminal?: (host: HTMLElement) => TerminalView;
+  createTerminal?: (host: HTMLElement, options?: { toggleChords?: () => readonly ToggleChord[] }) => TerminalView;
   preflight?: (shell: string) => Promise<PreflightResult>;
   session?: SessionDeps;
   baseEnv?: NodeJS.ProcessEnv;
@@ -68,6 +70,9 @@ export function shellEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return env;
 }
 
+/** How long the drawer state waits after the last change before data.json is written. */
+export const SAVE_DEBOUNCE_MS = 400;
+
 export class TerminalFeature {
   private ui: DrawerUI | null = null;
   private layout: LayoutController | null = null;
@@ -76,6 +81,7 @@ export class TerminalFeature {
   private readonly count: ShellCountItem;
   private id: string | null = null;
   private disposed = false;
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly host: TerminalHost,
@@ -141,7 +147,7 @@ export class TerminalFeature {
       onClosed: (hadFocus) => {
         if (hadFocus) this.host.focusEditor?.();
       },
-      createTerminal: this.overrides.createTerminal ?? createXtermView,
+      createTerminal: (el) => (this.overrides.createTerminal ?? createXtermView)(el, { toggleChords: () => this.host.toggleChords?.() ?? DEFAULT_TOGGLE_CHORDS }),
     });
     ui.onInput((sessionId, data) => this.manager.get(sessionId)?.controller.write(data));
     ui.onTerminalResize((sessionId, cols, rows) => this.manager.get(sessionId)?.controller.resize(cols, rows));
@@ -228,6 +234,7 @@ export class TerminalFeature {
   /** Stop every shell and take the drawer off the page. The kill signals go out before this returns. */
   dispose(): Promise<void> {
     this.disposed = true;
+    if (this.saveTimer) this.flushSave();
     const done = this.manager.dispose();
     this.count.dispose();
     this.ui?.unmount();
@@ -289,10 +296,22 @@ export class TerminalFeature {
     return typeof mine?.height === "number" ? mine.height : undefined;
   }
 
+  /**
+   * Record the drawer state in the plugin data now and write data.json a moment later. Dragging the window edge
+   * fires `resize` many times a second; each one that changes the clamped height lands here, so the write waits
+   * until they stop (PR-6 R4). `dispose` writes at once what is still waiting.
+   */
   private persist(state: DrawerState): void {
     if (!this.id) return;
     const data = this.host.data();
     Object.assign(data, withDrawerState(data, this.id, { height: clampHeight(state.height, this.host.window.innerHeight), open: state.open }));
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => this.flushSave(), SAVE_DEBOUNCE_MS);
+  }
+
+  private flushSave(): void {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = null;
     this.host.save().catch((e: unknown) => console.warn("VS Code Workbench: could not save the terminal drawer state:", e instanceof Error ? e.message : e));
   }
 }

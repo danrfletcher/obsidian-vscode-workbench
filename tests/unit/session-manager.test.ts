@@ -229,10 +229,30 @@ describe("SessionManager", () => {
       expect(manager.count).toBe(0);
       expect(world.spawned).toHaveLength(0);
       expect(manager.sessions).toHaveLength(1);
-      expect(of("count")).toHaveLength(0);
+      // counted while it was starting, and not once it failed
+      expect(of("count").map((e) => (e as { count: number }).count)).toEqual([1, 0]);
       await manager.remove(a.id); // closing it asks nothing of the manager
       expect(manager.sessions).toHaveLength(0);
       expect(manager.count).toBe(0);
+    });
+
+    it("counts a shell that is still starting (preflight not answered yet), then keeps counting it once it runs (PR-7 R2)", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const { manager, of } = managerRig(async () => {
+        await gate;
+        return GOOD;
+      });
+      const a = manager.create()!;
+      await tick();
+      expect(a.controller.state).toEqual({ kind: "starting" });
+      expect(manager.count).toBe(1);
+      expect(of("count").map((e) => (e as { count: number }).count)).toEqual([1]);
+      release();
+      await tick();
+      expect(a.controller.state).toEqual({ kind: "running" });
+      expect(manager.count).toBe(1);
+      expect(of("count").map((e) => (e as { count: number }).count)).toEqual([1]); // no flicker
     });
 
     it("a good shell and a missing one side by side: the count is the good one", async () => {

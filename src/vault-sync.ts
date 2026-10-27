@@ -100,12 +100,36 @@ export interface DeleteHost {
 }
 
 /**
+ * How long a delete stays "Obsidian's own" after the wrapped call has settled (PR-5 R3). Obsidian normally fires the
+ * vault `delete` event before the promise settles, but if it fires it later (from the file watcher, say) the event
+ * would otherwise look like a delete made outside Obsidian and a tab with unsaved edits would stay open. A grace
+ * period closes that gap. Nothing is lost either way (an outside delete only keeps a dirty tab open).
+ */
+export const OBSIDIAN_DELETE_GRACE_MS = 1500;
+
+/**
  * Wrap Obsidian's delete calls (`vault.delete`, `vault.trash`, `fileManager.trashFile`) so `sync` knows a
- * delete is Obsidian's own while it runs. Each wrapper calls the original with the same arguments and
- * returns its result, so behaviour is unchanged. The returned function puts the originals back.
+ * delete is Obsidian's own while it runs, and for `OBSIDIAN_DELETE_GRACE_MS` after it settles. Each wrapper calls
+ * the original with the same arguments and returns its result, so behaviour is unchanged. The returned function
+ * puts the originals back.
  */
 export function trackObsidianDeletes<L extends LeafLike>(app: DeleteHost, sync: VaultSync<L>): () => void {
   const restores: Array<() => void> = [];
+  const graceTimers = new Set<ReturnType<typeof setTimeout>>();
+  const endLater = (end: () => void) => {
+    const timer = setTimeout(() => {
+      graceTimers.delete(timer);
+      end();
+    }, OBSIDIAN_DELETE_GRACE_MS);
+    (timer as { unref?: () => void }).unref?.();
+    graceTimers.add(timer);
+    restores.push(() => {
+      if (graceTimers.delete(timer)) {
+        clearTimeout(timer);
+        end();
+      }
+    });
+  };
   const wrap = (owner: Record<string, any> | undefined, name: string) => {
     if (!owner || typeof owner[name] !== "function") return;
     const original = owner[name] as (...a: any[]) => unknown;
@@ -118,7 +142,7 @@ export function trackObsidianDeletes<L extends LeafLike>(app: DeleteHost, sync: 
         end();
         throw e;
       }
-      return Promise.resolve(result).finally(end);
+      return Promise.resolve(result).finally(() => endLater(end));
     };
     owner[name] = wrapper;
     restores.push(() => {

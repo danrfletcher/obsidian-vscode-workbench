@@ -12,7 +12,7 @@ import VSCodeWorkbenchPlugin from "../../src/main";
 import { DrawerUI } from "../../src/terminal/drawer-ui";
 import { HEADROOM, MIN_HEIGHT } from "../../src/terminal/drawer-geometry";
 import { DRAWER_KEY } from "../../src/terminal/drawer-state";
-import { TerminalFeature, type TerminalHost } from "../../src/terminal/feature";
+import { SAVE_DEBOUNCE_MS, TerminalFeature, type TerminalHost } from "../../src/terminal/feature";
 import type { PreflightResult } from "../../src/terminal/pty-preflight";
 import { ChildRegistry } from "../../src/child-registry";
 import { fakeWorld } from "../fake-pty";
@@ -611,9 +611,40 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
       window.dispatchEvent(pointer("pointermove", { clientY: 450 }));
       window.dispatchEvent(pointer("pointerup", { buttons: 0 }));
       expect(r.data[DRAWER_KEY]).toEqual({ [r.id]: { height: 450, open: true } });
-      expect(r.saves).toBeGreaterThanOrEqual(2);
+      await new Promise((res) => setTimeout(res, SAVE_DEBOUNCE_MS + 100));
+      expect(r.saves).toBe(1);
       strip().click();
       expect(r.data[DRAWER_KEY]).toEqual({ [r.id]: { height: 450, open: false } });
+    });
+
+    it("a burst of window resizes writes data.json once, after they stop; the in-memory state is current throughout (PR-6 R4)", async () => {
+      const r = rig();
+      r.feature.mount();
+      strip().click();
+      handle().dispatchEvent(pointer("pointerdown", { clientY: 600 }));
+      window.dispatchEvent(pointer("pointermove", { clientY: -100 }));
+      window.dispatchEvent(pointer("pointerup", { buttons: 0 }));
+      await new Promise((res) => setTimeout(res, SAVE_DEBOUNCE_MS + 100));
+      const before = r.saves;
+      for (const h of [880, 860, 840, 820, 800, 780, 760, 740]) {
+        setWindowHeight(h);
+        window.dispatchEvent(new Event("resize"));
+        expect((r.data[DRAWER_KEY] as Record<string, { height: number }>)[r.id].height).toBe(h - HEADROOM);
+      }
+      expect(r.saves).toBe(before); // nothing written during the burst
+      await new Promise((res) => setTimeout(res, SAVE_DEBOUNCE_MS + 100));
+      expect(r.saves).toBe(before + 1);
+    });
+
+    it("what is still waiting to be written is written when the feature is disposed", async () => {
+      const r = rig();
+      r.feature.mount();
+      strip().click();
+      expect(r.saves).toBe(0);
+      await r.feature.dispose();
+      expect(r.saves).toBe(1);
+      await new Promise((res) => setTimeout(res, SAVE_DEBOUNCE_MS + 100));
+      expect(r.saves).toBe(1); // the timer was cleared, no second write
     });
 
     it("restores height and open state after the plugin is reloaded: the drawer comes back open with a fresh shell", async () => {
@@ -651,7 +682,7 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
       expect((b.data[DRAWER_KEY] as Record<string, { open: boolean }>)["device-aaaa-1111"].open).toBe(true);
     });
 
-    it("clamps a saved height taller than the window on restore, and corrects the stored value (E14)", () => {
+    it("clamps a saved height taller than the window on restore, and corrects the stored value (E14)", async () => {
       setWindowHeight(600);
       const r = rig({ data: { [DRAWER_KEY]: { "device-aaaa-1111": { height: 4000, open: true } } } });
       r.feature.mount();
@@ -659,6 +690,7 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
       expect(px("--vscw-open-height")).toBe(600 - HEADROOM);
       expect(strip()).not.toBeNull();
       expect((r.data[DRAWER_KEY] as Record<string, { height: number }>)["device-aaaa-1111"].height).toBe(600 - HEADROOM);
+      await new Promise((res) => setTimeout(res, SAVE_DEBOUNCE_MS + 100));
       expect(r.saves).toBeGreaterThan(0);
     });
 

@@ -5,8 +5,8 @@
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ServerStartError, WorkbenchServer, checkServeWebSupport, type CodeBuild } from "../../src/server";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ServerStartError, StartCancelledError, WorkbenchServer, checkServeWebSupport, findFreePort as freePort, type CodeBuild } from "../../src/server";
 import { FAKE_CODE, isAlive, listenersOn, tempDir } from "../helpers";
 
 let runtimeDir: string;
@@ -147,6 +147,28 @@ describe("stop", () => {
 
   it("is a no-op when nothing was started", async () => {
     await expect(make().stop()).resolves.toBeUndefined();
+  });
+
+  it("a stop() that lands while the port is being picked cancels the start: nothing is spawned (PR-1 R3)", async () => {
+    let releasePort!: (port: number) => void;
+    const findPort = () => new Promise<number>((resolve) => (releasePort = resolve));
+    const s = make({}, { findPort });
+    const start = s.ensureStarted();
+    const outcome = start.catch((e: unknown) => e);
+    await vi.waitFor(() => expect(releasePort).toBeTypeOf("function"));
+    await s.stop(); // before the spawn: there is no child yet
+    releasePort(await freePort());
+    expect(await outcome).toBeInstanceOf(StartCancelledError);
+    expect(s.pid).toBeUndefined();
+    expect(s.current).toBeNull();
+    expect(serverPids()).toEqual([]); // the fake server writes its pid when it runs: it never ran
+  });
+
+  it("a stop() before a first start does not poison the next start", async () => {
+    const s = make();
+    await s.stop();
+    const r = await s.ensureStarted();
+    expect(await get(r.port, `/?tkn=${r.token}`)).toBe(302);
   });
 });
 

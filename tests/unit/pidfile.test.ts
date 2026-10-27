@@ -22,6 +22,7 @@ function fakeDeps(commands: Record<number, string>, opts: { children?: Record<nu
   const deps: SweepDeps = {
     commandOf: (pid) => (alive.has(pid) ? commands[pid] : null),
     descendants: (pid) => opts.children?.[pid] ?? [],
+    pidsMatching: (marker) => [...alive].filter((pid) => commands[pid]?.includes(marker) && pid !== 999),
     signal: (pid, sig) => {
       signals.push({ pid, sig, group: false });
       if (sig === "SIGKILL" || !opts.ignoreTerm?.includes(pid)) alive.delete(pid);
@@ -166,7 +167,7 @@ describe("sweepOrphans", () => {
       throw new Error("must not list processes for a corrupt file");
     };
     const r = await sweepOrphans(f, deps, 0);
-    expect(r).toEqual({ killed: [], gone: [], reused: [], corrupt: true });
+    expect(r).toEqual({ killed: [], gone: [], reused: [], stragglers: [], corrupt: true });
     expect(signals).toEqual([]);
     expect(fs.existsSync(f)).toBe(false);
   });
@@ -176,7 +177,7 @@ describe("sweepOrphans", () => {
     deps.commandOf = () => {
       throw new Error("must not list processes");
     };
-    await expect(sweepOrphans(path.join(tempDir(), "none.json"), deps, 0)).resolves.toEqual({ killed: [], gone: [], reused: [], corrupt: false });
+    await expect(sweepOrphans(path.join(tempDir(), "none.json"), deps, 0)).resolves.toEqual({ killed: [], gone: [], reused: [], stragglers: [], corrupt: false });
   });
 
   it("an entry without the group flag is not killed by process group", async () => {
@@ -184,5 +185,70 @@ describe("sweepOrphans", () => {
     const { deps, signals } = fakeDeps({ 41001: cmd });
     await sweepOrphans(f, deps, 0);
     expect(signals.filter((s) => s.group)).toEqual([]);
+  });
+
+  describe("an entry matched by this vault's own marker (findByMatch)", () => {
+    const TOKEN = "/Users/dan/vault A/.obsidian/plugins/vscode-workbench/.server/connection-token";
+    const own = `code serve-web --connection-token-file ${TOKEN}`;
+    const mine = (over: Partial<PidEntry> = {}) => entry({ match: TOKEN, findByMatch: true, ...over });
+
+    it("kills the re-parented server after its wrapper has died, and nothing else that says serve-web", async () => {
+      const f = setup([mine()]);
+      const other = "code serve-web --connection-token-file /Users/dan/vault B/.server/connection-token";
+      // 41001 (the wrapper) is gone; 41002 is its re-parented child; 41003 is another vault's server
+      const { deps, signals, alive } = fakeDeps({ 41002: `${own} --port 5000`, 41003: other, 41004: "code serve-web" });
+      const r = await sweepOrphans(f, deps, 0);
+      expect(r.gone.map((e) => e.pid)).toEqual([41001]);
+      expect(r.stragglers).toEqual([41002]);
+      expect([...alive].sort()).toEqual([41003, 41004]);
+      expect(signals.filter((s) => s.group)).toEqual([]); // the dead wrapper's group id is never signalled
+      expect(signals.map((s) => s.pid)).not.toContain(41001);
+      expect(fs.existsSync(f)).toBe(false);
+    });
+
+    it("does not kill a reused wrapper pid that is another serve-web, but still finds this vault's children", async () => {
+      const f = setup([mine()]);
+      const { deps, alive } = fakeDeps({ 41001: "code serve-web --connection-token-file /elsewhere/token", 41002: own });
+      const r = await sweepOrphans(f, deps, 0);
+      expect(r.reused.map((e) => e.pid)).toEqual([41001]);
+      expect(r.killed).toEqual([]);
+      expect(r.stragglers).toEqual([41002]);
+      expect([...alive]).toEqual([41001]);
+    });
+
+    it("a live wrapper is killed with its tree once, and the marker search adds only processes outside the tree", async () => {
+      const f = setup([mine()]);
+      const { deps, signals, alive } = fakeDeps({ 41001: own, 41002: own, 41005: own }, { children: { 41001: [41002] } });
+      const r = await sweepOrphans(f, deps, 0);
+      expect(r.killed.map((e) => e.pid)).toEqual([41001]);
+      expect(r.stragglers).toEqual([41005]);
+      expect([...alive]).toEqual([]);
+      expect(signals.filter((s) => !s.group && s.sig === "SIGTERM").map((s) => s.pid)).toEqual([41001, 41002, 41005]);
+    });
+
+    it("never signals this process or its parent, even when they carry the marker", async () => {
+      const f = setup([mine()]);
+      const { deps, signals } = fakeDeps({ 999: own });
+      deps.pidsMatching = () => [999];
+      await sweepOrphans(f, deps, 0);
+      expect(signals).toEqual([]);
+    });
+
+    it("an entry without findByMatch is not searched for by marker", async () => {
+      const f = setup([entry({ match: TOKEN })]);
+      const { deps, alive } = fakeDeps({ 41002: own });
+      const r = await sweepOrphans(f, deps, 0);
+      expect(r.stragglers).toEqual([]);
+      expect([...alive]).toEqual([41002]);
+    });
+
+    it("the flag survives the pidfile round trip, and an entry without it does not gain the key", () => {
+      const file = new PidFile(path.join(tempDir(), "pids.json"));
+      file.add(mine());
+      file.add(entry({ pid: 41009 }));
+      const [a, b] = file.read().entries;
+      expect(a.findByMatch).toBe(true);
+      expect("findByMatch" in b).toBe(false);
+    });
   });
 });

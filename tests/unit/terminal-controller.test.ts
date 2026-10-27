@@ -169,6 +169,33 @@ describe("ShellController", () => {
       expect(controller.liveCount).toBe(1);
     });
 
+    it("restart while a start is in flight kills the shell that start makes: one shell is left, none untracked (PR-6 R2)", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let first = true;
+      const { world, controller } = setup(async () => {
+        if (first) {
+          first = false;
+          await gate; // the first start's checks are still running
+        }
+        return GOOD;
+      });
+      const starting = controller.ensure();
+      await tick();
+      expect(controller.state).toEqual({ kind: "starting" });
+      const restarting = controller.restart();
+      await tick();
+      release();
+      await Promise.all([starting, restarting]);
+      expect(world.spawned).toHaveLength(2); // the in-flight start's shell, and the restart's
+      const [orphanCandidate, current] = world.spawned.map((x) => x.child.pid);
+      expect(world.signals.some(([pid, sig]) => pid === orphanCandidate && sig === "SIGTERM")).toBe(true);
+      expect(controller.state).toEqual({ kind: "running" });
+      expect(controller.liveCount).toBe(1);
+      await controller.dispose();
+      expect(world.signals.some(([pid, sig]) => pid === current && sig === "SIGTERM")).toBe(true);
+    });
+
     it("restart after an exit starts a new shell", async () => {
       const { world, controller } = setup();
       await controller.ensure();

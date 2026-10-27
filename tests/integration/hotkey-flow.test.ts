@@ -15,10 +15,13 @@ import { FAKE_CODE, isAlive, tempDir } from "../helpers";
 import { listDescendants } from "../../src/process-utils";
 
 const emulators: FakeTerminalView[] = [];
+/** What the plugin gave each terminal view to find the close key with (the real view reads it on every key). */
+const viewOptions: Array<{ toggleChords?: () => ReadonlyArray<Record<string, unknown>> } | undefined> = [];
 vi.mock("../../src/terminal/xterm-view", async () => {
   const { FakeTerminalView } = await import("../fake-terminal-view");
   return {
-    createXtermView: () => {
+    createXtermView: (_host: unknown, options?: (typeof viewOptions)[number]) => {
+      viewOptions.push(options);
       const v = new FakeTerminalView();
       emulators.push(v);
       return v;
@@ -204,6 +207,12 @@ async function openEmbed(mode: "webview" | "iframe" = "webview"): Promise<StubEm
   return embed;
 }
 
+/** One shell, past its start (the status-bar count includes a shell that is still starting, so count alone no longer says it runs). */
+function shellRunning(): boolean {
+  const m = term().terminal.sessions;
+  return m.count === 1 && m.sessions.every((x: { controller: { state: { kind: string } } }) => x.controller.state.kind === "running");
+}
+
 function rememberShellPids(): void {
   for (const c of (plugin as unknown as { registry: { list(): Array<{ pid: number; label: string }> } }).registry.list()) if (c.label === "terminal-shell") pids.add(c.pid);
 }
@@ -220,6 +229,7 @@ beforeEach(async () => {
   custom = {};
   view = { type: VIEW, file: null };
   emulators.length = 0;
+  viewOptions.length = 0;
   logged.length = 0;
   mocks.Plugin.reset();
   mocks.Notice.reset();
@@ -280,7 +290,7 @@ describe("Ctrl+` relayed from the embed (webview channel)", () => {
     expect(ev.prevented).toBe(1); // no backtick typed into the editor
     expect(drawerOpen()).toBe(true);
     expect(embed.focusCalls).toEqual(["blur"]); // focus leaves the embed so the terminal gets the typing
-    await waitUntil(() => term().terminal.sessions.count === 1);
+    await waitUntil(shellRunning);
     rememberShellPids();
     emulators[0].type("pwd\n");
     await waitUntil(() => emulators[0].text().includes(path.join(vault, "AWS SA Associate Mock Exams/scripts")));
@@ -290,7 +300,7 @@ describe("Ctrl+` relayed from the embed (webview channel)", () => {
     await loadPlugin();
     const embed = await openEmbed();
     embed.press({ key: "`", ctrlKey: true });
-    await waitUntil(() => term().terminal.sessions.count === 1);
+    await waitUntil(shellRunning);
     rememberShellPids();
     const [firstPid] = [...pids];
     embed.press({ key: "`", ctrlKey: true });
@@ -385,7 +395,7 @@ describe("Ctrl+` relayed from the embed (webview channel)", () => {
     await loadPlugin();
     const embed = await openEmbed();
     embed.press({ key: "`", ctrlKey: true });
-    await waitUntil(() => term().terminal.sessions.count === 1);
+    await waitUntil(shellRunning);
     rememberShellPids();
     view.file = "other/b.py"; // the user moves to another tab afterwards
     emulators[0].type("pwd\n");
@@ -396,7 +406,7 @@ describe("Ctrl+` relayed from the embed (webview channel)", () => {
   describe("keyboard focus when the drawer closes with focus in the terminal (GP5e)", () => {
     async function revealAndFocusTerminal(embed: StubEmbed): Promise<void> {
       embed.press({ key: "`", ctrlKey: true });
-      await waitUntil(() => term().terminal.sessions.count === 1);
+      await waitUntil(shellRunning);
       rememberShellPids();
       const field = document.createElement("textarea"); // xterm's helper textarea
       document.querySelector(".vscw-terminal")!.appendChild(field);
@@ -507,6 +517,19 @@ describe("rebinding and reloads", () => {
     expect(drawerOpen()).toBe(true);
   });
 
+  it("the terminal's own close key is the command's live hotkey list: Ctrl+` by default, the new chord after a rebinding, none when unbound (PR-8 R3)", async () => {
+    await loadPlugin();
+    const embed = await openEmbed();
+    embed.press({ key: "`", ctrlKey: true });
+    await waitUntil(shellRunning);
+    const chordsNow = () => (viewOptions[0]!.toggleChords!() as Array<Record<string, unknown>>).map((c) => [c.ctrl, c.alt, c.shift, c.meta, c.key]);
+    expect(chordsNow()).toEqual([[true, false, false, false, "`"]]);
+    custom[TOGGLE_COMMAND] = [{ modifiers: ["Ctrl", "Alt"], key: "j" }];
+    expect(chordsNow()).toEqual([[true, true, false, false, "j"]]); // no resync needed: read on every key
+    custom[TOGGLE_COMMAND] = [];
+    expect(chordsNow()).toEqual([]);
+  });
+
   it("unbinding the command in Obsidian frees the chord for VS Code", async () => {
     await loadPlugin();
     const embed = await openEmbed();
@@ -609,7 +632,7 @@ describe("the fallback: the recorded decision is `no` (E12, F2)", () => {
     expect(embed.focusCalls).toEqual([]);
     (document.querySelector(".vscw-strip") as HTMLElement).click();
     expect(drawerOpen()).toBe(true);
-    await waitUntil(() => term().terminal.sessions.count === 1);
+    await waitUntil(shellRunning);
     rememberShellPids();
   });
 

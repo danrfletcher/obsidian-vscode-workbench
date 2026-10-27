@@ -248,6 +248,15 @@ export function rewriteExtensionsJson(raw: string, targetDir: string): string {
   return JSON.stringify(out);
 }
 
+/** Whether `p` is a directory (a link is followed). A dangling link or a vanished entry is not one: it is skipped, never thrown. */
+function isDirectory(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Make the chosen build's installed extensions visible to the server without
  * touching that build's folder (F3): each extension directory is symlinked into
@@ -272,7 +281,7 @@ export function shareExtensions(sourceDir: string | null, serverDataDir: string)
       fs.writeFileSync(dst, rewriteExtensionsJson(fs.readFileSync(src, "utf8"), target));
     } else if (name.startsWith(".")) {
       continue;
-    } else if (fs.statSync(src).isDirectory()) {
+    } else if (isDirectory(src)) {
       if (!fs.existsSync(dst)) fs.symlinkSync(src, dst, "dir");
       linked++;
     }
@@ -352,17 +361,30 @@ export function httpProbe(port: number, token: string, timeoutMs = 2000): Promis
  * Whether the download host can be reached: a name lookup, then a TCP connect to
  * port 443 (no request is sent). `serve-web` does not say why a download failed,
  * so this is how "the network is unreachable" is told apart from any other
- * download failure.
+ * download failure. Each of the two steps gets `timeoutMs`: offline, getaddrinfo
+ * can keep retrying for far longer than that, and the answer must not wait for it.
  */
-export function checkDownloadHostReachable(host = DOWNLOAD_HOST, timeoutMs = 4000): Promise<boolean> {
+export function checkDownloadHostReachable(
+  host = DOWNLOAD_HOST,
+  timeoutMs = 4000,
+  lookup: (host: string, cb: (err: NodeJS.ErrnoException | null, address: string) => void) => void = dns.lookup,
+): Promise<boolean> {
   return new Promise((resolve) => {
-    dns.lookup(host, (err, address) => {
-      if (err) return resolve(false);
-      const socket = net.connect({ host: address, port: 443, timeout: timeoutMs });
-      const done = (ok: boolean) => {
-        socket.destroy();
-        resolve(ok);
-      };
+    let settled = false;
+    let socket: net.Socket | null = null;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(lookupTimer);
+      socket?.destroy();
+      resolve(ok);
+    };
+    const lookupTimer = setTimeout(() => done(false), timeoutMs);
+    lookup(host, (err, address) => {
+      if (settled) return; // the lookup timer already answered
+      clearTimeout(lookupTimer);
+      if (err) return done(false);
+      socket = net.connect({ host: address, port: 443, timeout: timeoutMs });
       socket.once("connect", () => done(true));
       socket.once("timeout", () => done(false));
       socket.once("error", () => done(false));
@@ -565,6 +587,9 @@ export class WorkbenchServer {
   }
 
   private async start(): Promise<RunningServer> {
+    // Reset before the first await: a stop() that lands while the port is being picked is then seen below
+    // (resetting it after the await would swallow that stop and spawn a server nobody wants).
+    this.stopRequested = false;
     const { build, runtimeDir } = this.opts;
     const tokenFile = path.join(runtimeDir, "connection-token");
     this.tokenFile = tokenFile;
@@ -575,6 +600,7 @@ export class WorkbenchServer {
     const token = createTokenFile(tokenFile);
     shareExtensions(build.extensionsDir, this.serverDataDir);
     const port = await pickPort(this.opts.findPort);
+    if (this.stopRequested) throw new StartCancelledError(); // stop() came in before the spawn: nothing to kill
     const args = buildServeWebArgs({
       port,
       tokenFile,
@@ -589,7 +615,6 @@ export class WorkbenchServer {
     this.downloadStartLines = 0;
     this.downloadErrorLine = null;
     this.exit = null;
-    this.stopRequested = false;
     // detached => its own process group, so stop() can take the whole tree down.
     const child = spawn(build.cli, args, {
       detached: true,
@@ -604,7 +629,10 @@ export class WorkbenchServer {
       this.opts.registry?.register({
         pid: child.pid,
         label: "vscode-server",
-        match: "serve-web",
+        // This vault's token-file path is on the command line of the wrapper and of every process it
+        // starts, so the next startup's sweep finds a re-parented server and spares another "serve-web".
+        match: tokenFile,
+        findByMatch: true,
         workspace: this.opts.workspace,
         group: true,
         kill: () => server.stop(),

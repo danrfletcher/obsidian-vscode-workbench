@@ -1,5 +1,6 @@
 /** The Code tab: one Obsidian tab hosting the VS Code web workbench for one file. */
 import { ItemView, type ViewStateResult, type WorkspaceLeaf } from "obsidian";
+import { DIRTY_SCRIPT, fileDirtyScript } from "./dirty-script";
 import { decide, resolveChoice, SETTLE_MS, SETTLE_POLL_MS, type AutoSave, type BufferState } from "./dirty-guard";
 import { LicenceDeclinedError } from "./licence";
 import type { CloseDirtyRequest } from "./modals";
@@ -134,16 +135,6 @@ interface PendingMove {
 }
 
 /**
- * Reads whether the page holds an unsaved buffer. The VS Code web workbench puts
- * "●" in front of the window title when the active editor is dirty, and marks a
- * dirty editor tab with the class `dirty`. The result is `true` or `false`.
- */
-export const DIRTY_SCRIPT = `(() => {
-  if ((document.title || "").startsWith("\u25cf")) return true;
-  return document.querySelector(".monaco-workbench .tab.dirty") !== null;
-})()`;
-
-/**
  * VS Code's default "Save All" key sequence, as Electron key events: Cmd+Alt+S on macOS, and the
  * chord Ctrl+K then S on Windows and Linux. Each entry is a key pressed and released.
  */
@@ -154,6 +145,8 @@ export function saveAllKeys(platform: string): Array<{ keyCode: string; modifier
     { keyCode: "S", modifiers: [] },
   ];
 }
+
+export { DIRTY_SCRIPT };
 
 export const CRASH_TEXT =
   "The VS Code server stopped unexpectedly. Restarting reloads this tab, and any unsaved changes in your open Code tabs are lost. Copy anything you need first.";
@@ -173,28 +166,35 @@ interface WebviewLike extends HTMLElement {
 
 /**
  * Run `script` once in the page the webview has just loaded (same origin as the
- * workbench), then resolve. Best effort: a missing `dom-ready`, a rejected script
- * or the timeout all resolve, so the workbench still opens.
+ * workbench), then resolve with what the script returned. Best effort: a missing
+ * `dom-ready`, a rejected script or the timeout all resolve (with "timeout",
+ * "unsupported" or "error:<message>"), so the workbench still opens.
  */
-export function runInWebview(el: WebviewLike, script: string, timeoutMs = 8000): Promise<void> {
+export function runInWebview(el: WebviewLike, script: string, timeoutMs = 8000): Promise<unknown> {
   return new Promise((resolve) => {
     let done = false;
-    const finish = () => {
+    const finish = (outcome: unknown) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve();
+      resolve(outcome);
     };
-    const timer = setTimeout(finish, timeoutMs);
+    const timer = setTimeout(() => finish("timeout"), timeoutMs);
     el.addEventListener(
       "dom-ready",
       () => {
-        if (typeof el.executeJavaScript !== "function") return finish();
-        el.executeJavaScript(script).then(finish, finish);
+        if (typeof el.executeJavaScript !== "function") return finish("unsupported");
+        el.executeJavaScript(script).then(finish, (e) => finish(`error:${e instanceof Error ? e.message : String(e)}`));
       },
       { once: true },
     );
   });
+}
+
+/** Say in the console how the browser-profile seed went, so a seed that quietly stops working can be seen. */
+export function logSeedOutcome(outcome: unknown): void {
+  if (outcome === "seeded") console.debug("VS Code Workbench: browser profile seeded");
+  else console.warn(`VS Code Workbench: the browser profile seed did not apply (${String(outcome)}); the workbench opens with its own defaults, so extension update checks, experiments and telemetry may not be switched off for this tab.`);
 }
 
 export function baseName(file: string): string {
@@ -428,6 +428,26 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
   }
 
   /**
+   * Like `bufferState`, but for the buffer of ONE file when other editors of the page may be unsaved too. The page-wide
+   * probe stays "dirty" while any editor is unsaved, which would hide a save of this file's own buffer. So when the page
+   * reads dirty, the tab of this file is asked: "clean" only when that tab is found and is not dirty. A tab that is
+   * not found (tab strip hidden by a setting, editor closed), an answer that makes no sense or a failed read keep the
+   * page-wide "dirty": never a guess towards clean.
+   */
+  private async fileState(path: string): Promise<BufferState> {
+    const page = await this.bufferState();
+    if (page !== "dirty") return page;
+    const f = this.frame as WebviewLike | null;
+    if (!f || typeof f.executeJavaScript !== "function") return page;
+    try {
+      const name = path.slice(path.lastIndexOf("/") + 1);
+      return (await withTimeout(f.executeJavaScript(fileDirtyScript(name)), READ_TIMEOUT_MS)) === "clean" ? "clean" : "dirty";
+    } catch {
+      return "dirty";
+    }
+  }
+
+  /**
    * Whether this tab must keep the server alive and be asked about: it holds an unsaved buffer, or the
    * page cannot be asked. An unsaved buffer is never discarded on a guess (E13). Used by the idle clock,
    * the quit prompt and the restart prompt.
@@ -636,9 +656,11 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
       this.frame = el;
       this.detachBridge = this.host.attachEmbed?.(el) ?? null;
       if (isWebview) {
-        await runInWebview(
-          el as WebviewLike,
-          buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...this.host.workbenchOverlay?.() }, this.host.userDataCopy()),
+        logSeedOutcome(
+          await runInWebview(
+            el as WebviewLike,
+            buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...this.host.workbenchOverlay?.() }, this.host.userDataCopy()),
+          ),
         );
         if (this.frame === el) el.setAttribute("src", url);
       }
@@ -714,7 +736,12 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     if (this.moveWatch) return;
     this.moveWatch = setInterval(() => {
       if (!this.pendingMove || this.closed) return this.stopMoveWatch();
-      void this.observeMove();
+      // A save made inside the embed raises no event of the plugin's: this look is what notices it, and the rename
+      // held back by the unsaved edits is applied at once (a reload onto the renamed file), not when the user next
+      // switches tabs. repoint() does nothing while the buffer is still unsaved or unreadable.
+      void this.observeMove().then(() => {
+        if (this.shownFile !== this.file) void this.repoint();
+      });
     }, MOVE_WATCH_MS);
     (this.moveWatch as { unref?: () => void }).unref?.();
   }
@@ -728,7 +755,12 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
    * Look at the buffer and at the old path of a renamed file, and note whether the tab saved since the last look
    * (R8). A save is the buffer going from dirty to clean while the old path's file changed, because a save writes the
    * file before the buffer reads clean. Edits that are undone (clean again with no write by the tab) leave the file
-   * as it was, so a file put there by something else is never taken for the tab's save. Never throws.
+   * as it was, so a file put there by something else is never taken for the tab's save. The page-wide probe stays
+   * dirty while ANY editor of the page is unsaved (another file's edits, or a buffer the workbench restored), so the
+   * state is read for this file's own tab (`fileState`): a save of this buffer shows as dirty-to-clean even then.
+   * Only when that tab cannot be found does the page-wide answer stand, and a save is then not seen: it is not
+   * carried (it cannot be told from a write by something else), and settleRename tells the user that the text is in
+   * the old path. Nothing is lost or overwritten. Never throws.
    */
   observeMove(): Promise<void> {
     const look = this.observing.then(() => this.lookAtMove()).catch(() => undefined);
@@ -745,7 +777,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     if (!from) return;
     const stat = (): Promise<string | null> => this.statOld(from);
     const before = await stat();
-    const state = await this.bufferState();
+    const state = await this.fileState(from);
     if (state === "unreadable") {
       // The buffer was not seen, so a later dirty-to-clean change cannot be matched with the earlier look: it is not
       // counted as a save (R11). A save made in this gap is then reported as "not moved", never carried on a guess.
@@ -796,31 +828,34 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
    * After a rename, edits saved from the workbench went to the file's OLD path (the buffer is bound to it), which
    * brings that file back while the renamed file keeps its old text. Moves them into the renamed file. Called
    * when the tab is about to close or reload and when Obsidian quits; does nothing for a tab that was not
-   * renamed, and nothing was saved. Never throws.
+   * renamed, and nothing was saved. True when the edits were moved into the renamed file. Never throws.
    */
-  async settleRename(): Promise<void> {
+  async settleRename(): Promise<boolean> {
     await this.observeMove(); // a last look: a save since the previous one still counts
     const move = this.pendingMove;
-    if (!move) return;
+    if (!move) return false;
     this.pendingMove = null;
     this.stopMoveWatch();
     try {
       // Carry only if the old path is still exactly the file the save the plugin saw wrote: a file put there since (a shell, git
       // checkout, a new file with the old name) is not the tab's (R10).
       const intact = move.saved && move.savedSig !== null && (await this.statOld(move.from)) === move.savedSig;
-      if (intact) await this.host.carryEdits?.(move.from, move.to, await move.baseline);
-      else if (move.everDirty && (await this.host.readBaseline?.(move.from)) != null) this.host.editsNotMoved?.(move.from, move.to);
+      if (intact) return (await this.host.carryEdits?.(move.from, move.to, await move.baseline)) === "carried";
+      if (move.everDirty && (await this.host.readBaseline?.(move.from)) != null) this.host.editsNotMoved?.(move.from, move.to);
     } catch (e) {
       console.warn("VS Code Workbench: could not move saved edits to the renamed file:", e instanceof Error ? e.message : e);
     }
+    return false;
   }
 
   /**
    * Point the embed at `file` if a rename left it on the old path. Does nothing while the embed is loading
    * (the load's end calls this again), while the tab is stopped or crashed (its next load uses the new
    * path), or while the buffer holds unsaved edits or cannot be read: a reload would drop them, so the
-   * embed stays on the old buffer, and the move is applied once it is saved (checked when the tab is shown),
-   * after the saved text has been carried from the old path into the renamed file.
+   * embed stays on the old buffer, and the move is applied once it is saved (checked when the tab is shown, and at every look of the move watch, so a save made inside the embed applies it within about a second),
+   * after the saved text has been carried from the old path into the renamed file. The reload waits for every
+   * editor of the page to be saved, but the carrying does not: a save of this file's own buffer is carried at once
+   * (`carryHeld`), even while another editor stays unsaved.
    * Repeated renames end in one reload to the final path.
    */
   private async repoint(): Promise<void> {
@@ -828,14 +863,38 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     this.repointing = true;
     try {
       while (!this.closed && !this.deleted && this.frame && this.shownFile !== this.file && !this.loading && !this.admitting && !this.crashed && !this.stale) {
-        if ((await this.bufferState()) !== "clean") return;
+        if ((await this.bufferState()) !== "clean") return void (await this.carryHeld());
         if (this.shownFile === this.file || this.closed) return;
         await this.settleRename();
+        // settleRename took several async round trips (page query, stat, file IO), during which the user may have typed
+        // again. The reload would drop that text, so the buffer is checked once more right before it.
+        if (this.closed || this.deleted) return;
+        if ((await this.bufferState()) !== "clean") {
+          // The buffer is bound to the old path still, and settleRename has forgotten the move: remember it again, so the
+          // next save is carried into the renamed file (and not left to recreate the old one). The watch applies the
+          // reload once that save has happened.
+          this.notePendingMove(this.file);
+          return;
+        }
         await this.loadWorkbench();
       }
     } finally {
       this.repointing = false;
     }
+  }
+
+  /**
+   * The page cannot be reloaded (some editor of it is unsaved), but this renamed file's own buffer may have been saved
+   * meanwhile: its text sits in the old path, where it would stay until the reload. Carry it into the renamed file now.
+   * The buffer is still bound to the old path, so the move is remembered again: a later save of it is carried too, and
+   * not left to recreate the old file. Does nothing unless a save was seen and this file's own tab reads clean.
+   */
+  private async carryHeld(): Promise<void> {
+    const move = this.pendingMove;
+    if (!move?.saved || this.closed || this.deleted) return;
+    if ((await this.fileState(move.from)) !== "clean") return;
+    const carried = await this.settleRename();
+    if (carried && !this.closed && !this.deleted) this.notePendingMove(this.file);
   }
 
   private queue(action: QueuedClose): void {

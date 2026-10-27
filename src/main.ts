@@ -28,7 +28,6 @@ import {
   type RunningServer,
 } from "./server";
 import { ServerManager, type ServerState, type StartOptions } from "./server-manager";
-import { chooseInstance } from "./instances/choose";
 import { verifyCliPath, type CliCheck } from "./instances/probe";
 import { appSupportRoot, describeCustom, type Instance, type ScanResult } from "./instances/scan";
 import { InstanceService } from "./instances/service";
@@ -192,6 +191,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
         addStatusBarItem: () => this.addStatusBarItem(),
         confirmKill: (title) => promptKillShell(this.app, title),
         focusEditor: () => this.focusActiveEditor(),
+        toggleChords: () =>
+          resolveChords((id) => this.hotkeysOf(id), this.isMac()).chords.filter((c) => c.action === "toggle-terminal"),
       });
       this.bridgeToggle = new DrawerToggle(this.terminal);
       this.addCommand({
@@ -387,13 +388,13 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return this.manager.onChange((state) => cb(state));
   }
 
-  /** The file in the active view: a Code tab's file, or the file of a note or other file view; null when the view has none. */
   /** The view type of the tab the user is on in the main area; a sidebar being focused does not change it. */
   private mainViewType(): string {
     const leaf = this.app.workspace.getMostRecentLeaf?.() ?? null;
     return leaf?.view?.getViewType?.() ?? "";
   }
 
+  /** The file in the active view: a Code tab's file, or the file of a note or other file view; null when the view has none. */
   private activeFilePath(): string | null {
     const ws = this.app.workspace as unknown as { getActiveViewOfType?: (t: unknown) => unknown; getActiveFile(): TFile | null };
     if (typeof ws.getActiveViewOfType !== "function") return ws.getActiveFile()?.path ?? null;
@@ -509,6 +510,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   private async startFlow(start: (o?: StartOptions) => Promise<RunningServer>): Promise<RunningServer> {
     if (!(await this.gate.request())) throw new LicenceDeclinedError();
+    // The plugin was unloaded while the licence modal was up: accepting it must not start a server nobody owns.
+    if (this.unloaded) throw new StartCancelledError();
     try {
       const running = await start();
       await this.recordLastServer();
@@ -517,6 +520,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       if (e instanceof StartCancelledError) throw e;
       const failure = this.reportFailure(e);
       if (failure.offerReuse && failure.versionChange && (await promptReuseBuild(this.app, failure.versionChange))) {
+        if (this.unloaded) throw new StartCancelledError();
         try {
           // The reused build is not recorded as the last server: it is the old one.
           return await this.manager.ensureStarted({ commitOverride: failure.offerReuse.commit });
@@ -558,10 +562,15 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private async createServer(o: StartOptions): Promise<WorkbenchServer> {
     // Defence in depth: no download can start without an accepted licence.
     if (!this.gate.accepted) throw new LicenceDeclinedError();
+    // Unload does not wait for a start: each await below can finish after the plugin is gone, and nothing
+    // may then be written, shown or spawned for it. (ServerManager also drops a server created after a stop.)
+    if (this.unloaded) throw new StartCancelledError();
     const chosen = await this.instanceForStart();
+    if (this.unloaded) throw new StartCancelledError();
     const build = chosen ? findNewestBuild({ override: chosen.cli }) : null;
     if (!chosen || !build) throw new ServerStartError("No VS Code installation found.", null, "", { kind: "missing-binary" });
     const support = await checkServeWebSupport(build.cli);
+    if (this.unloaded) throw new StartCancelledError();
     if (!support.serveWeb) {
       throw new ServerStartError(`${build.cli} has no "serve-web" command.`, null, "", { kind: "no-serve-web", detail: build.cli });
     }
@@ -595,8 +604,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private async instanceForStart(): Promise<Instance | null> {
     const override = this.data_.codeCliPath;
     if (override) return describeCustom(override);
-    const scan = await this.scanInstances();
-    return chooseInstance(scan, this.workbenchSettings().instanceId).selected;
+    const settings = this.workbenchSettings();
+    return this.instances.forStart(settings.customCliPath, settings.instanceId);
   }
 
   /** At each start: copy the instance's settings and keybindings one way into the user-data dir, excludes on top (G16, G17). */
@@ -884,6 +893,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       if (e instanceof LicenceDeclinedError) this.openInSystemApp(file);
       return; // any other failure has already been shown in a Notice
     }
+    if (this.unloaded) return; // unloaded while the server started: no tab on a plugin that is gone
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({ type: VIEW_TYPE_CODE, state: { file }, active: true });
     await this.app.workspace.revealLeaf(leaf);

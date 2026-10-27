@@ -76,6 +76,10 @@ Result: F5 is PARTIAL. Everything the plugin starts is silent except `main.vscod
 
 Real `extensions.json` entries carry an absolute `location` into the instance's own folder (Dan's: `/Users/danfletcher/.vscode-insiders/extensions/ms-azuretools.vscode-docker-2.0.0`). Round 1 copied the file unchanged, so the server could have resolved extensions in the instance's real folder. `shareExtensions` now rewrites each `location` to the same-named symlink under `<server-data>/extensions`; the copy contains no path under the instance's folder. Observed on the real server: the server removed the link of an extension the instance marks obsolete (`ms-python.vscode-python-envs-1.41.2026102201`); the instance's folder and its 180 files were untouched, and the instance's folder listing and `extensions.json` checksum were identical before and after four server runs. A unit test removes an extension through the link and checks the instance's copy survives. Auto-update and update-check switches are set in the browser profile as above (Machine scope does not take effect), which is where they apply.
 
+## Waiting for the server to answer (PR-1 R7)
+
+The spec gives the server 30 s to become ready (`READY_TIMEOUT_MS` in `src/server.ts`). That holds for a server that is already downloaded. The first run downloads the VS Code server from Microsoft, and `serve-web` answers HTTP 202 ("downloading") while it does. Once the server has answered 202 the limit is 300 s in total (`DOWNLOAD_TIMEOUT_MS`), so a slow connection can finish the one-time download. This is a deviation from the spec's 30 s, made on purpose: with 30 s, a normal first-run download on a slow link would be reported as a failed start. A download that fails does not wait out the 300 s: the failure line `serve-web` logs ends the wait at once with that message. Dan: confirm or ask for 30 s everywhere.
+
 ## Which later checks apply, by result
 
 | Spike result | What later PRs do |

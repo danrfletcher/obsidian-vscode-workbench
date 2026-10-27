@@ -46,6 +46,9 @@ function makeApp(root: string): typeof app {
       configDir: ".obsidian",
       getAbstractFileByPath: (p: string) => (fs.existsSync(path.join(root, p)) ? new TFile(p) : null),
       on: (name: string, cb: (...args: any[]) => void) => ({ name, cb }),
+      create: async (p: string) => new TFile(p),
+      createBinary: async (p: string) => new TFile(p),
+      copy: async (_f: unknown, p: string) => new TFile(p),
     },
     workspace: {
       onLayoutReady: (cb: () => void) => cb(),
@@ -86,9 +89,11 @@ const event = (name: string) => Plugin.events.filter((e) => e.name === name);
 const inner = () => plugin as unknown as { manager: import("../../src/server-manager").ServerManager; views: Set<unknown>; idle: import("../../src/idle-timer").IdleTimer; data_: Record<string, unknown> };
 
 /** A stand-in Code tab: what main.ts needs from a CodeView. */
-function fakeView(o: { file?: string; visible?: boolean; dirty?: boolean; saves?: boolean } = {}) {
+function fakeView(o: { file?: string; visible?: boolean; dirty?: boolean; saves?: boolean; leaf?: object } = {}) {
   const v = {
     filePath: o.file ?? "a.py",
+    leaf: o.leaf ?? {},
+    taken: [] as string[],
     visible: o.visible ?? false,
     dirty: o.dirty ?? false,
     saved: 0,
@@ -108,7 +113,7 @@ function fakeView(o: { file?: string; visible?: boolean; dirty?: boolean; saves?
     abandonRename: () => {
       v.abandoned++;
     },
-    pathTaken: () => undefined,
+    pathTaken: (p: string) => void v.taken.push(p),
     reload: () => undefined,
   };
   plugin.trackView(v as never);
@@ -144,7 +149,7 @@ afterEach(async () => {
   plugin?.onunload();
   await new Promise((r) => setTimeout(r, 400));
   for (const pid of [...serverPids(), ...strays.splice(0)]) if (isAlive(pid)) process.kill(pid, "SIGKILL");
-  for (const k of ["FAKE_CODE_NODE", "FAKE_CODE_PIDFILE", "FAKE_CODE_ARGSFILE", "FAKE_CODE_MODE", "FAKE_CODE_PARTIAL_DIR", "FAKE_CODE_OFFLINE_EXCEPT"]) delete process.env[k];
+  for (const k of ["FAKE_CODE_NODE", "FAKE_CODE_PIDFILE", "FAKE_CODE_ARGSFILE", "FAKE_CODE_MODE", "FAKE_CODE_HELP_DELAY", "FAKE_CODE_PARTIAL_DIR", "FAKE_CODE_OFFLINE_EXCEPT"]) delete process.env[k];
   vi.unstubAllGlobals();
 });
 
@@ -475,9 +480,24 @@ describe("quit", () => {
     await plugin.openSpikeFile();
     const clean = fakeView({ file: "clean.py" });
     const other = fakeView({ file: "other.py" });
+    // The settle takes a moment (it reads the files); what matters is that the server is still up while it runs
+    // and still up when it ends, i.e. the quit waits for it before manager.shutdown (PR-5 R7).
+    const [wrapper] = [inner().manager.serverInstance as unknown as { pid: number }];
+    const during: Array<{ state: string; alive: boolean; at: "start" | "end" }> = [];
+    for (const v of [clean, other]) {
+      v.settleRename = async () => {
+        during.push({ state: inner().manager.state, alive: isAlive(wrapper.pid), at: "start" });
+        await new Promise((r) => setTimeout(r, 100));
+        during.push({ state: inner().manager.state, alive: isAlive(wrapper.pid), at: "end" });
+        v.settled++;
+      };
+    }
     await quit();
     expect([clean.settled, other.settled]).toEqual([1, 1]);
+    expect(during).toHaveLength(4);
+    expect(during.every((d) => d.state === "running" && d.alive)).toBe(true);
     expect(inner().manager.state).toBe("stopped");
+    expect(isAlive(wrapper.pid)).toBe(false);
   });
 
   it("Discard quits without saving", async () => {
@@ -745,5 +765,179 @@ describe("pidfile content", () => {
       expect(isAlive(wrapper)).toBe(false);
       expect(isAlive(oldServer)).toBe(false);
     }, { timeout: 8000 });
+  });
+});
+
+describe("unload while a start is pending (PR-1 R3)", () => {
+  it("accepting the licence modal after the plugin was unloaded starts nothing", async () => {
+    await load();
+    const opening = plugin.openSpikeFile();
+    await vi.waitFor(() => expect(Modal.opened).toHaveLength(1));
+    plugin.onunload();
+    press("Accept and download");
+    await opening;
+    await new Promise((r) => setTimeout(r, 300));
+    expect(serverPids()).toEqual([]);
+    expect(fs.existsSync(argsFile)).toBe(false); // the fake server writes its arguments when it runs
+    expect(inner().manager.state).toBe("stopped");
+    expect(app.workspace.leaves).toHaveLength(0);
+    expect(Notice.messages).toEqual([]); // not even the "downloading the VS Code server" notice
+  });
+
+  it("an unload while the build is being checked (serve-web --help) spawns no server, shows no notice, opens no tab", async () => {
+    await load({ FAKE_CODE_HELP_DELAY: "1" }, { serverLicenceAccepted: true });
+    const opening = plugin.openSpikeFile();
+    await new Promise((r) => setTimeout(r, 250)); // the check is running
+    plugin.onunload();
+    await opening;
+    await new Promise((r) => setTimeout(r, 300));
+    expect(serverPids()).toEqual([]);
+    expect(fs.existsSync(argsFile)).toBe(false);
+    expect(inner().manager.state).toBe("stopped");
+    expect(app.workspace.leaves).toHaveLength(0);
+    expect(Notice.messages).toEqual([]);
+    expect(fs.existsSync(path.join(vault, PLUGIN_DIR, ".server/server-data"))).toBe(false); // nothing was set up for it either
+  });
+
+  it("an unload while the instance is being chosen does nothing further for that start", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    let release!: () => void;
+    const chosen = new Promise<void>((r) => (release = r));
+    const real = (plugin as unknown as { instanceForStart(): Promise<unknown> }).instanceForStart.bind(plugin);
+    (plugin as unknown as { instanceForStart(): Promise<unknown> }).instanceForStart = async () => {
+      await chosen;
+      return real();
+    };
+    const opening = plugin.openSpikeFile();
+    await new Promise((r) => setTimeout(r, 100));
+    plugin.onunload();
+    release();
+    await opening;
+    expect(serverPids()).toEqual([]);
+    expect(Notice.messages).toEqual([]);
+    expect(app.workspace.leaves).toHaveLength(0);
+  });
+});
+
+describe("the ribbon opens only what a Code tab opens (PR-1 R4)", () => {
+  const opened = () => app.workspace.leaves.map((l) => (l.viewState?.state as { file?: string } | undefined)?.file);
+
+  it.each(["doc.pdf", "photo.png", "song.mp3", "note.md", "board.canvas", "tasks.base", "archive.zip"])(
+    "an active %s is not opened in a Code tab: the spike file is",
+    async (name) => {
+      await load({}, { serverLicenceAccepted: true });
+      fs.writeFileSync(path.join(vault, name), "x");
+      app.workspace.activeFile = new TFile(name);
+      await plugin.openSpikeFile();
+      expect(opened()).toEqual([SPIKE_FILE]);
+    },
+  );
+
+  it("an active file under .obsidian or node_modules is not opened either", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    fs.mkdirSync(path.join(vault, "node_modules"), { recursive: true });
+    fs.writeFileSync(path.join(vault, "node_modules/x.js"), "x");
+    app.workspace.activeFile = new TFile("node_modules/x.js");
+    await plugin.openSpikeFile();
+    expect(opened()).toEqual([SPIKE_FILE]);
+  });
+
+  it("an active text file with a code extension is opened", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    fs.writeFileSync(path.join(vault, "tool.py"), "print(1)\n");
+    app.workspace.activeFile = new TFile("tool.py");
+    await plugin.openSpikeFile();
+    expect(opened()).toEqual(["tool.py"]);
+  });
+
+  it("with no usable file anywhere the ribbon says so and opens nothing", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    fs.rmSync(path.join(vault, SPIKE_FILE));
+    fs.writeFileSync(path.join(vault, "doc.pdf"), "x");
+    app.workspace.activeFile = new TFile("doc.pdf");
+    await plugin.openSpikeFile();
+    expect(opened()).toEqual([]);
+    expect(Notice.messages[0]).toContain("open a code file first");
+  });
+});
+
+describe("css-change reloads the theme only when light/dark flips (PR-1 R5)", () => {
+  it("font-size, snippet and accent-colour changes leave the Machine settings, the tabs and the server alone", async () => {
+    let dark = false;
+    await load({}, { serverLicenceAccepted: true });
+    vi.stubGlobal("document", { body: { classList: { contains: (c: string) => c === "theme-dark" && dark } } });
+    await plugin.openSpikeFile();
+    const told: boolean[] = [];
+    plugin.trackView({ switchTheme: async (m: { dark: boolean }) => void told.push(m.dark), isVisible: () => true, isDirty: async () => false, notifyVisible: () => undefined } as never);
+    const machine = path.join(inner().manager.serverInstance!.serverDataDir, "data", "Machine", "settings.json");
+    fs.writeFileSync(machine, '{"marker": "untouched"}'); // a rewrite would replace this
+    const pid = (inner().manager.serverInstance as unknown as { pid: number }).pid;
+    const cssChange = event("css-change");
+    expect(cssChange).toHaveLength(1);
+
+    for (let i = 0; i < 5; i++) cssChange[0].cb(); // five non-theme changes: still light
+    await new Promise((r) => setTimeout(r, 200));
+    expect(fs.readFileSync(machine, "utf8")).toBe('{"marker": "untouched"}');
+    expect(told).toEqual([]);
+    expect((inner().manager.serverInstance as unknown as { pid: number }).pid).toBe(pid);
+
+    dark = true; // the real flip
+    cssChange[0].cb();
+    await vi.waitFor(() => expect(told).toEqual([true]), { timeout: 3000 });
+    expect(JSON.parse(fs.readFileSync(machine, "utf8"))["workbench.colorTheme"]).toBe("Dark Modern");
+
+    fs.writeFileSync(machine, '{"marker": "untouched"}');
+    for (let i = 0; i < 5; i++) cssChange[0].cb(); // still dark
+    await new Promise((r) => setTimeout(r, 200));
+    expect(fs.readFileSync(machine, "utf8")).toBe('{"marker": "untouched"}');
+    expect(told).toEqual([true]);
+  });
+});
+
+describe("the plugin tells Code tabs when another file takes a path (PR-5 R9)", () => {
+  it("a vault rename event: every tab hears of the path the file was renamed onto", async () => {
+    await load();
+    const a = fakeView({ file: "a.py" });
+    const b = fakeView({ file: "b.py" });
+    const renameHandlers = event("rename");
+    expect(renameHandlers.length).toBeGreaterThanOrEqual(2);
+    for (const h of renameHandlers) h.cb(new TFile("old-name.py"), "elsewhere.py");
+    expect(a.taken).toEqual(["old-name.py"]);
+    expect(b.taken).toEqual(["old-name.py"]);
+  });
+
+  it("a rename event with a missing old path is ignored", async () => {
+    await load();
+    const a = fakeView();
+    for (const h of event("rename")) h.cb(new TFile("x.py"), undefined);
+    expect(a.taken).toEqual([]);
+  });
+
+  it("files made through vault.create, createBinary and copy are announced, and the wrappers are put back at unload", async () => {
+    await load();
+    const a = fakeView();
+    const vaultApi = app.vault as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    const originals = ["create", "createBinary", "copy"].map((n) => vaultApi[n]);
+    await vaultApi.create("n1.py", "");
+    await vaultApi.createBinary("n2.bin", new ArrayBuffer(0));
+    await vaultApi.copy(new TFile("src.py"), "n3.py");
+    expect(a.taken).toEqual(["n1.py", "n2.bin", "n3.py"]);
+    plugin.onunload();
+    // restored: the plugin no longer listens
+    await vaultApi.create("after.py", "");
+    expect(a.taken).toEqual(["n1.py", "n2.bin", "n3.py"]);
+    expect(["create", "createBinary", "copy"].map((n) => vaultApi[n])).not.toEqual(originals); // they were the plugin's wrappers
+    expect(vaultApi.create.toString()).not.toContain("claimed");
+  });
+
+  it("a tab given a file (admitFile) tells the other tabs, but not the tab that took it", async () => {
+    await load();
+    fs.writeFileSync(path.join(vault, "old.py"), "x = 1\n");
+    const leaf = new WorkspaceLeaf();
+    const taker = fakeView({ file: "x.py", leaf });
+    const other = fakeView({ file: "y.py", leaf: new WorkspaceLeaf() });
+    expect(await plugin.admitFile("old.py", leaf as never)).toBe(true);
+    expect(other.taken).toEqual(["old.py"]);
+    expect(taker.taken).toEqual([]);
   });
 });

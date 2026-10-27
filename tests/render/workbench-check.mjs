@@ -114,10 +114,12 @@ function freePort() {
 
 // --- the plugin's own code ---------------------------------------------------------------------------
 await build({
-  entryPoints: { settings: path.join(root, "src/settings.ts") },
+  entryPoints: { settings: path.join(root, "src/settings.ts"), "dirty-script": path.join(root, "src/dirty-script.ts") },
   bundle: true, format: "esm", platform: "node", outdir: path.join(work, "plugin"), outExtension: { ".js": ".mjs" }, logLevel: "error",
 });
 const settings = await import(pathToFileURL(path.join(work, "plugin/settings.mjs")).href);
+// The plugin's own unsaved-buffer probe (what delete, rename, idle stop and quit ask), run against the real workbench below.
+const { DIRTY_SCRIPT, fileDirtyScript } = await import(pathToFileURL(path.join(work, "plugin/dirty-script.mjs")).href);
 
 // --- the fixtures ------------------------------------------------------------------------------------
 const vault = path.join(work, "vault");
@@ -136,6 +138,9 @@ class Thing:
 `;
 fs.writeFileSync(path.join(vault, "clean.txt"), "clean line one\nclean line two\n");
 fs.writeFileSync(path.join(vault, "dirty.txt"), "dirty line one\ndirty line two\n");
+fs.writeFileSync(path.join(vault, "saved.txt"), "saved line one\nsaved line two\n");
+fs.writeFileSync(path.join(vault, "other.txt"), "other line one\n");
+fs.writeFileSync(path.join(vault, "mine.txt"), "mine line one\n");
 fs.writeFileSync(path.join(vault, "sample.py"), PY);
 
 // --- the server --------------------------------------------------------------------------------------
@@ -264,17 +269,92 @@ g4: {
   }
   fs.appendFileSync(path.join(vault, "clean.txt"), "added from outside\n");
   await sleep(6);
+  check((await b.ev(DIRTY_SCRIPT)) === false, "G3: the plugin's unsaved-buffer probe (DIRTY_SCRIPT) reads a clean buffer as clean");
   const clean = await pageState(b);
   await b.shot("G4-clean-external.png");
   console.log("clean buffer after outside change:", JSON.stringify({ toasts: clean.toasts, dialogs: clean.dialogs }));
   check(clean.text.includes("added from outside"), "G4: a clean buffer reloads the outside change");
   check(clean.toasts.length === 0 && !clean.anyDialogVisible, "G4: a clean buffer reloads with no prompt, toast or dialog (VS Code shows none)", JSON.stringify([...clean.toasts, ...clean.dialogs]));
 
+  // 1b. type into a file and save it: the probe sees the buffer go from dirty to clean (what the rename watch relies on).
+  // Done before the next step on purpose: the probe is true while ANY editor in the page is unsaved, so the refused save below would keep it true.
+  await b.openFile("saved.txt");
+  await b.send("Input.insertText", { text: "SAVED " });
+  await sleep(1.5);
+  check((await b.ev(DIRTY_SCRIPT)) === true, "G3: ...a second typed buffer reads dirty");
+  await b.key("s", "KeyS", 83, b.META);
+  await sleep(3);
+  check((await b.ev(DIRTY_SCRIPT)) === false, "G3: ...and reads clean once it is saved (Cmd+S in the tab)");
+  check(fs.readFileSync(path.join(vault, "saved.txt"), "utf8").startsWith("SAVED saved line one"), "G3: ...with the typed text on disk");
+
+  // 1b2. the page-wide probe cannot see a save while ANOTHER editor is unsaved, so the rename watch asks the tab of
+  // the one file (PR-5 R4, T40, T41): with other.txt unsaved, saving mine.txt leaves DIRTY_SCRIPT true, but the tab
+  // script reads mine.txt clean, other.txt dirty, and a file with no tab as "none" (the caller then keeps the page-wide answer).
+  await b.openFile("other.txt");
+  await b.send("Input.insertText", { text: "OTHER " });
+  await sleep(1.5);
+  await b.openFile("mine.txt");
+  await b.send("Input.insertText", { text: "MINE " });
+  await sleep(1.5);
+  check((await b.ev(fileDirtyScript("mine.txt"))) === "dirty", "G3: the tab script reads a typed file's own tab as dirty");
+  await b.key("s", "KeyS", 83, b.META);
+  await sleep(3);
+  check((await b.ev(DIRTY_SCRIPT)) === true, "G3: ...after saving mine.txt the page-wide probe still reads dirty (other.txt is unsaved)");
+  check((await b.ev(fileDirtyScript("mine.txt"))) === "clean", "G3: ...while the tab script reads the saved file's own tab as clean");
+  check((await b.ev(fileDirtyScript("other.txt"))) === "dirty", "G3: ...and the other file's tab as dirty");
+  check((await b.ev(fileDirtyScript("nothing-open.txt"))) === "none", "G3: ...and a file with no tab as none");
+  await b.openFile("other.txt");
+  await b.key("s", "KeyS", 83, b.META);
+  await sleep(3);
+  check((await b.ev(DIRTY_SCRIPT)) === false, "G3: ...and saving the other file leaves the page clean for the steps below");
+
+  // 1c. rename a file on disk under a typed buffer, then save in the workbench (PR-5 R4, T33). The held-back
+  // repoint in src/code-view.ts relies on exactly this: the buffer stays bound to the OLD path, the probe still
+  // reads it as dirty, and Cmd+S writes the text at the old path (re-creating it) and turns the probe clean. Only
+  // then does the plugin carry the text into the renamed file and re-point the embed. If VS Code behaved otherwise
+  // (refused the save, or followed the rename), the watch would never fire or would carry nothing.
+  fs.writeFileSync(path.join(vault, "ren-a.txt"), "rename line one\nrename line two\n");
+  await b.openFile("ren-a.txt");
+  await b.send("Input.insertText", { text: "RENAMED " });
+  await sleep(1.5);
+  check((await b.ev(DIRTY_SCRIPT)) === true, "G3: a typed buffer reads dirty before its file is renamed on disk");
+  fs.renameSync(path.join(vault, "ren-a.txt"), path.join(vault, "ren-b.txt"));
+  await sleep(5);
+  check((await b.ev(DIRTY_SCRIPT)) === true, "G3: ...and still reads dirty after the rename (the typed text is not dropped or moved by VS Code)");
+  check(!fs.existsSync(path.join(vault, "ren-a.txt")), "G3: ...nothing re-created the old path before a save");
+  await b.key("s", "KeyS", 83, b.META);
+  await sleep(4);
+  const afterRenameSave = await pageState(b);
+  await b.shot("G3-rename-save.png");
+  console.log("after saving under a renamed file:", JSON.stringify({ toasts: afterRenameSave.toasts, dialogs: afterRenameSave.dialogs }));
+  check((await b.ev(DIRTY_SCRIPT)) === false, "G3: ...the save in the workbench turns the probe clean (this is what makes the plugin's rename watch re-point the tab)");
+  check(
+    fs.existsSync(path.join(vault, "ren-a.txt")) && fs.readFileSync(path.join(vault, "ren-a.txt"), "utf8").startsWith("RENAMED rename line one"),
+    "G3: ...and the typed text is written at the OLD path, which is where the plugin picks it up to carry into the renamed file",
+  );
+  check(fs.readFileSync(path.join(vault, "ren-b.txt"), "utf8") === "rename line one\nrename line two\n", "G3: ...while the renamed file still holds its old content until the plugin carries the edit");
+
+  // 1d. delete a file on disk under a typed buffer (PR-5 R3, T32). A delete that is not Obsidian's own leaves a tab
+  // with unsaved edits open (src/vault-sync.ts); that is only safe if the probe the plugin asks still reads the
+  // buffer as dirty once its file is gone. Saved afterwards so the probe is clean for the steps below.
+  fs.writeFileSync(path.join(vault, "gone.txt"), "gone line one\ngone line two\n");
+  await b.openFile("gone.txt");
+  await b.send("Input.insertText", { text: "KEEP " });
+  await sleep(1.5);
+  fs.unlinkSync(path.join(vault, "gone.txt"));
+  await sleep(5);
+  check((await b.ev(DIRTY_SCRIPT)) === true, "G3: a typed buffer still reads dirty after its file is deleted on disk (so the tab is kept open)");
+  check((await pageState(b)).text.includes("KEEP gone line one"), "G3: ...and its typed text is still in the editor");
+  await b.key("s", "KeyS", 83, b.META);
+  await sleep(4);
+  check((await b.ev(DIRTY_SCRIPT)) === false, "G3: ...saving it turns the probe clean again");
+
   // 2. buffer with unsaved edits
   await b.openFile("dirty.txt");
   await b.send("Input.insertText", { text: "TYPED " });
   await sleep(1.5);
   check((await pageState(b)).title.includes("\u25cf"), "G4: typing makes the buffer unsaved (the window title shows the unsaved dot)");
+  check((await b.ev(DIRTY_SCRIPT)) === true, "G3: the plugin's unsaved-buffer probe (DIRTY_SCRIPT) reads the typed buffer as dirty");
   fs.appendFileSync(path.join(vault, "dirty.txt"), "outside change to a dirty file\n");
   await sleep(6);
   const dirty = await pageState(b);

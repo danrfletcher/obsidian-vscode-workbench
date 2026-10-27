@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceLeaf } from "../mocks/obsidian";
-import { CodeView, VIEW_TYPE_CODE, baseName, runInWebview, type CodeViewHost } from "../../src/code-view";
+import { CodeView, VIEW_TYPE_CODE, baseName, logSeedOutcome, runInWebview, type CodeViewHost } from "../../src/code-view";
 import { LicenceDeclinedError } from "../../src/licence";
 import { BROWSER_APP_SETTINGS, buildBrowserSeedScript } from "../../src/settings";
 
@@ -165,6 +165,15 @@ describe("CodeView", () => {
     expect(el.children[0].executed).toEqual([]);
   });
 
+  it("an iframe tab cannot be read, so it counts as holding unsaved edits: idle stop and quit keep it (PR-2 R6)", async () => {
+    const { view, el } = makeView({ embedElement: () => "iframe" });
+    await view.setState({ file: "a.py" }, {} as never);
+    // a real iframe has no executeJavaScript
+    (el.children[0] as unknown as { executeJavaScript?: unknown }).executeJavaScript = undefined;
+    expect(await view.bufferState()).toBe("unreadable");
+    expect(await view.isDirty()).toBe(true);
+  });
+
   it("closes the tab instead of leaving a blank embed when the server cannot start", async () => {
     const { view, el } = makeView({
       ensureServer: async () => {
@@ -301,7 +310,46 @@ describe("CodeView: one tab per file and the open guard", () => {
 describe("runInWebview", () => {
   it("resolves after the timeout when the page never reports dom-ready", async () => {
     const el = new FakeEl("webview");
-    await runInWebview(el as never, "x", 20);
+    expect(await runInWebview(el as never, "x", 20)).toBe("timeout");
     expect(el.executed).toEqual([]);
+  });
+
+  it("resolves with what the script returned, and with the error's message when it throws", async () => {
+    const ok = new FakeEl("webview");
+    ok.executeResult = async () => "kept";
+    const ready = runInWebview(ok as never, "x", 1000);
+    ok.fire("dom-ready");
+    expect(await ready).toBe("kept");
+    const bad = new FakeEl("webview");
+    bad.executeResult = async () => {
+      throw new Error("Script failed to execute");
+    };
+    const failed = runInWebview(bad as never, "x", 1000);
+    bad.fire("dom-ready");
+    expect(await failed).toBe("error:Script failed to execute");
+  });
+});
+
+describe("the seed outcome is logged (PR-1 R9)", () => {
+  it("a Code tab logs a seed that did not apply, with the reason, and still opens the workbench", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { view, el } = makeView();
+    vi.stubGlobal("document", { createElement: (t: string) => { const e = new FakeEl(t); e.executeResult = async () => "version-mismatch"; return e; } });
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].srcs[1]).toContain("tkn=tok123");
+    expect(warn.mock.calls.flat().join(" ")).toContain("version-mismatch");
+    warn.mockRestore();
+  });
+
+  it("a seed that applied is only a debug line, and a timeout is a warning", () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    logSeedOutcome("seeded");
+    expect(warn).not.toHaveBeenCalled();
+    expect(debug).toHaveBeenCalledTimes(1);
+    logSeedOutcome("timeout");
+    expect(warn.mock.calls.flat().join(" ")).toContain("timeout");
+    debug.mockRestore();
+    warn.mockRestore();
   });
 });

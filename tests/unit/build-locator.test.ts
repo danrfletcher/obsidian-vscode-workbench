@@ -95,6 +95,14 @@ describe("shareExtensions (F3: the instance's folder is only read)", () => {
     expect(fs.readdirSync(path.join(data, "extensions")).sort()).toEqual(["extensions.json", "ms-python.python-1.0"]);
   });
 
+  it("skips a dangling symlink in the instance's extensions folder instead of failing the start (PR-1 R6)", () => {
+    const src = instanceExtensions();
+    fs.symlinkSync(path.join(src, "gone-for-good"), path.join(src, "dangling.ext-1.0"), "dir");
+    const data = tempDir();
+    expect(shareExtensions(src, data)).toEqual({ linked: 2 });
+    expect(fs.readdirSync(path.join(data, "extensions")).sort()).toEqual(["extensions.json", "ms-python.python-1.0", "ms-python.vscode-pylance-2.0"]);
+  });
+
   it("creates an empty extensions dir when the instance has none", () => {
     const data = tempDir();
     expect(shareExtensions(null, data)).toEqual({ linked: 0 });

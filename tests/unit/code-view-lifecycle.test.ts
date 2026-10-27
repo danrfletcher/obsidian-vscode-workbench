@@ -5,6 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeNode, WorkspaceLeaf } from "../mocks/obsidian";
+import { fileDirtyScript } from "../../src/dirty-script";
 import { CRASH_TEXT, CodeView, DIRTY_SCRIPT, RESTART_FAILED_TEXT, saveAllKeys, type CodeViewHost } from "../../src/code-view";
 import type { ServerState } from "../../src/server-manager";
 
@@ -274,6 +275,27 @@ describe("unsaved buffer detection", () => {
   ])("the dirty script says %s -> %s", (_n, page, expected) => {
     const doc = { title: page.title, querySelector: (sel: string) => (sel.includes(".tab.dirty") && page.dirtyTab ? {} : null) };
     expect(new Function("document", `return ${DIRTY_SCRIPT}`)(doc)).toBe(expected);
+  });
+
+  // fileDirtyScript is run against stand-in tabs: its answer is about the tab with the file's name only.
+  it.each([
+    ["its tab is clean while another tab is dirty", "a.py", [{ name: "a.py", dirty: false }, { name: "b.py", dirty: true }], "clean"],
+    ["its tab is dirty", "a.py", [{ name: "a.py", dirty: true }, { name: "b.py", dirty: false }], "dirty"],
+    ["two tabs share its name and one is dirty", "a.py", [{ name: "a.py", dirty: false }, { name: "a.py", dirty: true }], "dirty"],
+    ["no tab has its name", "a.py", [{ name: "b.py", dirty: true }], "none"],
+    ["no tabs at all", "a.py", [], "none"],
+    ["a name with quotes is matched literally", 'a"b.py', [{ name: 'a"b.py', dirty: false }], "clean"],
+  ])("the file dirty script says %s -> %s", (_n, file, tabs, expected) => {
+    const doc = {
+      querySelectorAll: (sel: string) =>
+        sel === ".monaco-workbench .tab"
+          ? tabs.map((t) => ({
+              getAttribute: (a: string) => (a === "data-resource-name" ? t.name : null),
+              classList: { contains: (c: string) => c === "dirty" && t.dirty },
+            }))
+          : [],
+    };
+    expect(new Function("document", `return ${fileDirtyScript(file)}`)(doc)).toBe(expected);
   });
 });
 

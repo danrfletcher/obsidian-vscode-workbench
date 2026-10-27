@@ -147,7 +147,7 @@ export class WorkbenchSettingTab extends PluginSettingTab {
     // Custom CLI path
     new Setting(el)
       .setName("Custom CLI path")
-      .setDesc("The absolute path of a VS Code command-line tool. It is listed as Custom only after it passes the same serve-web check.")
+      .setDesc("The absolute path of a VS Code command-line tool. It is listed as Custom, and selected, only after it passes the same serve-web check.")
       .addText((t) => {
         t.setPlaceholder("/path/to/code").setValue(typed);
         t.onChange((v) => {
@@ -164,9 +164,18 @@ export class WorkbenchSettingTab extends PluginSettingTab {
               setCustomResult({ tone: "error", text: r.reason });
               return;
             }
-            await this.host.updateSettings({ customCliPath: r.cli });
-            // Rescan so the Custom entry appears in the list.
-            this.loadInstances(el, render, { ...state, customTyped: r.cli, customResult: { tone: "ok", text: "Verified: listed as Custom above." } });
+            // A program that passed the check is the one the user means to use: select it, so it does not
+            // have to be picked from the list afterwards.
+            await this.host.updateSettings({ customCliPath: r.cli, instanceId: CUSTOM_ID });
+            if (render !== this.renderId) return;
+            const live = this.host.serverState();
+            // Rescan so the Custom entry appears in the list, selected.
+            this.loadInstances(el, render, {
+              ...state,
+              appliesNextStart: live === "running" || live === "starting",
+              customTyped: r.cli,
+              customResult: { tone: "ok", text: "Verified and selected: Custom is now the VS Code instance above." },
+            });
           } finally {
             b.setDisabled(false);
           }

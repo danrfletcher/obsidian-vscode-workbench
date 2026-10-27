@@ -11,6 +11,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { chooseInstance } from "./choose";
 import { probeServeWeb, type ProbeResult } from "./probe";
 
 export type InstanceKind = "vscode" | "vscode-insiders" | "vscodium" | "antigravity" | "antigravity-ide" | "custom";
@@ -235,7 +236,8 @@ export function describeCustom(cli: string): Instance {
   };
 }
 
-async function checkCustom(custom: string, probe: NonNullable<ScanOptions["probe"]>, probeOpts: { timeoutMs?: number }): Promise<{ instance: Instance } | { failure: string }> {
+/** The checks on a saved custom CLI that need no process: it exists, is a file and is executable. */
+function precheckCustom(custom: string): { instance: Instance } | { failure: string } {
   let stat: fs.Stats;
   try {
     stat = fs.statSync(custom);
@@ -244,23 +246,21 @@ async function checkCustom(custom: string, probe: NonNullable<ScanOptions["probe
   }
   if (stat.isDirectory()) return { failure: "the path is a folder." };
   if (!isExecutable(custom)) return { failure: "the file is not executable." };
-  const r = await probe(custom, probeOpts);
-  return r.ok ? { instance: describeCustom(custom) } : { failure: r.reason };
+  return { instance: describeCustom(custom) };
 }
 
-/**
- * Scan for VS Code builds and probe each CLI (in parallel). Never throws, and
- * answers within `scanTimeoutMs` whatever the probes do.
- */
-export async function scanInstances(opts: ScanOptions = {}): Promise<ScanResult> {
-  const env = opts.env ?? process.env;
-  const roots = opts.roots ?? scanRoots(env);
-  const probe = opts.probe ?? probeServeWeb;
-  const probeOpts = { timeoutMs: opts.probeTimeoutMs };
+async function checkCustom(custom: string, probe: NonNullable<ScanOptions["probe"]>, probeOpts: { timeoutMs?: number }): Promise<{ instance: Instance } | { failure: string }> {
+  const pre = precheckCustom(custom);
+  if ("failure" in pre) return pre;
+  const r = await probe(custom, probeOpts);
+  return r.ok ? pre : { failure: r.reason };
+}
+
+/** Everything a scan learns without running a process: the builds still to probe and the ones rejected on sight. */
+function collectBuilds(roots: string[]): { toProbe: Instance[]; rejected: RejectedBuild[] } {
   const rejected: RejectedBuild[] = [];
   const toProbe: Instance[] = [];
   const seen = new Set<string>();
-
   for (const root of roots) {
     let names: string[];
     try {
@@ -287,6 +287,19 @@ export async function scanInstances(opts: ScanOptions = {}): Promise<ScanResult>
       toProbe.push(found.instance);
     }
   }
+  return { toProbe, rejected };
+}
+
+/**
+ * Scan for VS Code builds and probe each CLI (in parallel). Never throws, and
+ * answers within `scanTimeoutMs` whatever the probes do.
+ */
+export async function scanInstances(opts: ScanOptions = {}): Promise<ScanResult> {
+  const env = opts.env ?? process.env;
+  const roots = opts.roots ?? scanRoots(env);
+  const probe = opts.probe ?? probeServeWeb;
+  const probeOpts = { timeoutMs: opts.probeTimeoutMs };
+  const { toProbe, rejected } = collectBuilds(roots);
 
   const instances: Instance[] = [];
   let customFailure: string | null = null;
@@ -316,4 +329,40 @@ export async function scanInstances(opts: ScanOptions = {}): Promise<ScanResult>
   const order = (i: Instance) => (i.id === CUSTOM_ID ? 99 : KNOWN_BUILDS.findIndex((b) => b.kind === i.kind));
   const sorted = [...instances].sort((a, b) => order(a) - order(b) || a.id.localeCompare(b.id));
   return { instances: sorted, rejected: [...rejected].sort((a, b) => a.appPath.localeCompare(b.appPath)), customFailure };
+}
+
+export interface StartScanOptions extends ScanOptions {
+  /** The instance saved in data.json, or null for the default. */
+  savedId: string | null;
+}
+
+/**
+ * The instance a server start runs on, probing only what the choice needs. The builds are listed from
+ * disk (no process), `chooseInstance` names the one it would pick (the saved one, else the newest VS Code),
+ * and only that one is probed; a build that fails its probe is dropped and the choice is made again among
+ * the rest. The result is the instance a full scan followed by `chooseInstance` would give, but a hanging
+ * build that was never going to be chosen costs the start nothing. null when nothing usable is found
+ * (or the time limit runs out first).
+ */
+export async function resolveInstanceForStart(opts: StartScanOptions): Promise<Instance | null> {
+  const env = opts.env ?? process.env;
+  const probe = opts.probe ?? probeServeWeb;
+  const probeOpts = { timeoutMs: opts.probeTimeoutMs };
+  const { toProbe, rejected } = collectBuilds(opts.roots ?? scanRoots(env));
+  const pool = [...toProbe];
+  let customFailure: string | null = null;
+  const custom = opts.customCliPath?.trim();
+  if (custom) {
+    const pre = precheckCustom(custom);
+    if ("instance" in pre) pool.push(pre.instance);
+    else customFailure = pre.failure;
+  }
+  const until = Date.now() + (opts.scanTimeoutMs ?? SCAN_TIMEOUT_MS);
+  while (pool.length > 0 && Date.now() < until) {
+    const next = chooseInstance({ instances: pool, rejected, customFailure }, opts.savedId).selected;
+    if (!next) return null;
+    if ((await probe(next.cli, probeOpts)).ok) return next;
+    pool.splice(pool.indexOf(next), 1);
+  }
+  return null;
 }

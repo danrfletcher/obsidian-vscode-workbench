@@ -95,7 +95,7 @@ describe("a started server", () => {
 
     const { entries } = pidfile.read();
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toMatchObject({ pid: wrapper, label: "vscode-server", match: "serve-web", workspace: vault, group: true });
+    expect(entries[0]).toMatchObject({ pid: wrapper, label: "vscode-server", match: path.join(rd, "connection-token"), findByMatch: true, workspace: vault, group: true });
     expect(JSON.stringify(entries)).not.toContain(r.token);
 
     await m2.stop("manual");
