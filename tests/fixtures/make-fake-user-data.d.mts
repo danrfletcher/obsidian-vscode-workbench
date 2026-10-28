@@ -4,6 +4,9 @@ export const PROFILES: {
   agents: { name: string; location: string; useDefaultFlags: { settings: boolean; keybindings: boolean } };
   deleted: { name: string; location: string };
 };
+export const TRUST_KEYS: Record<string, unknown>;
+export const TOGGLE_SIDEBAR_KEY: { key: string; command: string };
+export const TOGGLE_PANEL_KEY: { key: string; command: string };
 export const BUILD_FOLDERS: string[];
 export function vscodeFolderUri(folder: string): string;
 export function writeUserData(userDataRoot: string, opts?: { associations?: Record<string, string>; label?: string }): string;

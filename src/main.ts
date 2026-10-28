@@ -39,7 +39,7 @@ import { resolveChords, type BridgeAction, type HotkeyLike } from "./hotkey/hotk
 import { profileForInstance, userDataRootFor, type ProfileState } from "./profile/mirrored-profile";
 import type { MirrorRequest, MirrorResult } from "./mirror/mirror";
 import { MirrorStateCache, profileExtensionsFile } from "./server/shared-extensions";
-import { instanceUserDir, seedUserData } from "./server/user-data-seed";
+import { instanceUserDir, profileSeedSource, seedUserData } from "./server/user-data-seed";
 import { dataObject, effectiveShell, readSettings, type WorkbenchSettings } from "./settings/data";
 import { type PortStatus, type SpikeResult } from "./settings/extensions-section";
 import { SPIKE_RESULT } from "./settings/spike-result";
@@ -670,10 +670,11 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return this.instances.forStart(settings.customCliPath, settings.instanceId);
   }
 
-  /** At each start: copy the instance's settings and keybindings one way into the user-data dir, excludes on top (G16, G17). */
+  /** At each start: copy the mirrored profile's settings and keybindings one way into the user-data dir, trust keys stripped, excludes on top (G12, G13, G16, G17). */
   private seedUserData(userDataDir: string, instance: Instance): void {
     try {
-      const result = seedUserData({ userDataDir, sourceUserDir: instanceUserDir(instance.userDataName, appSupportRoot()) });
+      const source = profileSeedSource(this.profile, instanceUserDir(instance.userDataName, appSupportRoot()));
+      const result = seedUserData({ userDataDir, ...source });
       if (result.notice) new Notice(`VS Code Workbench: ${result.notice}`, 10000);
       // files.autoSave is written out: the web workbench defaults to afterDelay, the desktop to off (G2).
       this.copy = { id: randomBytes(8).toString("hex"), settings: withAutoSaveDefault(result.merged), keybindingsBase64: result.keybindingsBase64 };

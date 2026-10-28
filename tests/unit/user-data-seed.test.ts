@@ -9,10 +9,14 @@ import {
   excludeGlobs,
   instanceUserDir,
   parseJsonc,
+  profileSeedSource,
   seedUserData,
   stripJsonc,
+  stripTrustKeys,
   writeAtomic,
 } from "../../src/server/user-data-seed";
+import { findMirroredProfile } from "../../src/profile/mirrored-profile";
+import { PROFILES, TOGGLE_PANEL_KEY, TOGGLE_SIDEBAR_KEY, TRUST_KEYS, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
 import { REPO_ROOT, tempDir } from "../helpers";
 
 const EXCLUDE_KEYS = ["files.watcherExclude", "search.exclude"];
@@ -350,5 +354,255 @@ describe("instanceUserDir", () => {
 
   it.each([null, "", ".", "..", "../Code", "a/b", "a\\b"])("returns null for %j", (name) => {
     expect(instanceUserDir(name, "/x")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR-6: trust keys (G12) and the mirrored profile as the source (G13)
+// ---------------------------------------------------------------------------
+
+describe("stripTrustKeys / buildSettings: no security.workspace.trust.* key is copied (G12)", () => {
+  const FIVE = [
+    "security.workspace.trust.enabled",
+    "security.workspace.trust.startupPrompt",
+    "security.workspace.trust.banner",
+    "security.workspace.trust.untrustedFiles",
+    "security.workspace.trust.emptyWindow",
+  ];
+
+  it.each(FIVE)("removes the known key %s", (key) => {
+    const r = buildSettings(JSON.stringify({ [key]: false, "editor.fontSize": 15 }));
+    expect(r.source).toBe("copied");
+    expect(r.settings).not.toHaveProperty(key);
+    expect(r.settings["editor.fontSize"]).toBe(15);
+  });
+
+  it("removes an unknown key under the prefix, including a deeper dotted one", () => {
+    const r = buildSettings('{"security.workspace.trust.somethingNew": 1, "security.workspace.trust.a.b.c": 2, "editor.fontSize": 15}');
+    expect(Object.keys(r.settings).sort()).toEqual(["editor.fontSize", ...EXCLUDE_KEYS].sort());
+  });
+
+  it.each([
+    ["security.workspace.trusted", true],
+    ["security.workspace.trust", { enabled: false }],
+    ["security.workspace", 1],
+    ["security.workspace", { trust: { enabled: false } }],
+    ["security", { workspace: { trust: { enabled: false } } }],
+    ["security", { "workspace.trust.enabled": false }],
+    ["security.allowedUNCHosts", ["a"]],
+    ["security.restrictUNCAccess", false],
+    ["Security.Workspace.Trust.enabled", false],
+    ["my.security.workspace.trust.enabled", false],
+    ["editor.fontSize", 15],
+  ])("keeps the near miss / other key %s unchanged", (key, value) => {
+    const r = buildSettings(JSON.stringify({ [key]: value }));
+    expect(r.settings[key]).toEqual(value);
+  });
+
+  it("only top-level dotted keys go: trust keys inside the user's own objects stay", () => {
+    const nested = { "security.workspace.trust.enabled": false, other: 1 };
+    const r = buildSettings(JSON.stringify({ "[python]": nested, "my.object": { "security.workspace.trust.enabled": true }, "security.workspace.trust.enabled": false }));
+    expect(r.settings).not.toHaveProperty("security.workspace.trust.enabled");
+    expect(r.settings["[python]"]).toEqual(nested);
+    expect(r.settings["my.object"]).toEqual({ "security.workspace.trust.enabled": true });
+  });
+
+  it("works on JSONC: comments, trailing commas, a trust key after a comment", () => {
+    const r = buildSettings(`{
+      // trust off, please
+      "security.workspace.trust.enabled": false, /* really */
+      "security.workspace.trust.banner": "never",
+      "security.workspace.trusted": "keep me", // near miss
+      "editor.fontSize": 15,
+    }`);
+    expect(r.source).toBe("copied");
+    expect(r.settings["security.workspace.trusted"]).toBe("keep me");
+    expect(r.settings["editor.fontSize"]).toBe(15);
+    expect(Object.keys(r.settings).some((k) => k.startsWith("security.workspace.trust."))).toBe(false);
+  });
+
+  it("keeps the user's other keys, the excludes and their own exclude patterns", () => {
+    const r = buildSettings(JSON.stringify({ ...TRUST_KEYS, "files.watcherExclude": { "**/build": true }, "search.exclude": { "**/dist": true }, "update.mode": "start", "a.b": [1, { c: 2 }] }));
+    expect(r.settings["files.watcherExclude"]).toEqual({ ...excludeGlobs(), "**/build": true });
+    expect(r.settings["search.exclude"]).toEqual({ ...excludeGlobs(), "**/dist": true });
+    expect(r.settings["update.mode"]).toBe("start");
+    expect(r.settings["a.b"]).toEqual([1, { c: 2 }]);
+  });
+
+  it("settings holding only trust keys give the excludes only, a valid object (not empty, not invalid)", () => {
+    const r = buildSettings(JSON.stringify(TRUST_KEYS));
+    expect(r.source).toBe("copied");
+    expect(Object.keys(r.settings).sort()).toEqual(EXCLUDE_KEYS);
+    expect(r.settings["files.watcherExclude"]).toEqual(excludeGlobs());
+  });
+
+  it("stripTrustKeys is pure: it returns a new object and leaves its input alone", () => {
+    const input = Object.freeze({ "security.workspace.trust.enabled": false, keep: 1 });
+    const out = stripTrustKeys(input);
+    expect(out).toEqual({ keep: 1 });
+    expect(out).not.toBe(input);
+    expect(input).toHaveProperty("security.workspace.trust.enabled");
+  });
+
+  it("seedUserData: the trust keys are in neither SeedResult.merged nor the file it wrote", () => {
+    const { source, userData, settings } = setup({ "settings.json": JSON.stringify({ ...TRUST_KEYS, "editor.fontSize": 15 }) });
+    const r = seedUserData({ userDataDir: userData, sourceUserDir: source });
+    for (const obj of [r.merged, settings()]) {
+      expect(Object.keys(obj).some((k) => k.startsWith("security.workspace.trust."))).toBe(false);
+      expect(obj["editor.fontSize"]).toBe(15);
+    }
+    expect(fs.readFileSync(r.settingsFile, "utf8")).not.toContain("security.workspace.trust");
+  });
+
+  it("keybindings.json is copied byte for byte: a trust-key lookalike inside it is not touched", () => {
+    const kb = Buffer.from('[{ "key": "a", "command": "x", "args": { "security.workspace.trust.enabled": false } }]');
+    const { source, userData } = setup({ "settings.json": "{}", "keybindings.json": kb });
+    const r = seedUserData({ userDataDir: userData, sourceUserDir: source });
+    expect(fs.readFileSync(r.keybindingsFile).equals(kb)).toBe(true);
+    expect(Buffer.from(r.keybindingsBase64 as string, "base64").equals(kb)).toBe(true);
+  });
+});
+
+describe("seedUserData from a profile folder (G13)", () => {
+  const vault = "/Users/x/Vault";
+  const profileOf = (root: string) => findMirroredProfile({ userDataRoot: root, vaultPath: vault });
+  const fixture = (association: string) => {
+    const root = writeUserData(path.join(tempDir(), "Code - Insiders"), { associations: { [vscodeFolderUri(vault)]: association } });
+    return { root, profile: profileOf(root), userData: path.join(tempDir(), "data") };
+  };
+  const readSettings = (userData: string) => JSON.parse(fs.readFileSync(path.join(userData, "User", "settings.json"), "utf8")) as Record<string, unknown>;
+
+  it("the profile's own settings and keybindings are copied, not the instance root's", () => {
+    const { profile, userData } = fixture(PROFILES.custom.location);
+    expect(profile.name).toBe("FDE Practice");
+    const src = profileSeedSource({ status: "resolved", profile }, null);
+    const r = seedUserData({ userDataDir: userData, ...src });
+    expect(r.settings).toBe("copied");
+    expect(readSettings(userData)["editor.fontSize"]).toBe(22);
+    expect(readSettings(userData).fixture).toMatch(/FDE Practice/);
+    expect(Object.keys(readSettings(userData)).some((k) => k.startsWith("security.workspace.trust."))).toBe(false);
+    const kb = Buffer.from(r.keybindingsBase64 as string, "base64").toString("utf8");
+    expect(kb).toContain(TOGGLE_PANEL_KEY.command);
+    expect(kb).not.toContain(TOGGLE_SIDEBAR_KEY.command);
+  });
+
+  it("Default reads the instance's User/ folder", () => {
+    const { profile, userData } = fixture("__default__profile__");
+    const r = seedUserData({ userDataDir: userData, ...profileSeedSource({ status: "resolved", profile }, null) });
+    expect(readSettings(userData)["editor.fontSize"]).toBe(14);
+    expect(Buffer.from(r.keybindingsBase64 as string, "base64").toString("utf8")).toContain(TOGGLE_SIDEBAR_KEY.command);
+  });
+
+  it("a second seed after the association moved replaces every FDE Practice value with Default's", () => {
+    const root = writeUserData(path.join(tempDir(), "Code - Insiders"), { associations: { [vscodeFolderUri(vault)]: PROFILES.custom.location } });
+    const userData = path.join(tempDir(), "data");
+    const seed = () => seedUserData({ userDataDir: userData, ...profileSeedSource({ status: "resolved", profile: findMirroredProfile({ userDataRoot: root, vaultPath: vault }) }, null) });
+    expect(seed().merged["editor.fontSize"]).toBe(22);
+    const storage = path.join(root, "User", "globalStorage", "storage.json");
+    const json = JSON.parse(fs.readFileSync(storage, "utf8"));
+    json.profileAssociations.workspaces[vscodeFolderUri(vault)] = "__default__profile__";
+    fs.writeFileSync(storage, JSON.stringify(json));
+    const r = seed();
+    expect(r.merged["editor.fontSize"]).toBe(14);
+    expect(fs.readFileSync(path.join(userData, "User", "settings.json"), "utf8")).not.toContain("FDE Practice");
+    expect(Buffer.from(r.keybindingsBase64 as string, "base64").toString("utf8")).not.toContain(TOGGLE_PANEL_KEY.command);
+  });
+
+  it("a profile with no keybindings.json removes a copy left from an earlier start", () => {
+    const { root, profile, userData } = fixture(PROFILES.custom.location);
+    const src = profileSeedSource({ status: "resolved", profile }, null);
+    expect(seedUserData({ userDataDir: userData, ...src }).keybindings).toBe(true);
+    fs.rmSync(path.join(root, "User", "profiles", PROFILES.custom.location, "keybindings.json"));
+    const r = seedUserData({ userDataDir: userData, ...src });
+    expect(r).toMatchObject({ keybindings: false, keybindingsBase64: null });
+    expect(fs.existsSync(path.join(userData, "User", "keybindings.json"))).toBe(false);
+  });
+
+  it("a profile folder that is missing, or whose settings.json is missing or empty: excludes only, no keybindings, no throw", () => {
+    const userData = path.join(tempDir(), "data");
+    const missing = path.join(tempDir(), "gone");
+    expect(seedUserData({ userDataDir: userData, sourceUserDir: missing })).toMatchObject({ settings: "missing", keybindings: false });
+    const folder = tempDir();
+    expect(seedUserData({ userDataDir: userData, sourceUserDir: folder })).toMatchObject({ settings: "missing", keybindings: false });
+    fs.writeFileSync(path.join(folder, "settings.json"), "");
+    const r = seedUserData({ userDataDir: userData, sourceUserDir: folder });
+    expect(r).toMatchObject({ settings: "empty", keybindings: false });
+    expect(Object.keys(readSettings(userData)).sort()).toEqual(EXCLUDE_KEYS);
+  });
+
+  it("an invalid profile settings.json: excludes only and the notice, which quotes nothing from the file", () => {
+    const folder = tempDir();
+    fs.writeFileSync(path.join(folder, "settings.json"), '{"github.token": "s3cret", "security.workspace.trust.enabled": false oops}');
+    const userData = path.join(tempDir(), "data");
+    const r = seedUserData({ userDataDir: userData, sourceUserDir: folder });
+    expect(r.settings).toBe("invalid");
+    expect(r.notice).not.toMatch(/s3cret|trust/);
+    expect(Object.keys(readSettings(userData)).sort()).toEqual(EXCLUDE_KEYS);
+  });
+
+  it("a symlinked profile folder and a symlinked file are read by content; the copy is a regular file", () => {
+    const real = tempDir();
+    fs.writeFileSync(path.join(real, "settings.json"), '{"from.link": 1, "security.workspace.trust.enabled": false}');
+    fs.writeFileSync(path.join(real, "keybindings.json"), "[7]");
+    const link = path.join(tempDir(), "profile-link");
+    fs.symlinkSync(real, link);
+    const userData = path.join(tempDir(), "data");
+    const r = seedUserData({ userDataDir: userData, sourceUserDir: link });
+    expect(readSettings(userData)["from.link"]).toBe(1);
+    expect(readSettings(userData)).not.toHaveProperty("security.workspace.trust.enabled");
+    for (const f of [r.settingsFile, r.keybindingsFile]) expect(fs.lstatSync(f).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(r.keybindingsFile, "utf8")).toBe("[7]");
+  });
+
+  it("a useDefaultFlags profile copies Default's files, by the profile resolution (not a second implementation)", () => {
+    const { root, profile, userData } = fixture(PROFILES.agents.location);
+    expect(profile.name).toBe("Agents");
+    const src = profileSeedSource({ status: "resolved", profile }, null);
+    expect(src).toEqual({ sourceUserDir: path.join(root, "User"), keybindingsSourceDir: path.join(root, "User") });
+    const r = seedUserData({ userDataDir: userData, ...src });
+    expect(r.merged["editor.fontSize"]).toBe(14);
+    expect(Buffer.from(r.keybindingsBase64 as string, "base64").toString("utf8")).toContain(TOGGLE_SIDEBAR_KEY.command);
+  });
+
+  it("a profile that takes only one kind from Default reads settings and keybindings from different folders", () => {
+    const own = tempDir();
+    const dflt = tempDir();
+    fs.writeFileSync(path.join(own, "settings.json"), '{"editor.fontSize": 22}');
+    fs.writeFileSync(path.join(own, "keybindings.json"), "[own]");
+    fs.writeFileSync(path.join(dflt, "settings.json"), '{"editor.fontSize": 14}');
+    fs.writeFileSync(path.join(dflt, "keybindings.json"), "[default]");
+    const userData = path.join(tempDir(), "data");
+    const r = seedUserData({ userDataDir: userData, sourceUserDir: own, keybindingsSourceDir: dflt });
+    expect(r.merged["editor.fontSize"]).toBe(22);
+    expect(fs.readFileSync(r.keybindingsFile, "utf8")).toBe("[default]");
+  });
+
+  it("profileSeedSource falls back to the given folder when the profile is not resolved", () => {
+    for (const state of [{ status: "not-read" }, { status: "unavailable", reason: "x" }] as const) {
+      expect(profileSeedSource(state, "/a/User")).toEqual({ sourceUserDir: "/a/User", keybindingsSourceDir: "/a/User" });
+    }
+    expect(profileSeedSource({ status: "not-read" }, null)).toEqual({ sourceUserDir: null, keybindingsSourceDir: null });
+  });
+
+  it("the destination guards hold with the profile folder as the source (settings and keybindings sides)", () => {
+    const userData = tempDir();
+    const profileInside = path.join(userData, "User", "profiles", "p1");
+    expect(() => seedUserData({ userDataDir: userData, sourceUserDir: profileInside })).toThrow(/destination is inside the instance|inside the plugin/);
+    expect(() => seedUserData({ userDataDir: userData, sourceUserDir: tempDir(), keybindingsSourceDir: profileInside })).toThrow(/inside the plugin|destination is inside/);
+    const profile = tempDir();
+    const inner = path.join(profile, "inner-data");
+    expect(() => seedUserData({ userDataDir: inner, sourceUserDir: profile })).toThrow();
+    expect(fs.existsSync(inner)).toBe(false);
+    expect(() => seedUserData({ userDataDir: path.join(profile, "x"), sourceUserDir: tempDir(), keybindingsSourceDir: profile })).toThrow();
+  });
+
+  it("nothing is written in the profile folder or anywhere beside the user-data dir", () => {
+    const { root, profile, userData } = fixture(PROFILES.custom.location);
+    const files = (d: string): string[] => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? files(path.join(d, e.name)) : [path.join(d, e.name)]));
+    const before = files(root).map((f) => [f, fs.readFileSync(f, "utf8")]);
+    seedUserData({ userDataDir: userData, ...profileSeedSource({ status: "resolved", profile }, null) });
+    expect(files(root).map((f) => [f, fs.readFileSync(f, "utf8")])).toEqual(before);
+    expect(fs.readdirSync(userData)).toEqual(["User"]);
+    expect(fs.readdirSync(path.join(userData, "User")).sort()).toEqual(["keybindings.json", "settings.json"]);
   });
 });

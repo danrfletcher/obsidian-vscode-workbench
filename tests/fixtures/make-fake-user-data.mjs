@@ -11,6 +11,10 @@
  *                  Default's settings and keybindings), with its own extensions.json
  *   Old Profile    listed, but its folder under User/profiles/ is gone (a deleted profile)
  *
+ * The settings files carry different `editor.fontSize` values (Default 14, FDE Practice 22), one different keybinding each
+ * (`TOGGLE_SIDEBAR_KEY` in Default's, `TOGGLE_PANEL_KEY` in FDE Practice's) and `security.workspace.trust.*` keys
+ * (`TRUST_KEYS`), so PR-6 tests can tell whose file reached the tab and that the trust keys did not.
+ *
  * The files are generated, never mocked: the real `fs` reads them. Nothing is written outside `appSupport`.
  */
 import * as fs from "node:fs";
@@ -23,6 +27,19 @@ export const PROFILES = {
   agents: { name: "Agents", location: "agents-7a2d", useDefaultFlags: { settings: true, keybindings: true } },
   deleted: { name: "Old Profile", location: "d3adbeef" },
 };
+
+/** `security.workspace.trust.*` settings both fixtures' settings.json carry (G12): none may reach the tab. */
+export const TRUST_KEYS = {
+  "security.workspace.trust.enabled": false,
+  "security.workspace.trust.startupPrompt": "never",
+  "security.workspace.trust.banner": "never",
+  "security.workspace.trust.untrustedFiles": "open",
+  "security.workspace.trust.emptyWindow": true,
+};
+
+/** The one keybinding each fixture profile has (G13): they differ in key and command. */
+export const TOGGLE_SIDEBAR_KEY = { key: "ctrl+alt+n", command: "workbench.action.toggleSidebarVisibility" };
+export const TOGGLE_PANEL_KEY = { key: "ctrl+alt+m", command: "workbench.action.togglePanel" };
 
 /** The user-data folder names of the known builds (KNOWN_BUILDS in src/instances/scan.ts). */
 export const BUILD_FOLDERS = ["Code", "Code - Insiders", "VSCodium", "Antigravity", "Antigravity IDE"];
@@ -43,8 +60,10 @@ function write(file, text) {
  */
 export function writeUserData(userDataRoot, { associations = {}, label = path.basename(userDataRoot) } = {}) {
   const user = path.join(userDataRoot, "User");
-  write(path.join(user, "settings.json"), `{ "editor.fontSize": 14, "fixture": "${label} default" }\n`);
-  write(path.join(user, "keybindings.json"), `[]\n`);
+  const settings = (fontSize, who) => `// ${who}\n${JSON.stringify({ "editor.fontSize": fontSize, fixture: `${label} ${who}`, ...TRUST_KEYS }, null, 2).replace(/\n}$/, ",\n}")}\n`;
+  const keybindings = (k) => `// ${k.command}\n[\n  ${JSON.stringify(k)},\n]\n`;
+  write(path.join(user, "settings.json"), settings(14, "default"));
+  write(path.join(user, "keybindings.json"), keybindings(TOGGLE_SIDEBAR_KEY));
   const profiles = Object.values(PROFILES).map((p) => ({ name: p.name, location: p.location, ...(p.useDefaultFlags ? { useDefaultFlags: p.useDefaultFlags } : {}) }));
   write(
     path.join(user, "globalStorage", "storage.json"),
@@ -54,8 +73,8 @@ export function writeUserData(userDataRoot, { associations = {}, label = path.ba
     const dir = path.join(user, "profiles", p.location);
     write(path.join(dir, "extensions.json"), `[]\n`);
     if (p !== PROFILES.agents) {
-      write(path.join(dir, "settings.json"), `{ "editor.fontSize": 22, "fixture": "${label} ${p.name}" }\n`);
-      write(path.join(dir, "keybindings.json"), `[]\n`);
+      write(path.join(dir, "settings.json"), settings(22, p.name));
+      write(path.join(dir, "keybindings.json"), keybindings(TOGGLE_PANEL_KEY));
     }
   }
   // PROFILES.deleted has no folder.

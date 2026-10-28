@@ -1,7 +1,8 @@
 /**
- * At each server start (G16, G17): copy the chosen instance's `User/settings.json`
- * and `User/keybindings.json` one way into the plugin-owned user-data dir, and
- * write the workspace excludes on top of the settings.
+ * At each server start (G16, G17, G12, G13): copy the mirrored profile's `settings.json` and
+ * `keybindings.json` (the instance's `User/` folder for Default, the profile's own folder for another
+ * profile; see `profileSeedSource`) one way into the plugin-owned user-data dir, strip every
+ * `security.workspace.trust.*` key from the settings, and write the workspace excludes on top of them.
  *
  * Rules (F3): the source files are only read (opened read-only, never touched);
  * every write goes to a temp name inside the destination folder and is renamed
@@ -23,12 +24,16 @@
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { ProfileState } from "../profile/mirrored-profile";
 
 /** Folders kept out of watching and search in the vault workspace (G16). */
 export const WORKSPACE_EXCLUDE_FOLDERS = [".git", ".obsidian", "Attachments", "node_modules", "_to_delete"] as const;
 
 /** Settings that carry the excludes. */
 export const EXCLUDE_SETTING_KEYS = ["files.watcherExclude", "search.exclude"] as const;
+
+/** Copied settings never carry a key with this prefix (G12): Workspace Trust is never switched off or loosened by a copy (F3). */
+export const TRUST_KEY_PREFIX = "security.workspace.trust.";
 
 export function excludeGlobs(): Record<string, true> {
   return Object.fromEntries(WORKSPACE_EXCLUDE_FOLDERS.map((f) => [`**/${f}`, true as const]));
@@ -117,7 +122,17 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 /**
- * The settings to write: the source's keys (when it parsed) with the excludes
+ * The settings without their `security.workspace.trust.*` keys (G12). Only top-level keys that start with the
+ * prefix go (`security.workspace.trust.enabled` and any unknown one under it); near misses such as
+ * `security.workspace.trusted`, other `security.*` keys, and keys nested inside the user's own objects stay.
+ * Pure: returns a new object.
+ */
+export function stripTrustKeys(settings: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(settings).filter(([key]) => !key.startsWith(TRUST_KEY_PREFIX)));
+}
+
+/**
+ * The settings to write: the source's keys (when it parsed, trust keys stripped) with the excludes
  * merged on top. The user's own exclude patterns stay; ours are set to true and
  * win over a copied value for the same pattern.
  */
@@ -131,7 +146,7 @@ export function buildSettings(sourceText: string | null): { settings: Record<str
       try {
         const parsed = parseJsonc(sourceText);
         if (isPlainObject(parsed)) {
-          base = parsed;
+          base = stripTrustKeys(parsed);
           source = "copied";
         } else {
           source = "invalid";
@@ -193,7 +208,7 @@ export interface SeedResult {
   /** keybindings.json was copied (false: missing in the source, or no source). */
   keybindings: boolean;
   /**
-   * What was written to `User/settings.json`: the copied keys with the excludes on top. The Code tab
+   * What was written to `User/settings.json`: the copied keys (no `security.workspace.trust.*`) with the excludes on top. The Code tab
    * hands this to the browser profile (src/settings.ts), because that is where the workbench reads user
    * settings; the file itself is the plugin-owned copy.
    */
@@ -209,33 +224,45 @@ export interface SeedResult {
 export interface SeedOptions {
   /** The plugin-owned user-data dir; `User/` is created in it. */
   userDataDir: string;
-  /** The chosen instance's `User/` folder, or null when it cannot be told. */
+  /** The folder `settings.json` is copied from: the mirrored profile's own folder (Default: the instance's `User/`), or null when it cannot be told. */
   sourceUserDir: string | null;
+  /**
+   * The folder `keybindings.json` is copied from; defaults to `sourceUserDir`. It differs only for a profile that
+   * takes one of the two files from Default (`useDefaultFlags`).
+   */
+  keybindingsSourceDir?: string | null;
 }
 
 export function seedUserData(o: SeedOptions): SeedResult {
   const userDir = path.join(o.userDataDir, "User");
   const settingsFile = path.join(userDir, "settings.json");
   const keybindingsFile = path.join(userDir, "keybindings.json");
+  const settingsSrc = o.sourceUserDir;
+  const keybindingsSrc = o.keybindingsSourceDir === undefined ? o.sourceUserDir : o.keybindingsSourceDir;
   for (const dest of [settingsFile, keybindingsFile]) {
     if (!isInside(dest, o.userDataDir)) throw new Error("The user-data destination is outside the plugin's user-data dir.");
-    if (o.sourceUserDir && isInside(dest, o.sourceUserDir)) throw new Error("The user-data destination is inside the instance's own folder.");
+    for (const source of [settingsSrc, keybindingsSrc]) {
+      if (source && isInside(dest, source)) throw new Error("The user-data destination is inside the instance's own folder.");
+    }
   }
-  if (o.sourceUserDir && isInside(o.sourceUserDir, o.userDataDir)) throw new Error("The instance's user folder is inside the plugin's user-data dir.");
+  for (const source of [settingsSrc, keybindingsSrc]) {
+    if (source && isInside(source, o.userDataDir)) throw new Error("The instance's user folder is inside the plugin's user-data dir.");
+  }
   fs.mkdirSync(userDir, { recursive: true, mode: 0o700 });
 
-  const src = o.sourceUserDir;
   let settingsRaw: Buffer | null = null;
   let keybindingsRaw: Buffer | null = null;
   let readError = false;
-  if (src) {
+  if (settingsSrc) {
     try {
-      settingsRaw = readSource(path.join(src, "settings.json"));
+      settingsRaw = readSource(path.join(settingsSrc, "settings.json"));
     } catch {
       readError = true;
     }
+  }
+  if (keybindingsSrc) {
     try {
-      keybindingsRaw = readSource(path.join(src, "keybindings.json"));
+      keybindingsRaw = readSource(path.join(keybindingsSrc, "keybindings.json"));
     } catch {
       /* unreadable keybindings: skipped */
     }
@@ -259,6 +286,21 @@ export function seedUserData(o: SeedOptions): SeedResult {
         ? "The instance's settings.json could not be read, so only the workspace excludes were applied. Fix the file in that VS Code and restart the server."
         : null,
   };
+}
+
+/**
+ * The folders the mirrored profile's files are copied from (G13), by PR-3's resolution (`files.settings.dir` and
+ * `files.keybindings.dir`: the profile's own folder, or Default's `User/` for a kind a `useDefaultFlags` profile takes from
+ * Default). When the profile could not be resolved at all, `fallbackDir` (the instance's own `User/`, that is Default) is used.
+ */
+export function profileSeedSource(
+  state: ProfileState,
+  fallbackDir: string | null,
+): { sourceUserDir: string | null; keybindingsSourceDir: string | null } {
+  if (state.status === "resolved") {
+    return { sourceUserDir: state.profile.files.settings.dir, keybindingsSourceDir: state.profile.files.keybindings.dir };
+  }
+  return { sourceUserDir: fallbackDir, keybindingsSourceDir: fallbackDir };
 }
 
 /** The instance's `User/` folder under Application Support, or null when its folder name is unknown or unsafe. */

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { BROWSER_APP_SETTINGS, USER_DATA_MARKER_KEY, buildBrowserSeedScript, buildMachineSettings, writeMachineSettings, type UserDataCopy } from "../../src/settings";
-import { excludeGlobs } from "../../src/server/user-data-seed";
+import { excludeGlobs, profileSeedSource, seedUserData } from "../../src/server/user-data-seed";
 import { STOP_TEXT, describeAge, describeDisabledLists, describeExtensionsSection, describePort, describeProfile, renderExtensionsSection, type PortStatus, type SpikeResult } from "../../src/settings/extensions-section";
 import { SPIKE_RESULT } from "../../src/settings/spike-result";
 import { FakeNode, Setting } from "../mocks/obsidian";
@@ -10,7 +10,7 @@ import { WorkbenchSettingTab, type SettingsHost } from "../../src/settings/setti
 import { DEFAULT_SETTINGS, type WorkbenchSettings } from "../../src/settings/data";
 import { MANUAL_TRUST_STEPS, describeTrust } from "../../src/trust/trust-message";
 import { findMirroredProfile, type MirroredProfile, type ProfileState } from "../../src/profile/mirrored-profile";
-import { PROFILES, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
+import { PROFILES, TOGGLE_PANEL_KEY, TRUST_KEYS, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
 import type { MirrorResult } from "../../src/mirror/mirror";
 import { tempDir } from "../helpers";
 
@@ -241,6 +241,50 @@ describe("buildBrowserSeedScript with the copy of the instance's settings and ke
     const r = await runSeed({ "/User/settings.json": new TextEncoder().encode('{ // hand edited\n}') }, copy, storage);
     expect(r.outcome).toBe("kept");
     expect(r.text).toContain("// hand edited");
+  });
+});
+
+describe("the seed script built from a stripped profile copy holds no trust key (G12, G13)", () => {
+  const vault = "/Users/x/Vault";
+  const copyFor = (location: string): UserDataCopy => {
+    const root = writeUserData(path.join(tempDir(), "Code - Insiders"), { associations: { [vscodeFolderUri(vault)]: location } });
+    const profile = findMirroredProfile({ userDataRoot: root, vaultPath: vault });
+    // The fixture's settings.json files carry all five trust keys (and comments, trailing commas).
+    expect(fs.readFileSync(path.join(profile.files.settings.dir as string, "settings.json"), "utf8")).toContain("security.workspace.trust.enabled");
+    const seeded = seedUserData({ userDataDir: path.join(tempDir(), "data"), ...profileSeedSource({ status: "resolved", profile }, null) });
+    return { id: "start-1", settings: seeded.merged, keybindingsBase64: seeded.keybindingsBase64 };
+  };
+
+  it.each([
+    ["FDE Practice", PROFILES.custom.location, 22],
+    ["Default", "__default__profile__", 14],
+  ])("%s: /User/settings.json in IndexedDB has the profile's values and no security.workspace.trust.* key", async (_n, location, fontSize) => {
+    const copy = copyFor(location);
+    // An earlier file in the tab with trust keys in it is replaced whole by the copy.
+    const old = new TextEncoder().encode(JSON.stringify(TRUST_KEYS));
+    const r = await runSeed({ "/User/settings.json": old }, copy);
+    expect(r.outcome).toBe("seeded");
+    const written = JSON.parse(r.text as string) as Record<string, unknown>;
+    expect(written["editor.fontSize"]).toBe(fontSize);
+    expect(Object.keys(written).filter((k) => k.startsWith("security.workspace.trust."))).toEqual([]);
+    expect(r.text).not.toContain("security.workspace.trust");
+  });
+
+  it("the profile's keybinding is written byte for byte, and a later Default copy replaces it", async () => {
+    const storage = fakeStorage();
+    const first = await runSeed(undefined, copyFor(PROFILES.custom.location), storage);
+    expect(first.keybindings).toContain(TOGGLE_PANEL_KEY.command);
+    const second = await runSeed({ "/User/settings.json": new TextEncoder().encode(first.text as string), "/User/keybindings.json": new TextEncoder().encode(first.keybindings as string) }, { ...copyFor("__default__profile__"), id: "start-2" }, storage);
+    expect(second.keybindings).not.toContain(TOGGLE_PANEL_KEY.command);
+    expect(JSON.parse(second.text as string)["editor.fontSize"]).toBe(14);
+    expect(second.text).not.toContain("FDE Practice");
+  });
+
+  it("the Machine file still has no security.workspace.trust.* key, and the seed script still turns telemetry off", () => {
+    const machine = buildMachineSettings({ dark: true });
+    expect(Object.keys(machine).filter((k) => k.startsWith("security.workspace.trust."))).toEqual([]);
+    expect(BROWSER_APP_SETTINGS).toMatchObject({ "telemetry.telemetryLevel": "off" });
+    expect(buildBrowserSeedScript(BROWSER_APP_SETTINGS, copyFor(PROFILES.custom.location))).toContain('"telemetry.telemetryLevel":"off"');
   });
 });
 
