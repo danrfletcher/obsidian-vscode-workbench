@@ -37,6 +37,7 @@ import { DrawerToggle } from "./hotkey/drawer-toggle";
 import { EmbedKeyRelay, type RelayFrame } from "./hotkey/embed-key-relay";
 import { resolveChords, type BridgeAction, type HotkeyLike } from "./hotkey/hotkey-bridge";
 import { profileForInstance, userDataRootFor, type ProfileState } from "./profile/mirrored-profile";
+import type { MirrorRequest, MirrorResult } from "./mirror/mirror";
 import { instanceUserDir, seedUserData } from "./server/user-data-seed";
 import { dataObject, effectiveShell, readSettings, type WorkbenchSettings } from "./settings/data";
 import { type PortStatus, type SpikeResult } from "./settings/extensions-section";
@@ -124,6 +125,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private profileSource: string | null = null;
   /** The next server start reads the profile: true from Obsidian start until a start reads it, and again from each Restart server. */
   private profileStale = true;
+  /** What the last server start read of desktop VS Code's disabled lists (read, snapshot or none); null until a start has read them. Shown in settings. */
+  private mirror: MirrorResult | null = null;
   /** What the trust seed answered at the last Code tab load that ran it; shown in settings. In memory only: nothing about it is stored. */
   private lastTrustOutcome: string | null = null;
   /** Tests only: replaces the reachability check that turns a failed download into "the network is unreachable". */
@@ -617,6 +620,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       // The server for this VS Code build is not on disk yet: the start below downloads it (this is the progress notice).
       new Notice("VS Code Workbench: downloading the VS Code server. The first run needs internet and can take a minute.", 8000);
     }
+    this.mirrorProfile(chosen);
+    this.mirror = null; // the new start reads the lists again; until it has, settings says "not read yet"
     const server = new WorkbenchServer({
       build: o.commitOverride ? { ...build, commit: o.commitOverride } : build,
       runtimeDir,
@@ -627,11 +632,14 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       downloadHostReachable: this.downloadHostReachable,
       storedPort: this.workbenchSettings().stablePort,
       onPortPick: (pick) => this.notePort(pick),
+      mirror: this.mirrorRequest(chosen),
+      onMirror: (result) => {
+        if (!this.unloaded) this.mirror = result;
+      },
     });
     writeMachineSettings(server.serverDataDir, { dark: this.isDark() });
     this.themeSync.markApplied(this.isDark());
     this.seedUserData(server.userDataDir, chosen);
-    this.mirrorProfile(chosen);
     return server;
   }
 
@@ -685,6 +693,25 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   mirroredProfile(): ProfileState {
     return this.profile;
+  }
+
+  /**
+   * What the server start reads of desktop VS Code's disabled lists: the instance's own user-data folder (F9),
+   * the profile `mirrorProfile` just resolved, and this vault. Nothing can be read when either is unknown.
+   */
+  private mirrorRequest(instance: Instance): MirrorRequest {
+    const found = userDataRootFor({ instance, appSupport: appSupportRoot(), configuredFolder: this.data_.userDataFolder });
+    if ("reason" in found) return { unavailable: found.reason };
+    const state = this.profile;
+    if (state.status === "unavailable") return { unavailable: state.reason };
+    if (state.status !== "resolved") return { unavailable: "the profile was not read" };
+    const { location, isDefault, dir } = state.profile;
+    return { instanceId: instance.id, userDataRoot: found.root, vaultPath: this.vaultRoot(), profile: { location, isDefault, dir } };
+  }
+
+  /** The disabled-list read of the last server start, for settings. */
+  disabledLists(): MirrorResult | null {
+    return this.mirror;
   }
 
   userDataCopy(): UserDataCopy | null {

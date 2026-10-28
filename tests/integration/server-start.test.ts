@@ -8,7 +8,9 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ServerStartError, StartCancelledError, WorkbenchServer, checkServeWebSupport, findFreePort as freePort, heldPortsSnapshot, type CodeBuild } from "../../src/server";
+import type { MirrorRequest } from "../../src/mirror/mirror";
 import { FAKE_CODE, isAlive, listenersOn, tempDir } from "../helpers";
+import { buildTree, snapshotTree, stateDb } from "../mirror-tree";
 
 let runtimeDir: string;
 let pidFile: string;
@@ -308,5 +310,106 @@ describe("checkServeWebSupport (test-start with --help)", () => {
 
   it("refuses a CLI that does not exist", async () => {
     expect((await checkServeWebSupport("/nonexistent/code")).serveWeb).toBe(false);
+  });
+});
+
+describe("the mirror read at server start (PR-4)", () => {
+  const request = (t: ReturnType<typeof buildTree>): MirrorRequest => ({
+    instanceId: "vscode-insiders:/Applications/Visual Studio Code.app",
+    userDataRoot: t.userDataRoot,
+    vaultPath: t.vault,
+    profile: { location: "__default__profile__", isDefault: true, dir: path.join(t.userDataRoot, "User") },
+  });
+
+  it("reads the disabled lists before the child is spawned, from real databases, and records the answer", async () => {
+    const t = buildTree({ base: tempDir(), global: ["--disabled", "g.one"], workspace: { dbArgs: ["--disabled", "w.one"] } });
+    const order: string[] = [];
+    const s = make({}, { mirror: request(t), onMirror: () => order.push(fs.existsSync(argsFile) ? "after-spawn" : "before-spawn"), onPortPick: () => order.push("port") });
+    expect(s.mirror).toBeNull();
+    await s.ensureStarted();
+    expect(order).toEqual(["before-spawn", "port"]);
+    expect(s.mirror).toMatchObject({ source: "read", disabled: ["g.one", "w.one"] });
+    expect(fs.existsSync(path.join(s.serverDataDir, "mirror-snapshot.json"))).toBe(true);
+  });
+
+  it("reads once per start: a restart reads again, and a start reads once", async () => {
+    const t = buildTree({ base: tempDir(), global: ["--disabled", "g.one"] });
+    let reads = 0;
+    const s = make({}, { mirror: request(t), onMirror: () => reads++ });
+    await s.ensureStarted();
+    await s.ensureStarted(); // already running: no new start, no new read
+    expect(reads).toBe(1);
+    await s.stop();
+    const again = make({}, { mirror: request(t), onMirror: () => reads++ });
+    await again.ensureStarted();
+    expect(reads).toBe(2);
+  });
+
+  it("no mirror asked for: nothing is read and nothing is written", async () => {
+    const s = make();
+    await s.ensureStarted();
+    expect(s.mirror).toBeNull();
+    expect(fs.existsSync(path.join(s.serverDataDir, "mirror-snapshot.json"))).toBe(false);
+  });
+
+  it("desktop VS Code's files are byte-identical and unchanged in mtime after a start and a stop (F1)", async () => {
+    const t = buildTree({ base: tempDir(), global: ["--wal", "--disabled", "g.one"], workspace: { dbArgs: ["--disabled", "w.one"] } });
+    const root = path.join(t.base, "AppSupport");
+    const home = path.join(t.base, "Home");
+    const before = { root: snapshotTree(root), home: snapshotTree(home), vault: snapshotTree(t.vault) };
+    const s = make({}, { mirror: request(t) });
+    await s.ensureStarted();
+    await s.stop();
+    expect({ root: snapshotTree(root), home: snapshotTree(home), vault: snapshotTree(t.vault) }).toEqual(before);
+    expect(s.mirror?.source).toBe("read");
+    expect(fs.readdirSync(path.join(runtimeDir, "mirror-tmp"))).toEqual([]);
+  });
+
+  it("a database that cannot be read does not stop the server from starting: the answer is none, with why", async () => {
+    const t = buildTree({ base: tempDir(), global: ["--corrupt"] });
+    const s = make({}, { mirror: request(t) });
+    const r = await s.ensureStarted();
+    expect(await get(r.port, `/?tkn=${r.token}`)).toBe(302);
+    expect(s.mirror).toMatchObject({ source: "none", disabled: [] });
+    expect(s.mirror?.source === "none" && s.mirror.why).toContain("corrupt");
+  });
+
+  it("an unlocatable instance does not stop the start either", async () => {
+    const s = make({}, { mirror: { unavailable: "no user-data folder" } });
+    await s.ensureStarted();
+    expect(s.mirror).toEqual({ source: "none", disabled: [], why: "desktop VS Code's state cannot be located (no user-data folder)" });
+  });
+
+  it("a second start uses the snapshot of the first when the second read fails", async () => {
+    const t = buildTree({ base: tempDir(), global: ["--disabled", "g.one"] });
+    const s = make({}, { mirror: request(t) });
+    await s.ensureStarted();
+    await s.stop();
+    stateDb(t.globalDb, "--corrupt");
+    const again = make({}, { mirror: request(t) });
+    await again.ensureStarted();
+    expect(again.mirror).toMatchObject({ source: "snapshot", disabled: ["g.one"] });
+  });
+
+  it("a listener that throws does not stop the start", async () => {
+    const t = buildTree({ base: tempDir(), global: [] });
+    const s = make({}, { mirror: request(t), onMirror: () => { throw new Error("listener"); } });
+    await s.ensureStarted();
+    expect(s.mirror?.source).toBe("read");
+  });
+
+  it("stop() during the read cancels the start, kills sqlite3 and leaves no temp copy, and no server process is spawned", async () => {
+    const t = buildTree({ base: tempDir(), global: ["--disabled", "g.one"] });
+    const mirrorDeps = { run: (_args: string[], o: { signal?: AbortSignal }) => new Promise<{ kind: "aborted" }>((resolve) => o.signal?.addEventListener("abort", () => resolve({ kind: "aborted" }))) };
+    const s = make({}, { mirror: request(t), mirrorDeps });
+    const starting = s.ensureStarted();
+    const outcome = starting.then(() => "started", (e: unknown) => e);
+    await vi.waitFor(() => expect(fs.existsSync(path.join(runtimeDir, "mirror-tmp")) && fs.readdirSync(path.join(runtimeDir, "mirror-tmp")).length).toBe(1));
+    await s.stop();
+    expect(await outcome).toBeInstanceOf(StartCancelledError);
+    expect(fs.readdirSync(path.join(runtimeDir, "mirror-tmp"))).toEqual([]);
+    expect(serverPids()).toEqual([]);
+    expect(fs.existsSync(argsFile)).toBe(false);
+    expect(s.mirror).toBeNull();
   });
 });

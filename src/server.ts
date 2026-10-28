@@ -18,6 +18,7 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ChildRegistry } from "./child-registry";
+import { mirrorDisabled, mirrorTmpRoot, type MirrorRequest, type MirrorResult, type MirrorOptions } from "./mirror/mirror";
 import { isAlive, listDescendants, pidsWithCommandContaining, signal, signalGroup } from "./process-utils";
 
 export { descendantsFromPs, listDescendants } from "./process-utils";
@@ -581,6 +582,15 @@ export interface ServerOptions {
   storedPort?: number | null;
   /** Called with the port chosen for each start, before the child is spawned. */
   onPortPick?: (pick: PortPick) => void;
+  /**
+   * What to mirror from desktop VS Code at each start (PR-4): the instance, the mirrored profile and the vault.
+   * Without it no read is made (tests that do not exercise the mirror).
+   */
+  mirror?: MirrorRequest;
+  /** Called with the mirror's answer as soon as the read is done, before anything is shared or spawned. */
+  onMirror?: (result: MirrorResult) => void;
+  /** Tests only: the file system and `sqlite3` runner the read uses. */
+  mirrorDeps?: MirrorOptions["deps"];
 }
 
 export interface RunningServer {
@@ -608,6 +618,8 @@ export class WorkbenchServer {
   private downloadErrorLine: string | null = null;
   private exit: ExitInfo | null = null;
   private exitListeners: Array<(info: ExitInfo) => void> = [];
+  private mirrorResult: MirrorResult | null = null;
+  private mirrorAbort: AbortController | null = null;
 
   constructor(private readonly opts: ServerOptions) {}
 
@@ -634,6 +646,11 @@ export class WorkbenchServer {
    */
   get userDataDir(): string {
     return path.join(this.serverDataDir, "data");
+  }
+
+  /** The disabled-extension read of the last start (null before it, or when no mirror was asked for). */
+  get mirror(): MirrorResult | null {
+    return this.mirrorResult;
   }
 
   /** Called when the server dies without stop() having been asked for (a crash, `kill -9`). */
@@ -668,6 +685,11 @@ export class WorkbenchServer {
     const cliDataDir = this.cliDataDir;
     fs.mkdirSync(this.serverDataDir, { recursive: true });
     fs.mkdirSync(cliDataDir, { recursive: true });
+
+    // Read desktop VS Code's disabled lists once per start, before any extension is shared (PR-5 shares only
+    // the enabled ones). A failed read is an answer (snapshot, or none), never an error: the start goes on.
+    await this.readMirror();
+    if (this.stopRequested) throw new StartCancelledError(); // stop() came in during the read: its temp copy is already gone
 
     const token = createTokenFile(tokenFile);
     shareExtensions(build.extensionsDir, this.serverDataDir);
@@ -756,6 +778,31 @@ export class WorkbenchServer {
     return this.running;
   }
 
+  private async readMirror(): Promise<void> {
+    this.mirrorResult = null;
+    const request = this.opts.mirror;
+    if (!request) return;
+    const abort = new AbortController();
+    this.mirrorAbort = abort;
+    try {
+      const result = await mirrorDisabled(request, {
+        dataDir: this.serverDataDir,
+        tmpRoot: mirrorTmpRoot(this.opts.runtimeDir),
+        signal: abort.signal,
+        deps: this.opts.mirrorDeps,
+      });
+      if (abort.signal.aborted) return;
+      this.mirrorResult = result;
+      try {
+        this.opts.onMirror?.(result);
+      } catch {
+        /* a listener's fault never stops the start */
+      }
+    } finally {
+      if (this.mirrorAbort === abort) this.mirrorAbort = null;
+    }
+  }
+
   private pushLog(line: string, token: string): void {
     const clean = redactToken(line, token).trim();
     if (!clean || isLogNoise(clean)) return;
@@ -832,6 +879,7 @@ export class WorkbenchServer {
    * (before the first await) so plugin unload can call this without waiting.
    */
   stop(): Promise<void> {
+    this.mirrorAbort?.abort(); // a read in flight kills its sqlite3 and removes its temp copy
     if (this.stopping) return this.stopping;
     this.stopRequested = true;
     const child = this.child;

@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { BROWSER_APP_SETTINGS, USER_DATA_MARKER_KEY, buildBrowserSeedScript, buildMachineSettings, writeMachineSettings, type UserDataCopy } from "../../src/settings";
 import { excludeGlobs } from "../../src/server/user-data-seed";
-import { STOP_TEXT, describeExtensionsSection, describePort, describeProfile, renderExtensionsSection, type PortStatus, type SpikeResult } from "../../src/settings/extensions-section";
+import { STOP_TEXT, describeAge, describeDisabledLists, describeExtensionsSection, describePort, describeProfile, renderExtensionsSection, type PortStatus, type SpikeResult } from "../../src/settings/extensions-section";
 import { SPIKE_RESULT } from "../../src/settings/spike-result";
 import { FakeNode, Setting } from "../mocks/obsidian";
 import { WorkbenchSettingTab, type SettingsHost } from "../../src/settings/settings-tab";
@@ -11,6 +11,7 @@ import { DEFAULT_SETTINGS, type WorkbenchSettings } from "../../src/settings/dat
 import { MANUAL_TRUST_STEPS, describeTrust } from "../../src/trust/trust-message";
 import { findMirroredProfile, type MirroredProfile, type ProfileState } from "../../src/profile/mirrored-profile";
 import { PROFILES, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
+import type { MirrorResult } from "../../src/mirror/mirror";
 import { tempDir } from "../helpers";
 
 describe("writeMachineSettings", () => {
@@ -368,6 +369,20 @@ describe("the Extensions section of the settings tab", () => {
     expect(css).not.toMatch(/\.workbench-message[^{]*\{[^}]*color:/);
   });
 
+  it("styles.css lets an Extensions row's text wrap and never clips it (long paths, why-text, snapshot age)", () => {
+    const css = fs.readFileSync(path.join(process.cwd(), "src/styles.css"), "utf8");
+    // Every rule that targets the row or its message, whatever else it sets.
+    const rules = [...css.matchAll(/([^{}]*\.workbench-extensions-row[^{}]*)\{([^}]*)\}/g)].map((m) => m[2]);
+    expect(rules.length).toBeGreaterThan(0);
+    for (const body of rules) {
+      expect(body).not.toMatch(/overflow(-x|-y)?:\s*(hidden|clip)/);
+      expect(body).not.toMatch(/white-space:\s*(nowrap|pre)\b/);
+      expect(body).not.toMatch(/text-overflow:/);
+      expect(body).not.toMatch(/(^|[;\s])(max-)?height:/);
+    }
+    expect(css).toMatch(/\.workbench-extensions-row \.workbench-message\s*\{[^}]*white-space:\s*normal[^}]*overflow-wrap:\s*anywhere/);
+  });
+
   it.each<[string, PortStatus, string]>([
     ["nothing stored, no server", { stored: null, current: null, note: null }, "None stored yet: the first server start picks a free port and stores it."],
     ["nothing stored, server running", { stored: null, current: 52000, note: null }, "Server running on port 52000; it will be stored as this vault's stable port."],
@@ -621,10 +636,10 @@ describe("the Profile row of the Extensions section (G7, G8, G9, E2, E10)", () =
       expect(t.row("Profile")?.cls).toContain("workbench-warning");
     });
 
-    it("sits in the Extensions section, after the port row, and is the only row added", () => {
+    it("sits in the Extensions section, after the port row, followed by the disabled-lists row", () => {
       const t = open(() => ({ status: "not-read" }));
       const names = t.el.all().filter((n) => n.cls?.includes("workbench-extensions-row")).map((r) => r.children[0]?.text);
-      expect(names).toEqual(["Measured", "Stable port", "Stable port in use", "Profile", "Trust record", "Settings and keybindings", "Turbo Console Log"]);
+      expect(names).toEqual(["Measured", "Stable port", "Stable port in use", "Profile", "Disabled in VS Code", "Trust record", "Settings and keybindings", "Turbo Console Log"]);
     });
 
     it("reads the host each time the tab is displayed: a restart's new result shows at once, nothing is cached", () => {
@@ -634,7 +649,7 @@ describe("the Profile row of the Extensions section (G7, G8, G9, E2, E10)", () =
       state = resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: PROFILES.custom.location }));
       t.tab.display();
       expect(t.text()).toContain("FDE Practice. Chosen from: the vault folder.");
-      expect(t.text()).not.toContain("Not read yet");
+      expect(t.text()).not.toContain("Not read yet: the profile is read when the server starts.");
     });
 
     it("a host that throws: the Profile row says it could not be shown, and the rest of settings is still drawn", () => {
@@ -650,15 +665,115 @@ describe("the Profile row of the Extensions section (G7, G8, G9, E2, E10)", () =
     });
   });
 
-  it("a Profile row with no spike result recorded is still drawn, after the port", () => {
+  it("a Profile row and a disabled-lists row with no spike result recorded are still drawn, after the port", () => {
     const el = new FakeNode("div");
     renderExtensionsSection(el as unknown as HTMLElement, describeExtensionsSection(null, { stored: null, current: null, note: null }, { status: "not-read" }));
     const names = el.all().filter((n) => n.cls?.includes("workbench-extensions-row")).map((r) => r.children[0]?.text);
-    expect(names).toEqual(["Extension spike", "Stable port in use", "Profile"]);
+    expect(names).toEqual(["Extension spike", "Stable port in use", "Profile", "Disabled in VS Code"]);
   });
 
   it("describeExtensionsSection without a profile argument says not read yet", () => {
     const view = describeExtensionsSection(null, { stored: null, current: null, note: null });
     expect(view.rows.find((r) => r.name === "Profile")?.text).toBe("Not read yet: the profile is read when the server starts.");
+  });
+});
+
+describe("the Disabled in VS Code row of the Extensions section (G14, E1)", () => {
+  const NOW = 1_800_000_000_000;
+  const read: MirrorResult = { source: "read", disabled: ["a.b", "c.d", "e.f"], counts: { global: 1, profile: 1, workspace: 2 }, notes: [], at: NOW };
+
+  it("not read yet", () => {
+    expect(describeDisabledLists(null, NOW)).toEqual({ name: "Disabled in VS Code", text: "Not read yet: the disabled lists are read when the server starts.", tone: "info" });
+  });
+
+  it("read: says the lists were read, how many extensions are disabled and from which lists", () => {
+    expect(describeDisabledLists(read, NOW)).toEqual({
+      name: "Disabled in VS Code",
+      text: "Disabled lists read from desktop VS Code at the last server start: 3 extensions disabled (global 1, profile 1, workspace 2).",
+      tone: "ok",
+    });
+  });
+
+  it("read in the Default profile: no profile count (its list is the global one), one extension in the singular, and the notes", () => {
+    const row = describeDisabledLists({ ...read, disabled: ["a.b"], counts: { global: 0, profile: null, workspace: 1 }, notes: ["no workspace storage names the vault"] }, NOW);
+    expect(row.text).toBe(
+      "Disabled lists read from desktop VS Code at the last server start: 1 extension disabled (global 0, workspace 1). Note: no workspace storage names the vault.",
+    );
+  });
+
+  it("snapshot: says the snapshot from an earlier start is used, with its age and why the read failed", () => {
+    const snap: MirrorResult = { source: "snapshot", disabled: ["a.b"], takenAt: NOW - 3 * 3_600_000 - 5 * 60_000, why: "the disabled list could not be read (the global list: sqlite3 was not found on PATH)" };
+    expect(describeDisabledLists(snap, NOW)).toEqual({
+      name: "Disabled in VS Code",
+      text: "Using the snapshot from an earlier start, taken 3 hours ago (1 extension disabled). Why: the disabled list could not be read (the global list: sqlite3 was not found on PATH).",
+      tone: "warning",
+    });
+  });
+
+  it("none: says no extensions are shared, and why", () => {
+    const none: MirrorResult = { source: "none", disabled: [], why: "the disabled list could not be read (the global list: sqlite3 was not found on PATH); there is no earlier snapshot" };
+    expect(describeDisabledLists(none, NOW)).toEqual({
+      name: "Disabled in VS Code",
+      text: "No extensions are shared: the disabled list could not be read (the global list: sqlite3 was not found on PATH); there is no earlier snapshot.",
+      tone: "warning",
+    });
+  });
+
+  it("describeAge: minutes, hours, days, singular and plural, and a clock that ran backwards", () => {
+    expect(describeAge(-5000)).toBe("less than a minute");
+    expect(describeAge(59_000)).toBe("less than a minute");
+    expect(describeAge(60_000)).toBe("1 minute");
+    expect(describeAge(45 * 60_000)).toBe("45 minutes");
+    expect(describeAge(60 * 60_000)).toBe("1 hour");
+    expect(describeAge(23 * 3_600_000)).toBe("23 hours");
+    expect(describeAge(24 * 3_600_000)).toBe("1 day");
+    expect(describeAge(50 * 3_600_000)).toBe("2 days");
+  });
+
+  describe("in the settings tab, against the mock host", () => {
+    function open(disabledLists?: () => MirrorResult | null) {
+      const host: SettingsHost = {
+        restartServer: async () => undefined,
+        serverState: () => "running",
+        workbenchSettings: () => ({ ...DEFAULT_SETTINGS }),
+        updateSettings: async () => undefined,
+        scanInstances: async () => ({ instances: [], rejected: [], customFailure: null }),
+        verifyCustomCli: async () => ({ ok: false, reason: "no" }),
+        codeCliOverride: () => undefined,
+        portStatus: () => ({ stored: 51789, current: 51789, note: null }),
+        spikeResult: () => SPIKE_RESULT,
+        mirroredProfile: () => ({ status: "not-read" }),
+        ...(disabledLists ? { disabledLists } : {}),
+      };
+      Setting.reset();
+      const tab = new WorkbenchSettingTab({} as never, {} as never, host);
+      tab.display();
+      const el = tab.containerEl as unknown as FakeNode;
+      const row = el.all().find((n) => n.cls?.includes("workbench-extensions-row") && n.children[0]?.text === "Disabled in VS Code");
+      return { tab, row, text: () => row?.children[1].text };
+    }
+
+    it("a host without the method shows not read yet", () => {
+      expect(open().text()).toContain("Not read yet");
+    });
+
+    it("shows the host's result, and reads it again each time the tab is displayed", () => {
+      let result: MirrorResult | null = null;
+      const t = open(() => result);
+      expect(t.text()).toContain("Not read yet");
+      result = read;
+      t.tab.display();
+      const again = (t.tab.containerEl as unknown as FakeNode).all().find((n) => n.children[0]?.text === "Disabled in VS Code");
+      expect(again?.children[1].text).toContain("3 extensions disabled");
+    });
+
+    it("a host that throws shows not read yet and leaves the rest drawn", () => {
+      const t = open(() => {
+        throw new Error("secret detail");
+      });
+      expect(t.text()).toContain("Not read yet");
+      expect(t.text()).not.toContain("secret");
+      expect(Setting.all.find((x) => x.name === "Restart server")).toBeDefined();
+    });
   });
 });

@@ -7,6 +7,7 @@ import { addExtension, defaultShell, type WorkbenchSettings } from "./data";
 import { describeExtensionsSection, renderExtensionsSection, type PortStatus, type SpikeResult } from "./extensions-section";
 import { describeTrust, MANUAL_TRUST_STEPS } from "../trust/trust-message";
 import type { ProfileState } from "../profile/mirrored-profile";
+import type { MirrorResult } from "../mirror/mirror";
 
 export interface SettingsHost {
   restartServer(): Promise<void>;
@@ -27,6 +28,8 @@ export interface SettingsHost {
   mirroredProfile(): ProfileState;
   /** What the trust seed answered at the last Code tab load (from the host, not the page); null = no tab has run it yet. */
   trustOutcome?(): string | null;
+  /** What the last server start read of desktop VS Code's disabled lists (read, snapshot or none); null = no start has read them yet. From the host, never from disk here. */
+  disabledLists?(): MirrorResult | null;
 }
 
 type Tone = "error" | "warning" | "ok" | "info";
@@ -92,7 +95,7 @@ export class WorkbenchSettingTab extends PluginSettingTab {
     this.renderDrawerAndShell(containerEl);
     this.renderTrust(containerEl.createDiv());
     // Read once, here: the section shows the recorded result and the port as they are when settings opens.
-    renderExtensionsSection(containerEl.createDiv(), describeExtensionsSection(this.host.spikeResult(), this.host.portStatus(), this.profileState()));
+    renderExtensionsSection(containerEl.createDiv(), describeExtensionsSection(this.host.spikeResult(), this.host.portStatus(), this.profileState(), this.disabledListsState(), Date.now()));
     this.renderRestart(containerEl);
   }
 
@@ -102,6 +105,15 @@ export class WorkbenchSettingTab extends PluginSettingTab {
       return this.host.mirroredProfile();
     } catch {
       return { status: "unavailable", reason: "the plugin could not report it" };
+    }
+  }
+
+  /** The host's disabled-list result; a host without one, or one that throws, shows "not read yet". */
+  private disabledListsState(): MirrorResult | null {
+    try {
+      return this.host.disabledLists?.() ?? null;
+    } catch {
+      return null;
     }
   }
 

@@ -5,8 +5,10 @@
  *
  * It shows a recorded result. Nothing here reads desktop VS Code's state, starts a timer or watches a file
  * (F7): it is drawn from `SPIKE_RESULT`, the host's port status and the host's last profile result each time
- * the settings tab is opened. The profile is read by the server start (src/profile/mirrored-profile.ts), never here.
+ * the settings tab is opened. The profile and the disabled lists are read by the server start
+ * (src/profile/mirrored-profile.ts, src/mirror/), never here.
  */
+import type { MirrorResult } from "../mirror/mirror";
 import type { MirroredProfile, ProfileState } from "../profile/mirrored-profile";
 import { PROFILE_KINDS } from "../profile/profile-kinds";
 
@@ -95,19 +97,67 @@ export function describeProfile(state: ProfileState): SectionRow {
   return { name, text, tone: p.fallback ? "warning" : "ok" };
 }
 
+/** How long ago, in words: "less than a minute", "5 minutes", "2 hours", "3 days". */
+export function describeAge(ms: number): string {
+  const minutes = Math.floor(Math.max(0, ms) / 60_000);
+  if (minutes < 1) return "less than a minute";
+  const unit = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  if (minutes < 60) return unit(minutes, "minute");
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return unit(hours, "hour");
+  return unit(Math.floor(hours / 24), "day");
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+/**
+ * The Disabled in VS Code row: which of three cases applies to the list of extensions desktop VS Code has
+ * switched off. It is read at each server start (src/mirror/), never here.
+ *  - read: the lists were read at the last start;
+ *  - snapshot: the read failed and the snapshot from an earlier start is used (with its age);
+ *  - none: the read failed and there is no usable snapshot, so no extensions are shared.
+ */
+export function describeDisabledLists(result: MirrorResult | null, now: number): SectionRow {
+  const name = "Disabled in VS Code";
+  if (result === null) return { name, text: "Not read yet: the disabled lists are read when the server starts.", tone: "info" };
+  if (result.source === "read") {
+    const c = result.counts;
+    const parts = [`global ${c.global}`, ...(c.profile === null ? [] : [`profile ${c.profile}`]), `workspace ${c.workspace}`];
+    let text = `Disabled lists read from desktop VS Code at the last server start: ${plural(result.disabled.length, "extension")} disabled (${parts.join(", ")}).`;
+    if (result.notes.length > 0) text += ` Note: ${result.notes.join("; ")}.`;
+    return { name, text, tone: "ok" };
+  }
+  if (result.source === "snapshot") {
+    return {
+      name,
+      text: `Using the snapshot from an earlier start, taken ${describeAge(now - result.takenAt)} ago (${plural(result.disabled.length, "extension")} disabled). Why: ${result.why}.`,
+      tone: "warning",
+    };
+  }
+  return { name, text: `No extensions are shared: ${result.why}.`, tone: "warning" };
+}
+
 /** Everything the section shows, as plain data. `result` null = nothing recorded yet. `profile` defaults to not read yet. */
-export function describeExtensionsSection(result: SpikeResult | null, port: PortStatus, profile: ProfileState = { status: "not-read" }): SectionView {
+export function describeExtensionsSection(
+  result: SpikeResult | null,
+  port: PortStatus,
+  profile: ProfileState = { status: "not-read" },
+  disabled: MirrorResult | null = null,
+  now: number = Date.now(),
+): SectionView {
   const rows: SectionRow[] = [];
   if (result === null) {
     rows.push({ name: "Extension spike", text: "No spike result recorded yet.", tone: "info" });
     rows.push(describePort(port));
     rows.push(describeProfile(profile));
+    rows.push(describeDisabledLists(disabled, now));
     return { heading: "Extensions", rows };
   }
   rows.push({ name: "Measured", text: `${result.measuredOn}, on VS Code ${result.vscodeVersion}.`, tone: "info" });
   rows.push({ name: "Stable port", text: `${result.stablePort.result} Decision: ${result.stablePort.decision}`, tone: result.stablePort.stable ? "ok" : "warning" });
   rows.push(describePort(port));
   rows.push(describeProfile(profile));
+  rows.push(describeDisabledLists(disabled, now));
 
   const t = result.trustRecord;
   rows.push(
