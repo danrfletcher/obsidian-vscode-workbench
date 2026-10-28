@@ -7,10 +7,15 @@
  * (F7): it is drawn from `SPIKE_RESULT`, the host's port status and the host's last profile result each time
  * the settings tab is opened. The profile and the disabled lists are read by the server start
  * (src/profile/mirrored-profile.ts, src/mirror/), never here.
+ *
+ * Under the heading it also draws the list of shared extensions (PR-7): `renderExtensionsSection` leaves a
+ * container for it and `renderExtensionList` fills that container from a view the host built when settings
+ * opened (src/settings/extension-list.ts). The list has no control; it reports.
  */
 import type { MirrorResult } from "../mirror/mirror";
 import type { MirroredProfile, ProfileState } from "../profile/mirrored-profile";
 import { PROFILE_KINDS } from "../profile/profile-kinds";
+import { STATE_TONE, type ExtensionListView } from "./extension-states";
 
 /** The marker the section and the doc use when the spike says the profile's settings and keybindings never reach the tab (F8). */
 export const STOP_MARKER = "STOP";
@@ -189,13 +194,55 @@ export function describeExtensionsSection(
  * (the success, warning and error text colours do not: `--text-success` is about 2.6:1 on white). The tone is
  * a coloured bar down the left edge of the row (`workbench-extensions-row.workbench-<tone>` in styles.css), and
  * the words themselves ("STOP", "not found", "failed") carry the meaning too, so colour is never the only signal.
+ * Returns the container for the extension list, which sits under the intro line and above these rows.
  */
-export function renderExtensionsSection(el: HTMLElement, view: SectionView): void {
+export function renderExtensionsSection(el: HTMLElement, view: SectionView): HTMLElement {
   const box = el.createDiv({ cls: "workbench-extensions" });
   box.createEl("h3", { text: view.heading });
+  box.createDiv({ text: LIST_INTRO, cls: "setting-item-description workbench-message" });
+  // The list of extensions goes here, above the recorded results; the caller fills it when its read answers.
+  const list = box.createDiv({ cls: "workbench-extension-list" });
   for (const row of view.rows) {
     const item = box.createDiv({ cls: `workbench-extensions-row workbench-${row.tone}` });
     item.createDiv({ text: row.name, cls: "setting-item-name" });
     item.createDiv({ text: row.text, cls: "setting-item-description workbench-message" });
+  }
+  return list;
+}
+
+/** The line under the heading: where the list gets its states and when a change shows. */
+export const LIST_INTRO = "Changes made in desktop VS Code show here after Restart server.";
+
+/** Shown while the list is being read. */
+export const LIST_LOADING = "Reading the extension list…";
+
+/** Shown when the host could not give a list at all. */
+export const LIST_FAILED = "The extension list could not be read. Close and reopen settings to try again.";
+
+/** The text of the server-stopped case. */
+export const SERVER_NOT_RUNNING = "server not running";
+
+/**
+ * Draw the list into `el` (the container `renderExtensionsSection` returned): one item per extension with its
+ * name, id and version, and its state and reason. Plain text only, set as text content; the tone is a bar at
+ * the item's left edge (`workbench-extension-item.workbench-<tone>` in styles.css). It has no control: nothing
+ * here changes an extension (F2).
+ */
+export function renderExtensionList(el: HTMLElement, view: ExtensionListView): void {
+  el.empty();
+  if (view.status === "server-not-running") {
+    el.createDiv({ text: SERVER_NOT_RUNNING, cls: "setting-item-description workbench-message workbench-extension-note" });
+    return;
+  }
+  if (view.status === "empty") {
+    el.createDiv({ text: view.message, cls: "setting-item-name workbench-extension-note" });
+    el.createDiv({ text: view.reason, cls: "setting-item-description workbench-message" });
+    return;
+  }
+  for (const row of view.rows) {
+    const item = el.createDiv({ cls: `workbench-extension-item workbench-${STATE_TONE[row.state]}` });
+    item.createDiv({ text: row.name, cls: "setting-item-name" });
+    item.createDiv({ text: `${row.id} · ${row.version}`, cls: "setting-item-description workbench-message workbench-extension-id" });
+    item.createDiv({ text: `${row.stateLabel}: ${row.reason}`, cls: "setting-item-description workbench-message workbench-extension-state" });
   }
 }

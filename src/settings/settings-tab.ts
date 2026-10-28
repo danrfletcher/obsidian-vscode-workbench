@@ -4,7 +4,8 @@ import type { CliCheck } from "../instances/probe";
 import { CUSTOM_ID, KNOWN_BUILDS, type Instance, type ScanResult } from "../instances/scan";
 import type { ServerState } from "../server-manager";
 import { addExtension, defaultShell, type WorkbenchSettings } from "./data";
-import { describeExtensionsSection, renderExtensionsSection, type PortStatus, type SpikeResult } from "./extensions-section";
+import { describeExtensionsSection, LIST_FAILED, LIST_LOADING, renderExtensionList, renderExtensionsSection, type PortStatus, type SpikeResult } from "./extensions-section";
+import type { ExtensionListView } from "./extension-states";
 import { describeTrust, MANUAL_TRUST_STEPS } from "../trust/trust-message";
 import type { ProfileState } from "../profile/mirrored-profile";
 import type { MirrorResult } from "../mirror/mirror";
@@ -30,6 +31,11 @@ export interface SettingsHost {
   trustOutcome?(): string | null;
   /** What the last server start read of desktop VS Code's disabled lists (read, snapshot or none); null = no start has read them yet. From the host, never from disk here. */
   disabledLists?(): MirrorResult | null;
+  /**
+   * The Extensions list: every extension the mirrored profile lists, with state and reason, read now (including the
+   * extension host log). Asked each time settings opens; `server-not-running` when no server runs. Read only.
+   */
+  extensionRows(): Promise<ExtensionListView>;
 }
 
 type Tone = "error" | "warning" | "ok" | "info";
@@ -71,7 +77,7 @@ interface InstanceViewState {
   customResult: { tone: Tone; text: string } | null;
 }
 
-/** The settings tab: instances, custom CLI, excludes, the drawer toggle, the shell, the trust toggle, the extension spike result and Restart server. */
+/** The settings tab: instances, custom CLI, excludes, the drawer toggle, the shell, the trust toggle, the Extensions section (its list and the spike result) and Restart server. */
 export class WorkbenchSettingTab extends PluginSettingTab {
   /** Bumped by every display(): an answer that belongs to an older display is dropped. */
   private renderId = 0;
@@ -95,8 +101,28 @@ export class WorkbenchSettingTab extends PluginSettingTab {
     this.renderDrawerAndShell(containerEl);
     this.renderTrust(containerEl.createDiv());
     // Read once, here: the section shows the recorded result and the port as they are when settings opens.
-    renderExtensionsSection(containerEl.createDiv(), describeExtensionsSection(this.host.spikeResult(), this.host.portStatus(), this.profileState(), this.disabledListsState(), Date.now()));
+    const list = renderExtensionsSection(containerEl.createDiv(), describeExtensionsSection(this.host.spikeResult(), this.host.portStatus(), this.profileState(), this.disabledListsState(), Date.now()));
+    // The extension list is read from the host (and the extension host log) every time settings opens; it answers later.
+    this.loadExtensionList(list, render);
     this.renderRestart(containerEl);
+  }
+
+  /** "Reading…", then the list. An answer that belongs to an older display() is dropped; a host that throws or rejects leaves the rest drawn. */
+  private loadExtensionList(el: HTMLElement, render: number): void {
+    el.createDiv({ text: LIST_LOADING, cls: "setting-item-description workbench-message" });
+    // Promise.resolve().then also catches a host method that throws before it returns a promise.
+    Promise.resolve()
+      .then(() => this.host.extensionRows())
+      .then(
+        (view) => {
+          if (render === this.renderId) renderExtensionList(el, view);
+        },
+        () => {
+          if (render !== this.renderId) return;
+          el.empty();
+          el.createDiv({ text: LIST_FAILED, cls: "setting-item-description workbench-message" });
+        },
+      );
   }
 
   /** The host's profile result; a host that throws gives a row saying so and leaves the rest of settings drawn. */

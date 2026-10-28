@@ -333,3 +333,28 @@ body.vscw-terminal-on.vscw-terminal-dragging .status-bar {
 .workbench-extensions-row.workbench-error {
   border-left-color: var(--text-error);
 }
+
+/* Settings > Extensions: the list of shared extensions (name, id and version, state and reason). Long reasons and ids wrap. */
+.workbench-extension-item {
+  padding: 0.5em 0 0.5em 0.75em;
+  border-bottom: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--background-modifier-border);
+}
+.workbench-extension-item .workbench-message {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.workbench-extension-item.workbench-ok {
+  border-left-color: var(--text-success);
+}
+.workbench-extension-item.workbench-warning {
+  border-left-color: var(--text-warning);
+}
+.workbench-extension-item.workbench-error {
+  border-left-color: var(--text-error);
+}
+.workbench-extension-note {
+  padding: 0.5em 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}

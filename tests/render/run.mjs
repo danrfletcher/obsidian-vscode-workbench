@@ -90,6 +90,37 @@ const profileScenarios = [
   profileScenario("profile-no-association-accents", SPACE_VAULT, {}),
 ];
 
+// The extension list of the Extensions section (PR-7: G11, G16, F2), one scenario per kind of view. Hand-written rows so
+// every state, a long id and long reasons are drawn; the unit tests build the same view from real trees.
+const row = (state, stateLabel, reason, over = {}) => ({ id: "pub.name", name: "Name", version: "1.0.0", state, stateLabel, reason, ...over });
+const LONG = "Error: Cannot find module '/Users/x/.vscode-insiders/extensions/some.publisher-extension-with-a-long-name-1.2.3/dist/extension.js' from a long path that has to wrap and not run past the edge of the settings pane";
+const listScenarios = [
+  {
+    name: "extension-list",
+    kind: "settings-section",
+    view: describeExtensionsSection(SPIKE_RESULT, { stored: 51789, current: 51789, note: null }, { status: "not-read" }),
+    list: {
+      status: "listed",
+      rows: [
+        row("active", "active", "activated by the extension host", { id: "ChakrounAnas.turbo-console-log", name: "Turbo Console Log", version: "3.2.1" }),
+        row("failed", "failed", LONG, { id: "ms-python.vscode-pylance", name: "Pylance", version: "2026.4.1" }),
+        row("failed", "failed", "no reason in the log", { id: "ms-vscode.cpptools", name: "C/C++", version: "1.30.0" }),
+        row("disabled", "disabled in VS Code", "switched off in desktop VS Code, so the tab does not run it; changes made there show here after Restart server", { id: "eamodio.gitlens", name: "GitLens — Git supercharged", version: "17.0.0" }),
+        row("untrusted", "untrusted", "the vault folder is not trusted, so the tab keeps it from running (see the trust setting above)", { id: "dbaeumer.vscode-eslint", name: "ESLint", version: "3.0.10" }),
+        row("inactive", "inactive", "not activated yet; most extensions start when a file they handle is opened in the tab", { id: "redhat.vscode-yaml", name: "YAML", version: "1.19.0" }),
+        row("inactive", "inactive", "no extension host log found", { id: "a-very-long-publisher-name.an-extension-id-with-no-spaces-to-break-on-at-all-0123456789", name: "An extension with a rather long display name that has to wrap inside the settings pane", version: "10.20.30-insiders.20261028" }),
+      ],
+    },
+  },
+  { name: "extension-list-not-running", kind: "settings-section", view: describeExtensionsSection(SPIKE_RESULT, { stored: null, current: null, note: null }, { status: "not-read" }), list: { status: "server-not-running" } },
+  {
+    name: "extension-list-empty",
+    kind: "settings-section",
+    view: describeExtensionsSection(SPIKE_RESULT, { stored: null, current: null, note: null }, { status: "not-read" }),
+    list: { status: "empty", message: "No extensions shared", reason: "desktop VS Code's disabled list could not be read and there is no earlier copy, so nothing is shared until the next Restart server" },
+  },
+];
+
 // The download failure the way the CLI logs it.
 const DNS =
   "Error downloading server: error sending request for url (https://update.example/): error trying to connect: dns error: failed to lookup address information";
@@ -118,6 +149,8 @@ const scenarios = [
   { name: "restart-with-dirty-modal", kind: "modal", prompt: "restart-with-dirty", files: ["a.py", "scripts/estimate_time.py"] },
   // The Profile row of the settings Extensions section (PR-3: G7, G8, E2, E10), drawn with the plugin's styles.css.
   ...profileScenarios,
+  // The extension list under the same heading (PR-7).
+  ...listScenarios,
 ];
 const windows = [
   [1280, 800],

@@ -470,6 +470,7 @@ describe("the \"Trust the vault folder\" toggle in the settings tab (G6, E3)", (
       portStatus: () => ({ stored: null, current: null, note: null }),
       spikeResult: () => null,
       mirroredProfile: () => ({ status: "not-read" }),
+      extensionRows: async () => ({ status: "server-not-running" }),
       ...(last === undefined ? {} : { trustOutcome: () => last ?? null }),
     };
     Setting.reset();
@@ -652,6 +653,7 @@ describe("the Profile row of the Extensions section (G7, G8, G9, E2, E10)", () =
         portStatus: () => ({ stored: 51789, current: 51789, note: null }),
         spikeResult: () => SPIKE_RESULT,
         mirroredProfile: profile,
+        extensionRows: async () => ({ status: "server-not-running" }),
       };
       Setting.reset();
       const tab = new WorkbenchSettingTab({} as never, {} as never, host);
@@ -787,6 +789,7 @@ describe("the Disabled in VS Code row of the Extensions section (G14, E1)", () =
         portStatus: () => ({ stored: 51789, current: 51789, note: null }),
         spikeResult: () => SPIKE_RESULT,
         mirroredProfile: () => ({ status: "not-read" }),
+        extensionRows: async () => ({ status: "server-not-running" }),
         ...(disabledLists ? { disabledLists } : {}),
       };
       Setting.reset();

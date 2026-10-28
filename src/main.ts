@@ -43,6 +43,8 @@ import { instanceUserDir, profileSeedSource, seedUserData } from "./server/user-
 import { dataObject, effectiveShell, readSettings, type WorkbenchSettings } from "./settings/data";
 import { type PortStatus, type SpikeResult } from "./settings/extensions-section";
 import { SPIKE_RESULT } from "./settings/spike-result";
+import { buildExtensionList } from "./settings/extension-list";
+import type { ExtensionListView } from "./settings/extension-states";
 import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
 import { workbenchOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
 import { DEVICE_ID_KEY } from "./terminal/drawer-state";
@@ -737,6 +739,23 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   /** The disabled-list read of the last server start, for settings. */
   disabledLists(): MirrorResult | null {
     return this.mirror;
+  }
+
+  /**
+   * The Extensions list for settings, built now from what the last start read, the plugin's own links and the
+   * extension host log (read only; nothing is kept). `server-not-running` unless the server is up, so no state
+   * from an earlier run is shown.
+   */
+  extensionRows(): Promise<ExtensionListView> {
+    const server = this.manager.serverInstance;
+    return buildExtensionList({
+      serverRunning: this.manager.state === "running",
+      serverDataDir: server?.serverDataDir ?? null,
+      sourceDir: this.lastBuild?.extensionsDir ?? null,
+      mirror: this.mirrorCache.current,
+      trustSeedOn: this.workbenchSettings().trustVaultFolder,
+      trustOutcome: this.lastTrustOutcome,
+    });
   }
 
   /** Shared links whose extension folder has been removed since the last start (E5). Read-only; the next start rebuilds the set. */

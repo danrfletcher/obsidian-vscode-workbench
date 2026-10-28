@@ -1,0 +1,13 @@
+2026-10-28 09:10:01.100 [info] Extension host with pid 4343 started
+2026-10-28 09:10:02.300 [info] ExtensionService#_doActivateExtension ChakrounAnas.turbo-console-log, startup: false, activationEvent: 'onStartupFinished'
+2026-10-28 09:10:02.350 [info] ExtensionService#_doActivateExtension ms-python.vscode-pylance, startup: false, activationEvent: 'onLanguage:python'
+2026-10-28 09:10:02.400 [error] Activating extension ms-python.vscode-pylance failed due to an error:
+2026-10-28 09:10:02.401 [error] Error: Pylance can only be used with Microsoft's own builds of VS Code.
+    at activate (/scratch/extensions/ms-python.vscode-pylance-2026.4.1/dist/extension.js:1:2345)
+    at async Promise.all (index 0)
+2026-10-28 09:10:02.500 [info] ExtensionService#_doActivateExtension ms-vscode.cpptools, startup: false, activationEvent: 'onLanguage:cpp'
+2026-10-28 09:10:02.510 [error] ms-vscode.cpptools: Error: The C/C++ extension may be used only with Microsoft Visual Studio, Visual Studio Code and successor Microsoft products.
+2026-10-28 09:10:02.600 [info] ExtensionService#_doActivateExtension dbaeumer.vscode-eslint, startup: false, activationEvent: 'onLanguage:javascript'
+2026-10-28 09:10:02.610 [error] Activating extension dbaeumer.vscode-eslint failed due to an error:
+2026-10-28 09:10:02.700 [error] Activating extension some.unshared-extension failed due to an error:
+2026-10-28 09:10:02.701 [error] Error: this extension is not in the shared set
