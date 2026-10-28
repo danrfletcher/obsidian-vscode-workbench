@@ -65,9 +65,61 @@ await build({
   outfile: path.join(outDir, "messages.mjs"),
   logLevel: "error",
 });
-const { describeFailure, ServerStartError } = await import(pathToFileURL(path.join(outDir, "messages.mjs")).href);
+const { describeFailure, ServerStartError, findMirroredProfile, describeExtensionsSection, SPIKE_RESULT } = await import(pathToFileURL(path.join(outDir, "messages.mjs")).href);
+const { PROFILES, vscodeFolderUri, writeUserData } = await import(pathToFileURL(path.join(root, "tests/fixtures/make-fake-user-data.mjs")).href);
 
 fs.writeFileSync(path.join(outDir, "app.css"), readAsar(ASAR, "app.css"));
+fs.copyFileSync(path.join(root, "styles.css"), path.join(outDir, "plugin.css"));
+
+// The Profile row of the Extensions section, from the real lookup against generated user-data folders.
+const SPACE_VAULT = "/Users/x/My Vault/Café Ünï";
+function profileScenario(name, vaultPath, associations) {
+  const userDataRoot = writeUserData(path.join(fs.mkdtempSync(path.join(outDir, "userdata-")), "Code - Insiders"), { associations });
+  const profile = findMirroredProfile({ userDataRoot, vaultPath });
+  const state = { status: "resolved", profile };
+  const port = { stored: 51789, current: 51789, note: null };
+  return { name, kind: "settings-section", view: describeExtensionsSection(SPIKE_RESULT, port, state) };
+}
+const notRead = { name: "profile-not-read", kind: "settings-section", view: describeExtensionsSection(SPIKE_RESULT, { stored: 51789, current: 51789, note: null }, { status: "not-read" }) };
+const profileScenarios = [
+  notRead,
+  profileScenario("profile-default", SPACE_VAULT, { [vscodeFolderUri(SPACE_VAULT)]: "__default__profile__" }),
+  profileScenario("profile-fde-practice", SPACE_VAULT, { [vscodeFolderUri(SPACE_VAULT)]: PROFILES.custom.location }),
+  profileScenario("profile-unknown", SPACE_VAULT, { [vscodeFolderUri(SPACE_VAULT)]: "ffff0000" }),
+  profileScenario("profile-deleted-folder", SPACE_VAULT, { [vscodeFolderUri(SPACE_VAULT)]: PROFILES.deleted.location }),
+  profileScenario("profile-no-association-accents", SPACE_VAULT, {}),
+];
+
+// The extension list of the Extensions section (PR-7: G11, G16, F2), one scenario per kind of view. Hand-written rows so
+// every state, a long id and long reasons are drawn; the unit tests build the same view from real trees.
+const row = (state, stateLabel, reason, over = {}) => ({ id: "pub.name", name: "Name", version: "1.0.0", state, stateLabel, reason, ...over });
+const LONG = "Error: Cannot find module '/Users/x/.vscode-insiders/extensions/some.publisher-extension-with-a-long-name-1.2.3/dist/extension.js' from a long path that has to wrap and not run past the edge of the settings pane";
+const listScenarios = [
+  {
+    name: "extension-list",
+    kind: "settings-section",
+    view: describeExtensionsSection(SPIKE_RESULT, { stored: 51789, current: 51789, note: null }, { status: "not-read" }),
+    list: {
+      status: "listed",
+      rows: [
+        row("active", "active", "activated by the extension host", { id: "ChakrounAnas.turbo-console-log", name: "Turbo Console Log", version: "3.2.1" }),
+        row("failed", "failed", LONG, { id: "ms-python.vscode-pylance", name: "Pylance", version: "2026.4.1" }),
+        row("failed", "failed", "no reason in the log", { id: "ms-vscode.cpptools", name: "C/C++", version: "1.30.0" }),
+        row("disabled", "disabled in VS Code", "switched off in desktop VS Code, so the tab does not run it; changes made there show here after Restart server", { id: "eamodio.gitlens", name: "GitLens — Git supercharged", version: "17.0.0" }),
+        row("untrusted", "untrusted", "the vault folder is not trusted, so the tab keeps it from running (see the trust setting above)", { id: "dbaeumer.vscode-eslint", name: "ESLint", version: "3.0.10" }),
+        row("inactive", "inactive", "not activated yet; most extensions start when a file they handle is opened in the tab", { id: "redhat.vscode-yaml", name: "YAML", version: "1.19.0" }),
+        row("inactive", "inactive", "no extension host log found", { id: "a-very-long-publisher-name.an-extension-id-with-no-spaces-to-break-on-at-all-0123456789", name: "An extension with a rather long display name that has to wrap inside the settings pane", version: "10.20.30-insiders.20261028" }),
+      ],
+    },
+  },
+  { name: "extension-list-not-running", kind: "settings-section", view: describeExtensionsSection(SPIKE_RESULT, { stored: null, current: null, note: null }, { status: "not-read" }), list: { status: "server-not-running" } },
+  {
+    name: "extension-list-empty",
+    kind: "settings-section",
+    view: describeExtensionsSection(SPIKE_RESULT, { stored: null, current: null, note: null }, { status: "not-read" }),
+    list: { status: "empty", message: "No extensions shared", reason: "desktop VS Code's disabled list could not be read and there is no earlier copy, so nothing is shared until the next Restart server" },
+  },
+];
 
 // The download failure the way the CLI logs it.
 const DNS =
@@ -95,6 +147,10 @@ const scenarios = [
   { name: "quit-save-or-discard-modal", kind: "modal", prompt: "quit-save-or-discard", files: ["a.py", "b.ts", "Makefile", "scripts/estimate_time.py", "notes/ünï.ts", "seventh.rs"] },
   { name: "quit-save-failed-modal", kind: "modal", prompt: "quit-save-failed", files: ["Untitled-1", "scripts/estimate_time.py"] },
   { name: "restart-with-dirty-modal", kind: "modal", prompt: "restart-with-dirty", files: ["a.py", "scripts/estimate_time.py"] },
+  // The Profile row of the settings Extensions section (PR-3: G7, G8, E2, E10), drawn with the plugin's styles.css.
+  ...profileScenarios,
+  // The extension list under the same heading (PR-7).
+  ...listScenarios,
 ];
 const windows = [
   [1280, 800],
@@ -119,7 +175,7 @@ for (const sc of scenarios) {
       const page = path.join(outDir, `${id}.html`);
       fs.writeFileSync(
         page,
-        `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="app.css"></head>` +
+        `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="app.css">${sc.kind === "settings-section" ? '<link rel="stylesheet" href="plugin.css">' : ""}</head>` +
           `<body class="${theme} is-frameless mod-macos"><pre id="result" style="display:none"></pre>` +
           `<script src="entry.js"></script>` +
           `<script>render.run(${JSON.stringify(sc)}).then(r => { document.getElementById("result").textContent = JSON.stringify(r); }, e => { document.getElementById("result").textContent = JSON.stringify({ ok: false, error: String(e) }); });</script>` +
@@ -136,7 +192,7 @@ for (const sc of scenarios) {
       }
       chrome([size, "--virtual-time-budget=2000", `--screenshot=${path.join(outDir, `${id}.png`)}`, pathToFileURL(page).href]);
       const lines = (r.results ?? []).map((x) => `${x.label} ${x.box} ${x.textLines} lines`).join("; ");
-      console.log(`${r.ok ? "ok  " : "FAIL"} ${id} (window ${r.window ?? "?"}) ${lines}${r.buttons ? ` buttons: ${r.buttons.join(" | ")}` : ""}`);
+      console.log(`${r.ok ? "ok  " : "FAIL"} ${id} (window ${r.window ?? "?"}) ${lines}${r.buttons ? ` buttons: ${r.buttons.join(" | ")}` : ""}${r.profileRow ? ` profile row: ${r.profileRow}` : ""}`);
       for (const x of r.results ?? []) for (const p of x.problems) console.log(`       ${p}`);
       if (r.error) console.log(`       ${r.error}`);
       if (!r.ok) failed++;

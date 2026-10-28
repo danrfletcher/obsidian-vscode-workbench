@@ -39,7 +39,16 @@ class Embed extends FakeNode {
     (this.fired[n] ??= []).push(f);
     super.addEventListener(n, f);
   }
+  /** Every script that was neither a dirty read nor a file-tab read: the two seeds, in order. */
+  seeds: string[] = [];
+  /** What the trust seed answers. */
+  trustAnswer: () => Promise<unknown> = () => Promise.resolve("seeded");
   executeJavaScript(code: string) {
+    if (code.includes("vscode-web-state-db-global-shared")) {
+      this.seeds.push(code);
+      return this.trustAnswer();
+    }
+    if (code.includes("vscode-web-db")) this.seeds.push(code);
     if (code === DIRTY_SCRIPT) return this.dirtyAnswer ? this.dirtyAnswer() : Promise.resolve(this.dirty);
     if (code.includes("data-resource-name")) return Promise.resolve(this.fileTab); // fileDirtyScript
     return Promise.resolve("seeded");
@@ -73,7 +82,13 @@ interface Tab {
 }
 
 function world(
-  opts: { autoSave?: "on" | "off"; answers?: Array<"save" | "discard" | "cancel">; root?: string; afterCarry?: () => void } = {},
+  opts: {
+    autoSave?: "on" | "off";
+    answers?: Array<"save" | "discard" | "cancel">;
+    root?: string;
+    afterCarry?: () => void;
+    trust?: { enabled: () => boolean; held: () => number[]; outcomes: string[]; port?: number };
+  } = {},
 ) {
   const leaves: Array<WorkspaceLeaf & { detached?: boolean }> = [];
   const open = new OpenFiles<WorkspaceLeaf>(() => leaves.filter((l) => !(l as { detached?: boolean }).detached));
@@ -90,13 +105,20 @@ function world(
   const host: CodeViewHost = {
     vaultRoot: () => root ?? "/vault",
     embedElement: () => "webview",
-    ensureServer: async () => ({ baseUrl: "http://127.0.0.1:5555", port: 5555, token: "tok" }),
+    ensureServer: async () => ({ baseUrl: `http://127.0.0.1:${opts.trust?.port ?? 5555}`, port: opts.trust?.port ?? 5555, token: "tok" }),
     trackView: () => undefined,
     untrackView: () => undefined,
     serverState: () => "running",
     onServerState: () => () => undefined,
     restartServer: async () => undefined,
     userDataCopy: () => null,
+    ...(opts.trust
+      ? {
+          trustVaultFolder: () => opts.trust?.enabled() ?? false,
+          heldPorts: () => opts.trust?.held() ?? [],
+          noteTrustOutcome: (o: string) => void opts.trust?.outcomes.push(o),
+        }
+      : {}),
     admitFile: async (f, leaf) => open.claim(f, leaf as WorkspaceLeaf) === null,
     releaseFile: (f, leaf) => open.release(f, leaf as WorkspaceLeaf),
     openInSystemApp: () => undefined,
@@ -1076,6 +1098,87 @@ describe("vault events (G3, G4)", () => {
     expect(t.embed().keys).toBe(0);
     expect(t.embed().dirty).toBe(true);
     expect(w.prompts).toEqual([]);
+  });
+});
+
+describe("the trust seed on every tab load (G5, G6, E3, E11)", () => {
+  const trustScripts = (e: Embed) => e.seeds.filter((c) => c.includes("content.trust.model.key"));
+
+  it("runs once per tab, after the settings seed and before the workbench page starts, for the vault folder", async () => {
+    const outcomes: string[] = [];
+    const w = world({ root: "/Users/dan/My Notes", trust: { enabled: () => true, held: () => [5555], outcomes } });
+    const a = await w.openTab("a.py");
+    const b = await w.openTab("b.py"); // a second tab on the same server
+    for (const t of [a, b]) {
+      expect(t.embed().seeds).toHaveLength(2);
+      expect(t.embed().seeds[0]).toContain("vscode-web-db");
+      expect(t.embed().seeds[1]).toContain("content.trust.model.key");
+      expect(t.embed().seeds[1]).toContain('"path":"/Users/dan/My Notes"');
+      expect(t.embed().srcs[0]).toBe("http://127.0.0.1:5555/"); // seeded on the bare origin
+      expect(t.embed().srcs[1]).toContain("tkn=tok");
+    }
+    expect(outcomes).toEqual(["seeded", "seeded"]);
+  });
+
+  it("a restart reseeds on the new port and keeps the other running server's port in the keep-list", async () => {
+    const outcomes: string[] = [];
+    const trust = { enabled: () => true, held: () => [5555, 7000], outcomes, port: 5555 };
+    const w = world({ trust });
+    const before = await w.openTab("a.py");
+    expect(trustScripts(before.embed())[0]).toContain("const keep = [5555,7000];");
+    trust.port = 6001;
+    trust.held = () => [6001, 7000];
+    const after = await w.openTab("b.py");
+    const script = trustScripts(after.embed())[0];
+    expect(script).toContain('"authority":"127.0.0.1:6001"');
+    expect(script).toContain("const keep = [6001,7000];");
+  });
+
+  it("with the setting off, no trust script runs and the tab opens", async () => {
+    const outcomes: string[] = [];
+    const w = world({ trust: { enabled: () => false, held: () => [5555], outcomes } });
+    const t = await w.openTab("a.py");
+    expect(trustScripts(t.embed())).toEqual([]);
+    expect(t.embed().srcs[1]).toContain("tkn=tok");
+    expect(outcomes).toEqual([]);
+  });
+
+  it.each(["version-mismatch", "no-store", "error:SecurityError", "timeout", "unsupported"])("opens the tab, not closed or blank, when the trust seed answers %s", async (answer) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const outcomes: string[] = [];
+    const w = world({ trust: { enabled: () => true, held: () => [5555], outcomes } });
+    const orig = document.createElement;
+    vi.stubGlobal("document", {
+      createElement: (t: string) => {
+        const e = orig.call(document, t) as unknown as Embed;
+        e.trustAnswer = () => Promise.resolve(answer);
+        return e;
+      },
+    });
+    const t = await w.openTab("a.py");
+    expect(t.leaf.detached).toBeFalsy();
+    expect(t.embed().srcs[1]).toContain("tkn=tok");
+    expect(outcomes).toEqual([answer]);
+    warn.mockRestore();
+  });
+
+  it("a trust script that is rejected still opens the tab", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const outcomes: string[] = [];
+    const w = world({ trust: { enabled: () => true, held: () => [5555], outcomes } });
+    const orig = document.createElement;
+    vi.stubGlobal("document", {
+      createElement: (t: string) => {
+        const e = orig.call(document, t) as unknown as Embed;
+        e.trustAnswer = () => Promise.reject(new Error("blocked"));
+        return e;
+      },
+    });
+    const t = await w.openTab("a.py");
+    expect(t.leaf.detached).toBeFalsy();
+    expect(t.embed().srcs[1]).toContain("tkn=tok");
+    expect(outcomes).toEqual(["error:blocked"]);
+    warn.mockRestore();
   });
 });
 

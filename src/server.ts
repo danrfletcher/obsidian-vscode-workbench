@@ -18,6 +18,15 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ChildRegistry } from "./child-registry";
+import { mirrorDisabled, mirrorTmpRoot, type MirrorRequest, type MirrorResult, type MirrorOptions } from "./mirror/mirror";
+import {
+  danglingSharedLinks,
+  enabledExtensions,
+  EXTENSIONS_LIST_FILE,
+  readProfileExtensions,
+  type MirrorState,
+  type ProfileExtension,
+} from "./server/shared-extensions";
 import { isAlive, listDescendants, pidsWithCommandContaining, signal, signalGroup } from "./process-utils";
 
 export { descendantsFromPs, listDescendants } from "./process-utils";
@@ -258,36 +267,45 @@ function isDirectory(p: string): boolean {
 }
 
 /**
- * Make the chosen build's installed extensions visible to the server without
- * touching that build's folder (F3): each extension directory is symlinked into
- * the plugin-owned server data dir, and extensions.json is rewritten (see
- * rewriteExtensionsJson) rather than copied or linked.
+ * Make exactly the enabled extensions visible to the server without touching the
+ * build's folder (F3). Every symlink under `<serverDataDir>/extensions` is removed
+ * first (a link is unlinked, never what it points at, so nothing in the instance's
+ * folder is touched), then each extension in `enabled` whose folder is in
+ * `sourceDir` is symlinked, and extensions.json is written from those entries only
+ * (see rewriteExtensionsJson: every `location` is the same-named link). An entry
+ * whose folder is missing or dangling is skipped and not written; a folder in
+ * `sourceDir` that `enabled` does not name is not shared. With nothing enabled
+ * there are no links and extensions.json is `[]`.
  * serve-web has no --extensions-dir flag, so this is how sharing is done.
  */
-export function shareExtensions(sourceDir: string | null, serverDataDir: string): { linked: number } {
+export function shareExtensions(sourceDir: string | null, serverDataDir: string, enabled: readonly ProfileExtension[]): { linked: number } {
   const target = path.join(serverDataDir, "extensions");
   fs.mkdirSync(target, { recursive: true });
-  if (!sourceDir || !fs.existsSync(sourceDir)) return { linked: 0 };
-  // Drop links from a previous run so removed extensions disappear.
+  // The previous start's set goes first, extensions.json included if it was ever a link, so the write below can never go through one.
   for (const name of fs.readdirSync(target)) {
     const p = path.join(target, name);
-    if (fs.lstatSync(p).isSymbolicLink()) fs.unlinkSync(p); // unlink the link itself, never the instance's folder
+    if (fs.lstatSync(p).isSymbolicLink()) fs.unlinkSync(p);
   }
-  let linked = 0;
-  for (const name of fs.readdirSync(sourceDir)) {
-    const src = path.join(sourceDir, name);
-    const dst = path.join(target, name);
-    if (name === "extensions.json") {
-      fs.writeFileSync(dst, rewriteExtensionsJson(fs.readFileSync(src, "utf8"), target));
-    } else if (name.startsWith(".")) {
-      continue;
-    } else if (isDirectory(src)) {
-      if (!fs.existsSync(dst)) fs.symlinkSync(src, dst, "dir");
-      linked++;
+  const shared: Record<string, unknown>[] = [];
+  if (sourceDir) {
+    for (const ext of enabled) {
+      const src = path.join(sourceDir, ext.folder);
+      const dst = path.join(target, ext.folder);
+      if (!isDirectory(src)) continue; // removed, or a dangling link
+      try {
+        fs.symlinkSync(src, dst, "dir");
+      } catch {
+        continue; // something that is not ours already sits at that name: it is neither linked nor listed
+      }
+      shared.push(ext.entry);
     }
   }
-  return { linked };
+  fs.writeFileSync(path.join(target, EXTENSIONS_LIST_FILE), rewriteExtensionsJson(JSON.stringify(shared), target));
+  return { linked: shared.length };
 }
+
+/** Shared links whose extension folder has since gone (E5): read-only, for the settings list to call when it opens. */
+export { danglingSharedLinks };
 
 // ---------------------------------------------------------------------------
 // Ports and probing
@@ -309,11 +327,79 @@ export function findFreePort(): Promise<number> {
 /** Ports of servers this process started and that are still up: a new start never reuses one. */
 const heldPorts = new Set<number>();
 
-/** A free loopback port that no server of ours still holds. */
-export async function pickPort(pick: () => Promise<number> = findFreePort): Promise<number> {
+/**
+ * Read-only view of `heldPorts`: the ports of the servers this process started and that are still up, sorted.
+ * A copy, so a caller cannot change what `pickPort` checks. The trust seed uses it to keep the records of
+ * ports a running server still holds.
+ */
+export function heldPortsSnapshot(): number[] {
+  return [...heldPorts].sort((a, b) => a - b);
+}
+
+/**
+ * Whether nothing is using `port` on loopback. A connect that gets any answer but "refused" means something
+ * is listening (this also catches a program bound to every interface, which a bind on 127.0.0.1 alone can
+ * miss); otherwise the port must be bindable. Never rejects: a probe that cannot tell counts as "not free".
+ */
+export function portIsFree(port: number, connect: (o: net.NetConnectOpts) => net.Socket = net.connect, timeoutMs = 1000): Promise<boolean> {
+  const inUse = new Promise<boolean>((resolve) => {
+    const sock = connect({ host: LOOPBACK_HOST, port });
+    sock.setTimeout(timeoutMs, () => {
+      sock.destroy();
+      resolve(true);
+    });
+    sock.once("connect", () => {
+      sock.destroy();
+      resolve(true);
+    });
+    // Only a refused connection proves nobody listens; a reset or any other error means something answered.
+    sock.once("error", (e: NodeJS.ErrnoException) => resolve(e.code !== "ECONNREFUSED"));
+  });
+  return inUse.then((listening) =>
+    listening
+      ? false
+      : new Promise<boolean>((resolve) => {
+          const srv = net.createServer();
+          srv.once("error", () => resolve(false));
+          srv.listen(port, LOOPBACK_HOST, () => srv.close(() => resolve(true)));
+        }),
+  );
+}
+
+/** The port a start will use, and, when the stored one could not be used, why (shown in settings). */
+export interface PortPick {
+  port: number;
+  /** The stored port was free and is the one in use. */
+  usedStored: boolean;
+  /** Set when a stored port was passed over: says which port, why, and that the stored value is kept. */
+  note: string | null;
+}
+
+/**
+ * The port for a start. The stored (stable) port is used when no server of ours holds it and nothing else
+ * listens on it; otherwise a free port is picked and the result says so. A stored port never makes the start
+ * fail. A free port is never one a server of ours still holds.
+ */
+export async function pickPort(
+  pick: () => Promise<number> = findFreePort,
+  stored: number | null = null,
+  isFree: (port: number) => Promise<boolean> = portIsFree,
+): Promise<PortPick> {
+  let note: string | null = null;
+  if (stored !== null) {
+    const why = heldPorts.has(stored)
+      ? "a VS Code server of this plugin already holds it"
+      : (await isFree(stored))
+        ? null
+        : "another program is using it (for example a second Obsidian window on this vault)";
+    if (why === null) return { port: stored, usedStored: true, note: null };
+    note = `The stored port ${stored} is not available: ${why}.`;
+  }
   for (let i = 0; i < 20; i++) {
     const port = await pick();
-    if (!heldPorts.has(port)) return port;
+    if (!heldPorts.has(port)) {
+      return { port, usedStored: false, note: note === null ? null : `${note} Using port ${port} for this start; the stored port is kept.` };
+    }
   }
   throw new ServerStartError("Could not find a free port on 127.0.0.1.", null, "", { kind: "port-bind" });
 }
@@ -509,6 +595,31 @@ export interface ServerOptions {
   downloadHostReachable?: () => Promise<boolean>;
   /** Replaces the free-port lookup (tests). */
   findPort?: () => Promise<number>;
+  /** The vault's stable port (settings `stablePort`), tried before a free one; null = none stored. */
+  storedPort?: number | null;
+  /** Called with the port chosen for each start, before the child is spawned. */
+  onPortPick?: (pick: PortPick) => void;
+  /**
+   * What to mirror from desktop VS Code at each start (PR-4): the instance, the mirrored profile and the vault.
+   * Without it no read is made (tests that do not exercise the mirror).
+   */
+  mirror?: MirrorRequest;
+  /** Called with the mirror's answer as soon as the read is done, before anything is shared or spawned. */
+  onMirror?: (result: MirrorResult) => void;
+  /**
+   * The profile's `extensions.json` (PR-5): the list the shared set is taken from. Read once, together with the
+   * disabled lists, whenever those are read; null = cannot be located, so nothing is shared.
+   */
+  profileExtensionsFile?: string | null;
+  /**
+   * The state of an earlier read to share from instead of reading again (an idle restart, G2): no `sqlite3` call and
+   * no read of the profile's `extensions.json`. Only the plugin passes it, and only when nothing asked for a new read.
+   */
+  reuseMirror?: MirrorState | null;
+  /** Called with everything a read produced (the disabled lists and the profile's list), for the plugin to keep. */
+  onMirrorState?: (state: MirrorState) => void;
+  /** Tests only: the file system and `sqlite3` runner the read uses. */
+  mirrorDeps?: MirrorOptions["deps"];
 }
 
 export interface RunningServer {
@@ -536,6 +647,9 @@ export class WorkbenchServer {
   private downloadErrorLine: string | null = null;
   private exit: ExitInfo | null = null;
   private exitListeners: Array<(info: ExitInfo) => void> = [];
+  private mirrorResult: MirrorResult | null = null;
+  private mirrorState: MirrorState | null = null;
+  private mirrorAbort: AbortController | null = null;
 
   constructor(private readonly opts: ServerOptions) {}
 
@@ -562,6 +676,11 @@ export class WorkbenchServer {
    */
   get userDataDir(): string {
     return path.join(this.serverDataDir, "data");
+  }
+
+  /** The disabled-extension read of the last start (null before it, or when no mirror was asked for). */
+  get mirror(): MirrorResult | null {
+    return this.mirrorResult;
   }
 
   /** Called when the server dies without stop() having been asked for (a crash, `kill -9`). */
@@ -597,10 +716,19 @@ export class WorkbenchServer {
     fs.mkdirSync(this.serverDataDir, { recursive: true });
     fs.mkdirSync(cliDataDir, { recursive: true });
 
+    // Read desktop VS Code's disabled lists and the profile's extension list once per read (Restart server or
+    // Obsidian start; an idle restart reuses the earlier state), before any extension is shared. A failed read is
+    // an answer (snapshot, or none), never an error: the start goes on.
+    await this.readMirror();
+    if (this.stopRequested) throw new StartCancelledError(); // stop() came in during the read: its temp copy is already gone
+
     const token = createTokenFile(tokenFile);
-    shareExtensions(build.extensionsDir, this.serverDataDir);
-    const port = await pickPort(this.opts.findPort);
+    // Only now, with the previous server already stopped (restart awaits stop before it creates the next one), are the links rebuilt.
+    shareExtensions(build.extensionsDir, this.serverDataDir, enabledExtensions(this.mirrorState));
+    const picked = await pickPort(this.opts.findPort, this.opts.storedPort ?? null);
+    const port = picked.port;
     if (this.stopRequested) throw new StartCancelledError(); // stop() came in before the spawn: nothing to kill
+    this.opts.onPortPick?.(picked);
     const args = buildServeWebArgs({
       port,
       tokenFile,
@@ -682,6 +810,50 @@ export class WorkbenchServer {
     return this.running;
   }
 
+  private async readMirror(): Promise<void> {
+    this.mirrorResult = null;
+    this.mirrorState = null;
+    const reuse = this.opts.reuseMirror;
+    if (reuse) {
+      this.mirrorResult = reuse.disabled;
+      this.mirrorState = reuse;
+      return;
+    }
+    const request = this.opts.mirror;
+    if (!request) return;
+    const abort = new AbortController();
+    this.mirrorAbort = abort;
+    try {
+      const result = await mirrorDisabled(request, {
+        dataDir: this.serverDataDir,
+        tmpRoot: mirrorTmpRoot(this.opts.runtimeDir),
+        signal: abort.signal,
+        deps: this.opts.mirrorDeps,
+      });
+      if (abort.signal.aborted) return;
+      this.mirrorResult = result;
+      // With no disabled list at all nothing is shared, so the profile's list is not read either.
+      const extensions: MirrorState["extensions"] =
+        result.source === "none" ? { ok: false, why: "the disabled list is unknown" } : readProfileExtensions(this.opts.profileExtensionsFile ?? null);
+      const state: MirrorState = { disabled: result, extensions };
+      this.mirrorState = state;
+      for (const notify of [() => this.opts.onMirror?.(result), () => this.opts.onMirrorState?.(state)]) {
+        try {
+          notify();
+        } catch {
+          /* a listener's fault never stops the start */
+        }
+      }
+    } finally {
+      if (this.mirrorAbort === abort) this.mirrorAbort = null;
+    }
+  }
+
+  /** Shared links whose extension folder has been removed since the start (E5). Read-only. */
+  danglingLinks(): string[] {
+    return danglingSharedLinks(this.serverDataDir);
+  }
+
   private pushLog(line: string, token: string): void {
     const clean = redactToken(line, token).trim();
     if (!clean || isLogNoise(clean)) return;
@@ -758,6 +930,7 @@ export class WorkbenchServer {
    * (before the first await) so plugin unload can call this without waiting.
    */
   stop(): Promise<void> {
+    this.mirrorAbort?.abort(); // a read in flight kills its sqlite3 and removes its temp copy
     if (this.stopping) return this.stopping;
     this.stopRequested = true;
     const child = this.child;

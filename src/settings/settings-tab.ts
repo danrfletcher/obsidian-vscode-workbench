@@ -4,6 +4,11 @@ import type { CliCheck } from "../instances/probe";
 import { CUSTOM_ID, KNOWN_BUILDS, type Instance, type ScanResult } from "../instances/scan";
 import type { ServerState } from "../server-manager";
 import { addExtension, defaultShell, type WorkbenchSettings } from "./data";
+import { describeExtensionsSection, LIST_FAILED, LIST_LOADING, renderExtensionList, renderExtensionsSection, type PortStatus, type SpikeResult } from "./extensions-section";
+import type { ExtensionListView } from "./extension-states";
+import { describeTrust, MANUAL_TRUST_STEPS } from "../trust/trust-message";
+import type { ProfileState } from "../profile/mirrored-profile";
+import type { MirrorResult } from "../mirror/mirror";
 
 export interface SettingsHost {
   restartServer(): Promise<void>;
@@ -16,6 +21,21 @@ export interface SettingsHost {
   verifyCustomCli(input: string): Promise<CliCheck>;
   /** A hand-edited `codeCliPath` in data.json, which overrides the choice made here. */
   codeCliOverride(): string | undefined;
+  /** The stable port: stored, in use, and why the stored one was passed over. */
+  portStatus(): PortStatus;
+  /** What the extension spike recorded; null = nothing recorded yet. */
+  spikeResult(): SpikeResult | null;
+  /** The profile the last server start resolved (or "not read" before the first start). Read from the host, never from disk here. */
+  mirroredProfile(): ProfileState;
+  /** What the trust seed answered at the last Code tab load (from the host, not the page); null = no tab has run it yet. */
+  trustOutcome?(): string | null;
+  /** What the last server start read of desktop VS Code's disabled lists (read, snapshot or none); null = no start has read them yet. From the host, never from disk here. */
+  disabledLists?(): MirrorResult | null;
+  /**
+   * The Extensions list: every extension the mirrored profile lists, with state and reason, read now (including the
+   * extension host log). Asked each time settings opens; `server-not-running` when no server runs. Read only.
+   */
+  extensionRows(): Promise<ExtensionListView>;
 }
 
 type Tone = "error" | "warning" | "ok" | "info";
@@ -57,7 +77,7 @@ interface InstanceViewState {
   customResult: { tone: Tone; text: string } | null;
 }
 
-/** The settings tab: instances, custom CLI, excludes, the drawer toggle, the shell and Restart server. */
+/** The settings tab: instances, custom CLI, excludes, the drawer toggle, the shell, the trust toggle, the Extensions section (its list and the spike result) and Restart server. */
 export class WorkbenchSettingTab extends PluginSettingTab {
   /** Bumped by every display(): an answer that belongs to an older display is dropped. */
   private renderId = 0;
@@ -79,7 +99,48 @@ export class WorkbenchSettingTab extends PluginSettingTab {
     this.loadInstances(containerEl.createDiv(), render, { appliesNextStart: false, customResult: null });
     this.renderExcludes(containerEl.createDiv());
     this.renderDrawerAndShell(containerEl);
+    this.renderTrust(containerEl.createDiv());
+    // Read once, here: the section shows the recorded result and the port as they are when settings opens.
+    const list = renderExtensionsSection(containerEl.createDiv(), describeExtensionsSection(this.host.spikeResult(), this.host.portStatus(), this.profileState(), this.disabledListsState(), Date.now()));
+    // The extension list is read from the host (and the extension host log) every time settings opens; it answers later.
+    this.loadExtensionList(list, render);
     this.renderRestart(containerEl);
+  }
+
+  /** "Reading…", then the list. An answer that belongs to an older display() is dropped; a host that throws or rejects leaves the rest drawn. */
+  private loadExtensionList(el: HTMLElement, render: number): void {
+    el.createDiv({ text: LIST_LOADING, cls: "setting-item-description workbench-message" });
+    // Promise.resolve().then also catches a host method that throws before it returns a promise.
+    Promise.resolve()
+      .then(() => this.host.extensionRows())
+      .then(
+        (view) => {
+          if (render === this.renderId) renderExtensionList(el, view);
+        },
+        () => {
+          if (render !== this.renderId) return;
+          el.empty();
+          el.createDiv({ text: LIST_FAILED, cls: "setting-item-description workbench-message" });
+        },
+      );
+  }
+
+  /** The host's profile result; a host that throws gives a row saying so and leaves the rest of settings drawn. */
+  private profileState(): ProfileState {
+    try {
+      return this.host.mirroredProfile();
+    } catch {
+      return { status: "unavailable", reason: "the plugin could not report it" };
+    }
+  }
+
+  /** The host's disabled-list result; a host without one, or one that throws, shows "not read yet". */
+  private disabledListsState(): MirrorResult | null {
+    try {
+      return this.host.disabledLists?.() ?? null;
+    } catch {
+      return null;
+    }
   }
 
   // --- Instances -----------------------------------------------------------
@@ -251,13 +312,38 @@ export class WorkbenchSettingTab extends PluginSettingTab {
       });
   }
 
+  // --- Trust ------------------------------------------------------------------
+
+  /** The "Trust the vault folder" toggle and, under it, what the last trust seed did (G6, E3). */
+  private renderTrust(el: HTMLElement): void {
+    const drawMessage = () => {
+      messageEl.empty();
+      const m = describeTrust(this.host.workbenchSettings().trustVaultFolder, this.host.trustOutcome?.() ?? null);
+      if (m) message(messageEl, m.text, m.tone);
+    };
+    new Setting(el)
+      .setName("Trust the vault folder")
+      .setDesc(
+        `Marks this vault's folder as trusted in Code tabs, so extensions can run without the Restricted Mode banner and a Trust click. Only the vault folder is trusted: no other folder is, and Workspace Trust itself stays on. A change applies at the next tab load. When off, tabs open in Restricted Mode; to trust the folder yourself, ${MANUAL_TRUST_STEPS}.`,
+      )
+      .addToggle((t) => {
+        t.setValue(this.host.workbenchSettings().trustVaultFolder);
+        t.onChange(async (v) => {
+          await this.host.updateSettings({ trustVaultFolder: v });
+          drawMessage();
+        });
+      });
+    const messageEl = el.createDiv();
+    drawMessage();
+  }
+
   // --- Restart ---------------------------------------------------------------
 
   private renderRestart(el: HTMLElement): void {
     new Setting(el)
       .setName("Restart server")
       .setDesc(
-        `Stops the VS Code server and starts a fresh one on a new port with a new secret. Open Code tabs reload, and unsaved changes in them are lost. Server state: ${this.host.serverState()}.`,
+        `Stops the VS Code server and starts a fresh one with a new secret, on this vault's stable port when it is free. Open Code tabs reload, and unsaved changes in them are lost. Server state: ${this.host.serverState()}.`,
       )
       .addButton((button) =>
         button.setButtonText("Restart server").onClick(async () => {

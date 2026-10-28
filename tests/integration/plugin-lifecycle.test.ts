@@ -6,13 +6,22 @@
  * with unsaved buffers, restart, and the offline re-download offer.
  */
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileSystemAdapter, Modal, Notice, Plugin, Tasks, TFile, WorkspaceLeaf, FakeNode, type MockApp } from "../mocks/obsidian";
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
 import { CodeView } from "../../src/code-view";
 import { IDLE_MS } from "../../src/idle-timer";
+import * as profileModule from "../../src/profile/mirrored-profile";
+import { PROFILES, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
 import { FAKE_CODE, isAlive, listenersOn, tempDir } from "../helpers";
+
+// The real profile lookup, wrapped so a test can count how often a start asks for it (and make it throw).
+vi.mock("../../src/profile/mirrored-profile", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../../src/profile/mirrored-profile")>();
+  return { ...real, profileForInstance: vi.fn(real.profileForInstance) };
+});
 
 let vault: string;
 let pidFile: string;
@@ -655,8 +664,73 @@ describe("quit", () => {
   });
 });
 
+describe("the stable port (extension spike)", () => {
+  /** A listener on a free loopback port, standing in for another program (or a second Obsidian window's server). */
+  async function occupy(): Promise<{ port: number; close(): Promise<void> }> {
+    const srv = net.createServer((sock) => sock.destroy()); // accepts a probe's connect, then hangs up
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    return { port: (srv.address() as net.AddressInfo).port, close: () => new Promise<void>((r) => srv.close(() => r())) };
+  }
+  const status = () => plugin.portStatus();
+
+  it("the first start stores the port it used; the next load of the plugin starts on the same port", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    expect(inner().data_.stablePort).toBeUndefined();
+    await plugin.openSpikeFile();
+    const first = inner().manager.current!.port;
+    await vi.waitFor(() => expect(inner().data_.stablePort).toBe(first));
+    plugin.onunload();
+    await vi.waitFor(() => expect(listenersOn(first)).toEqual([]), { timeout: 5000 });
+    await load({}, { serverLicenceAccepted: true, stablePort: first });
+    await plugin.openSpikeFile();
+    expect(inner().manager.current!.port).toBe(first);
+    expect(status()).toEqual({ stored: first, current: first, note: null });
+  });
+
+  it("data.json cannot be saved: the server still starts and runs on the port it picked", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    (plugin as unknown as { saveData: () => Promise<void> }).saveData = async () => {
+      throw new Error("disk full");
+    };
+    await plugin.openSpikeFile();
+    const running = inner().manager.current!;
+    expect(inner().manager.state).toBe("running");
+    expect(status()).toMatchObject({ current: running.port });
+    await vi.waitFor(() => expect(inner().data_.stablePort).toBe(running.port)); // kept in memory for this session
+  });
+
+  it("the stored port is held by another process: the server starts on a free port, the stored value is kept, and settings says so", async () => {
+    const other = await occupy();
+    try {
+      await load({}, { serverLicenceAccepted: true, stablePort: other.port });
+      await plugin.openSpikeFile();
+      const running = inner().manager.current!;
+      expect(running.port).not.toBe(other.port);
+      expect(inner().data_.stablePort).toBe(other.port);
+      expect(status().note).toContain(`stored port ${other.port} is not available`);
+      expect(status().note).toContain(`Using port ${running.port}`);
+      expect(listenersOn(other.port)).toEqual([process.pid]); // the other program still has its port
+    } finally {
+      await other.close();
+    }
+  });
+
+  it.each([
+    ["out of range", 70000],
+    ["below 1024", 80],
+    ["not a number", "8080"],
+    ["a fraction", 5000.5],
+  ])("a stored port that is %s reads as none: the server starts and a valid port is stored", async (_n, bad) => {
+    await load({}, { serverLicenceAccepted: true, stablePort: bad });
+    expect(status().stored).toBeNull();
+    await plugin.openSpikeFile();
+    const running = inner().manager.current!;
+    await vi.waitFor(() => expect(inner().data_.stablePort).toBe(running.port));
+  });
+});
+
 describe("restart", () => {
-  it("from the settings button: a new port and token, tabs told to reload", async () => {
+  it("from the settings button: a new token on the same stable port, tabs told to reload", async () => {
     await load({}, { serverLicenceAccepted: true });
     await plugin.openSpikeFile();
     const before = inner().manager.current!;
@@ -664,7 +738,9 @@ describe("restart", () => {
     plugin.onServerState((s) => states.push(s));
     await plugin.restartServer();
     const after = inner().manager.current!;
-    expect(after.port).not.toBe(before.port);
+    // The first start stored its port; the restart stopped that server first, so the port is free again.
+    expect(inner().data_.stablePort).toBe(before.port);
+    expect(after.port).toBe(before.port);
     expect(after.token).not.toBe(before.token);
     expect(states).toContain("running");
     expect(serverPids()).toHaveLength(2);
@@ -713,6 +789,33 @@ describe("restart", () => {
     expect(page.removed).toBe(true);
     expect(before).toHaveLength(1);
     await vi.waitFor(() => expect(isAlive(before[0])).toBe(false), { timeout: 3000 });
+  });
+
+  it("a corrupt stablePort in data.json: the settings tab still opens, shows the Extensions section, and says no port is stored", async () => {
+    await load({}, { serverLicenceAccepted: true, stablePort: { not: "a port" } });
+    const tab = Plugin.settingTabs[0] as { display(): void; containerEl: { textContent(): string } };
+    const { Setting } = await import("../mocks/obsidian");
+    Setting.reset();
+    expect(() => tab.display()).not.toThrow();
+    const text = tab.containerEl.textContent();
+    expect(text).toContain("Extensions");
+    expect(text).toContain("Stable port in use");
+    expect(text).toContain("None stored yet");
+    expect(text).toContain("Turbo Console Log");
+    expect(Setting.all.find((x) => x.name === "Restart server")).toBeDefined();
+  });
+
+  it("the settings tab's Extensions section reads the port when it is opened, not on a timer", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    const tab = Plugin.settingTabs[0] as { display(): void; containerEl: { textContent(): string } };
+    tab.display();
+    expect(tab.containerEl.textContent()).toContain("None stored yet");
+    await plugin.openSpikeFile();
+    const port = inner().manager.current!.port;
+    await vi.waitFor(() => expect(inner().data_.stablePort).toBe(port));
+    expect(tab.containerEl.textContent()).toContain("None stored yet"); // unchanged until opened again
+    tab.display();
+    expect(tab.containerEl.textContent()).toContain(`Port ${port} (stored), in use by the running server.`);
   });
 
   it("the settings tab has a Restart server button wired to it", async () => {
@@ -939,5 +1042,257 @@ describe("the plugin tells Code tabs when another file takes a path (PR-5 R9)", 
     expect(await plugin.admitFile("old.py", leaf as never)).toBe(true);
     expect(other.taken).toEqual(["old.py"]);
     expect(taker.taken).toEqual([]);
+  });
+});
+
+describe("the mirrored profile is resolved at each server start and Restart server (PR-3, G7, G8, G15)", () => {
+  const lookup = vi.mocked(profileModule.profileForInstance);
+  let appSupport: string;
+  const storage = () => path.join(appSupport, "Code - Insiders", "User", "globalStorage", "storage.json");
+  const associate = (id: string | null) => {
+    writeUserData(path.join(appSupport, "Code - Insiders"), { associations: id ? { [vscodeFolderUri(vault)]: id } : {} });
+  };
+  const profile = () => plugin.mirroredProfile();
+  const named = () => {
+    const s = profile();
+    return s.status === "resolved" ? s.profile.name : s.status;
+  };
+  const settingsText = () => {
+    const tab = Plugin.settingTabs[0] as { display(): void; containerEl: { textContent(): string } };
+    tab.display();
+    return tab.containerEl.textContent();
+  };
+  /** The plugin on a custom CLI whose user-data folder is configured, so the instance does not need a real install. */
+  const start = (data: Record<string, unknown> = {}) => load({}, { serverLicenceAccepted: true, userDataFolder: "Code - Insiders", ...data });
+
+  beforeEach(() => {
+    appSupport = tempDir();
+    vi.stubEnv("WORKBENCH_APP_SUPPORT_ROOT", appSupport);
+    lookup.mockClear();
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("before the first start nothing is read: the state is not-read and settings says it is read when the server starts", async () => {
+    associate(PROFILES.custom.location);
+    await start();
+    expect(profile()).toEqual({ status: "not-read" });
+    expect(lookup).not.toHaveBeenCalled();
+    const text = settingsText();
+    expect(text).toContain("Not read yet: the profile is read when the server starts.");
+    expect(text).not.toContain("FDE Practice");
+  });
+
+  it("GP1/GP2: the vault associated with Default: after the start settings names Default, chosen from the vault folder", async () => {
+    associate("__default__profile__");
+    await start();
+    await plugin.openSpikeFile();
+    expect(inner().manager.state).toBe("running");
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(settingsText()).toContain("Default. Chosen from: the vault folder.");
+    expect(settingsText()).not.toContain("Fallback");
+  });
+
+  it("GP7: the vault moved to FDE Practice: settings keeps the old profile until Restart server, then names FDE Practice", async () => {
+    associate("__default__profile__");
+    await start();
+    await plugin.openSpikeFile();
+    expect(named()).toBe("Default");
+
+    associate(PROFILES.custom.location); // moved in desktop VS Code
+    expect(named()).toBe("Default"); // never live (F7)
+    expect(settingsText()).toContain("Default. Chosen from: the vault folder.");
+
+    await plugin.restartServer();
+    expect(named()).toBe("FDE Practice");
+    expect(settingsText()).toContain("FDE Practice. Chosen from: the vault folder.");
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it("is resolved once per start and once per Restart server; not on an idle restart, a settings reopen or a second tab", async () => {
+    associate(PROFILES.custom.location);
+    await start();
+    await plugin.openSpikeFile();
+    expect(lookup).toHaveBeenCalledTimes(1);
+
+    associate("__default__profile__"); // a change the idle restart must not pick up
+    settingsText();
+    settingsText();
+    await plugin.openSpikeFile(); // a second tab on the same server
+    expect(lookup).toHaveBeenCalledTimes(1);
+
+    await inner().manager.stop("idle");
+    expect(inner().manager.state).toBe("stopped-by-idle");
+    await plugin.openSpikeFile(); // the tab wakes the server: a new server, the old snapshot
+    expect(inner().manager.state).toBe("running");
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(named()).toBe("FDE Practice");
+
+    await plugin.restartServer();
+    expect(lookup).toHaveBeenCalledTimes(2);
+    expect(named()).toBe("Default");
+
+    await plugin.restartServer();
+    expect(lookup).toHaveBeenCalledTimes(3);
+  });
+
+  it("an instance changed in settings: the next start (an idle wake) reads the new instance's folder, and settings never shows the old instance's profile (E6, F9)", async () => {
+    const installFor = (nameShort: string) => {
+      const cli = fakeInstall("1.2.0", "b".repeat(40));
+      fs.writeFileSync(path.join(path.dirname(path.dirname(cli)), "product.json"), JSON.stringify({ version: "1.2.0", commit: "b".repeat(40), nameShort }));
+      return cli;
+    };
+    const cliA = installFor("Code - Insiders");
+    const cliB = installFor("VSCodium");
+    associate(PROFILES.custom.location); // A (Code - Insiders): FDE Practice
+    writeUserData(path.join(appSupport, "VSCodium"), { associations: { [vscodeFolderUri(vault)]: "__default__profile__" } }); // B (VSCodium): Default
+    await load({}, { serverLicenceAccepted: true, codeCliPath: undefined, customCliPath: cliA, instanceId: "custom" });
+    await plugin.openSpikeFile();
+    expect(named()).toBe("FDE Practice");
+    expect(lookup).toHaveBeenCalledTimes(1);
+
+    await plugin.updateSettings({ customCliPath: cliB }); // the settings route: saved now, applies at the next start
+    expect(named()).toBe("FDE Practice"); // nothing is read before a start
+    expect(lookup).toHaveBeenCalledTimes(1);
+
+    await inner().manager.stop("idle");
+    await plugin.openSpikeFile(); // wakes on B
+    expect(inner().manager.state).toBe("running");
+    expect(lookup).toHaveBeenCalledTimes(2);
+    const s = profile();
+    expect(s.status).toBe("resolved");
+    if (s.status === "resolved") {
+      expect(s.profile.name).toBe("Default");
+      expect(s.profile.dir).toBe(path.join(appSupport, "VSCodium", "User"));
+    }
+    expect(settingsText()).toContain("Default. Chosen from: the vault folder.");
+
+    await inner().manager.stop("idle"); // an idle wake on the same instance keeps the result
+    await plugin.openSpikeFile();
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it("a Restart server cancelled at the unsaved-changes prompt reads nothing", async () => {
+    associate(PROFILES.custom.location);
+    await start();
+    await plugin.openSpikeFile();
+    fakeView({ dirty: true });
+    associate("__default__profile__");
+    const restarting = plugin.restartServer();
+    await onModal(() => lastModal().close());
+    await restarting;
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(named()).toBe("FDE Practice");
+  });
+
+  it("a restart whose start fails before the lookup reads nothing; the next Restart server does", async () => {
+    associate(PROFILES.custom.location);
+    await start();
+    await plugin.openSpikeFile();
+    associate("__default__profile__");
+    inner().data_.codeCliPath = path.join(vault, "no-such-code");
+    await expect(plugin.restartServer()).rejects.toThrow(); // no instance: the start fails before the lookup
+    expect(lookup).toHaveBeenCalledTimes(1);
+    inner().data_.codeCliPath = FAKE_CODE;
+    await plugin.restartServer();
+    expect(lookup).toHaveBeenCalledTimes(2);
+    expect(named()).toBe("Default");
+  });
+
+  it.each([
+    ["no association (G7)", () => associate(null), "not associated with a profile in desktop VS Code"],
+    ["an unknown profile (G8)", () => associate("ffff0000"), 'profile location "ffff0000"'],
+    ["a profile whose folder is gone (E2)", () => associate(PROFILES.deleted.location), 'profile "Old Profile" (location "d3adbeef"), but its folder under User/profiles/ is missing'],
+  ])("%s: the start runs, and settings shows Default with the reason", async (_name, setup, reason) => {
+    setup();
+    await start();
+    await plugin.openSpikeFile();
+    expect(inner().manager.state).toBe("running");
+    expect(app.workspace.leaves).toHaveLength(1);
+    expect(named()).toBe("Default");
+    const text = settingsText();
+    expect(text).toContain("Default. Chosen from: default. Fallback:");
+    expect(text).toContain(reason);
+    expect(Notice.messages.filter((m) => /profile/i.test(m))).toEqual([]);
+  });
+
+  it("E10: a vault that still matches shows the vault URI that was tried, next to the fallback", async () => {
+    associate(null);
+    await start();
+    await plugin.openSpikeFile();
+    expect(settingsText()).toContain(`vault URI tried: file://${vault.normalize("NFC")}`);
+  });
+
+  it.each([
+    ["missing", () => fs.rmSync(storage()), "the file is missing"],
+    ["empty", () => fs.writeFileSync(storage(), ""), "the file is empty"],
+    ["not valid JSON", () => fs.writeFileSync(storage(), "{ nope"), "the file is not valid JSON"],
+    ["without profileAssociations", () => fs.writeFileSync(storage(), "{}"), "it has no profileAssociations"],
+  ])("a storage.json that is %s: the server still starts, and settings says it could not be read", async (_name, damage, why) => {
+    associate(PROFILES.custom.location);
+    damage();
+    await start();
+    await plugin.openSpikeFile();
+    expect(inner().manager.state).toBe("running");
+    expect(settingsText()).toContain(`storage.json could not be read (${why})`);
+  });
+
+  it("the whole app-support folder missing: the server still starts with Default and the reason", async () => {
+    await start();
+    vi.stubEnv("WORKBENCH_APP_SUPPORT_ROOT", path.join(appSupport, "nothing-here"));
+    await plugin.openSpikeFile();
+    expect(inner().manager.state).toBe("running");
+    expect(named()).toBe("Default");
+    expect(settingsText()).toContain("the file is missing");
+  });
+
+  it("a lookup that throws never blocks the start: the state says the lookup failed", async () => {
+    await start();
+    lookup.mockImplementationOnce(() => {
+      throw new Error("boom: /secret/path");
+    });
+    await plugin.openSpikeFile();
+    expect(inner().manager.state).toBe("running");
+    expect(app.workspace.leaves).toHaveLength(1);
+    expect(profile()).toEqual({ status: "unavailable", reason: "the lookup failed" });
+    expect(settingsText()).toContain("Could not be worked out: the lookup failed.");
+    expect(settingsText()).not.toContain("/secret/path");
+    // and the next Restart server reads again
+    associate(PROFILES.custom.location);
+    await plugin.restartServer();
+    expect(named()).toBe("FDE Practice");
+  });
+
+  it("E6: a custom CLI whose folder cannot be told: the start runs and settings says the folder cannot be told", async () => {
+    await load({}, { serverLicenceAccepted: true }); // no configured folder; the fake CLI has no product.json
+    await plugin.openSpikeFile();
+    expect(inner().manager.state).toBe("running");
+    expect(profile().status).toBe("unavailable");
+    expect(settingsText()).toContain("the user-data folder of this custom VS Code cannot be told");
+    expect(settingsText()).not.toContain("Fallback");
+  });
+
+  it("E6: a custom CLI that sits in an app whose product.json names its folder uses it", async () => {
+    associate(PROFILES.custom.location);
+    const cli = fakeInstall("1.2.0", "b".repeat(40));
+    const product = path.join(path.dirname(path.dirname(cli)), "product.json");
+    fs.writeFileSync(product, JSON.stringify({ version: "1.2.0", commit: "b".repeat(40), nameShort: "Code - Insiders" }));
+    await load({}, { serverLicenceAccepted: true, codeCliPath: cli });
+    await plugin.openSpikeFile();
+    expect(named()).toBe("FDE Practice");
+  });
+
+  it("F1: a server start changes no file under User/ and creates none", async () => {
+    associate(PROFILES.custom.location);
+    const user = path.join(appSupport, "Code - Insiders", "User");
+    const old = new Date("2020-01-01T00:00:00Z");
+    const walk = (d: string): string[] => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? [path.join(d, e.name), ...walk(path.join(d, e.name))] : [path.join(d, e.name)]));
+    for (const f of walk(user)) if (fs.statSync(f).isFile()) fs.utimesSync(f, old, old);
+    const snap = () => Object.fromEntries(walk(user).map((f) => [f, fs.statSync(f).isFile() ? `${fs.statSync(f).mtimeMs} ${fs.readFileSync(f).toString("base64")}` : "dir"]));
+    const before = snap();
+    await start();
+    await plugin.openSpikeFile();
+    await plugin.restartServer();
+    expect(named()).toBe("FDE Practice");
+    expect(snap()).toEqual(before);
   });
 });

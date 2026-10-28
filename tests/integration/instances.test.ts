@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileSystemAdapter, Notice, Plugin, Setting, TFile, WorkspaceLeaf, type FakeNode, type MockApp } from "../mocks/obsidian";
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
 import { FAKE_CODE, isAlive, tempDir } from "../helpers";
+import { stateDb } from "../mirror-tree";
 import { HANG_SCRIPT, makeApp as makeBundle, makeReadOnly, makeWritable, treeDigest } from "../instance-helpers";
 
 const PLUGIN_DIR = ".obsidian/plugins/obsidian-vscode-workbench";
@@ -610,13 +611,20 @@ describe("extensions of other instances are never combined (F3)", () => {
     ]) {
       fs.mkdirSync(path.join(home, dir, "extensions", ext), { recursive: true });
       fs.writeFileSync(path.join(home, dir, "extensions", ext, "package.json"), "{}");
+      // The Default profile's list (what the start shares from), and a desktop state with nothing disabled (the real reader needs sqlite3).
+      const [id] = ext.split("-");
+      fs.writeFileSync(path.join(home, dir, "extensions", "extensions.json"), JSON.stringify([{ identifier: { id }, relativeLocation: ext, location: { $mid: 1, path: path.join(home, dir, "extensions", ext), scheme: "file" } }]));
+    }
+    for (const folder of ["Code", "Code - Insiders"]) {
+      fs.mkdirSync(path.join(userDir(folder), "globalStorage"), { recursive: true });
+      stateDb(path.join(userDir(folder), "globalStorage", "state.vscdb"));
     }
     servingApp(STABLE, "com.microsoft.VSCode", "1.143.1", "code", ".ext-a", "Code");
     servingApp(INSIDERS, "com.microsoft.VSCodeInsiders", "1.144.0-insider", "code", ".ext-b", "Code - Insiders");
     const digestA = treeDigest(path.join(home, ".ext-a"));
     const digestB = treeDigest(path.join(home, ".ext-b"));
     await load();
-    const shared = () => fs.readdirSync(path.join(inner().manager.serverInstance!.serverDataDir, "extensions")).sort();
+    const shared = () => fs.readdirSync(path.join(inner().manager.serverInstance!.serverDataDir, "extensions")).filter((n) => n !== "extensions.json").sort();
 
     await plugin.openSpikeFile(); // default: Insiders, so .ext-b
     expect(shared()).toEqual(["beta.two-2.0.0"]);
@@ -657,6 +665,13 @@ describe("chrome settings and theme switching write nothing to another instance 
     ]) {
       fs.mkdirSync(path.join(home, dir, "extensions", ext), { recursive: true });
       fs.writeFileSync(path.join(home, dir, "extensions", ext, "package.json"), "{}");
+      // The Default profile's list (what the start shares from), and a desktop state with nothing disabled (the real reader needs sqlite3).
+      const [id] = ext.split("-");
+      fs.writeFileSync(path.join(home, dir, "extensions", "extensions.json"), JSON.stringify([{ identifier: { id }, relativeLocation: ext, location: { $mid: 1, path: path.join(home, dir, "extensions", ext), scheme: "file" } }]));
+    }
+    for (const folder of ["Code", "Code - Insiders"]) {
+      fs.mkdirSync(path.join(userDir(folder), "globalStorage"), { recursive: true });
+      stateDb(path.join(userDir(folder), "globalStorage", "state.vscdb"));
     }
     servingApp(STABLE, "com.microsoft.VSCode", "1.143.1", "code", ".ext-a", "Code");
     servingApp(INSIDERS, "com.microsoft.VSCodeInsiders", "1.144.0-insider", "code", ".ext-b", "Code - Insiders");

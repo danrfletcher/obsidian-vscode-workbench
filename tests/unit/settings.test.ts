@@ -1,8 +1,17 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BROWSER_APP_SETTINGS, USER_DATA_MARKER_KEY, buildBrowserSeedScript, buildMachineSettings, writeMachineSettings, type UserDataCopy } from "../../src/settings";
-import { excludeGlobs } from "../../src/server/user-data-seed";
+import { excludeGlobs, profileSeedSource, seedUserData } from "../../src/server/user-data-seed";
+import { STOP_TEXT, describeAge, describeDisabledLists, describeExtensionsSection, describePort, describeProfile, renderExtensionsSection, type PortStatus, type SpikeResult } from "../../src/settings/extensions-section";
+import { SPIKE_RESULT } from "../../src/settings/spike-result";
+import { FakeNode, Setting } from "../mocks/obsidian";
+import { WorkbenchSettingTab, type SettingsHost } from "../../src/settings/settings-tab";
+import { DEFAULT_SETTINGS, type WorkbenchSettings } from "../../src/settings/data";
+import { MANUAL_TRUST_STEPS, describeTrust } from "../../src/trust/trust-message";
+import { findMirroredProfile, type MirroredProfile, type ProfileState } from "../../src/profile/mirrored-profile";
+import { PROFILES, TOGGLE_PANEL_KEY, TRUST_KEYS, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
+import type { MirrorResult } from "../../src/mirror/mirror";
 import { tempDir } from "../helpers";
 
 describe("writeMachineSettings", () => {
@@ -235,6 +244,50 @@ describe("buildBrowserSeedScript with the copy of the instance's settings and ke
   });
 });
 
+describe("the seed script built from a stripped profile copy holds no trust key (G12, G13)", () => {
+  const vault = "/Users/x/Vault";
+  const copyFor = (location: string): UserDataCopy => {
+    const root = writeUserData(path.join(tempDir(), "Code - Insiders"), { associations: { [vscodeFolderUri(vault)]: location } });
+    const profile = findMirroredProfile({ userDataRoot: root, vaultPath: vault });
+    // The fixture's settings.json files carry all five trust keys (and comments, trailing commas).
+    expect(fs.readFileSync(path.join(profile.files.settings.dir as string, "settings.json"), "utf8")).toContain("security.workspace.trust.enabled");
+    const seeded = seedUserData({ userDataDir: path.join(tempDir(), "data"), ...profileSeedSource({ status: "resolved", profile }, null) });
+    return { id: "start-1", settings: seeded.merged, keybindingsBase64: seeded.keybindingsBase64 };
+  };
+
+  it.each([
+    ["FDE Practice", PROFILES.custom.location, 22],
+    ["Default", "__default__profile__", 14],
+  ])("%s: /User/settings.json in IndexedDB has the profile's values and no security.workspace.trust.* key", async (_n, location, fontSize) => {
+    const copy = copyFor(location);
+    // An earlier file in the tab with trust keys in it is replaced whole by the copy.
+    const old = new TextEncoder().encode(JSON.stringify(TRUST_KEYS));
+    const r = await runSeed({ "/User/settings.json": old }, copy);
+    expect(r.outcome).toBe("seeded");
+    const written = JSON.parse(r.text as string) as Record<string, unknown>;
+    expect(written["editor.fontSize"]).toBe(fontSize);
+    expect(Object.keys(written).filter((k) => k.startsWith("security.workspace.trust."))).toEqual([]);
+    expect(r.text).not.toContain("security.workspace.trust");
+  });
+
+  it("the profile's keybinding is written byte for byte, and a later Default copy replaces it", async () => {
+    const storage = fakeStorage();
+    const first = await runSeed(undefined, copyFor(PROFILES.custom.location), storage);
+    expect(first.keybindings).toContain(TOGGLE_PANEL_KEY.command);
+    const second = await runSeed({ "/User/settings.json": new TextEncoder().encode(first.text as string), "/User/keybindings.json": new TextEncoder().encode(first.keybindings as string) }, { ...copyFor("__default__profile__"), id: "start-2" }, storage);
+    expect(second.keybindings).not.toContain(TOGGLE_PANEL_KEY.command);
+    expect(JSON.parse(second.text as string)["editor.fontSize"]).toBe(14);
+    expect(second.text).not.toContain("FDE Practice");
+  });
+
+  it("the Machine file still has no security.workspace.trust.* key, and the seed script still turns telemetry off", () => {
+    const machine = buildMachineSettings({ dark: true });
+    expect(Object.keys(machine).filter((k) => k.startsWith("security.workspace.trust."))).toEqual([]);
+    expect(BROWSER_APP_SETTINGS).toMatchObject({ "telemetry.telemetryLevel": "off" });
+    expect(buildBrowserSeedScript(BROWSER_APP_SETTINGS, copyFor(PROFILES.custom.location))).toContain('"telemetry.telemetryLevel":"off"');
+  });
+});
+
 describe("buildBrowserSeedScript when VS Code's database is not what the plugin expects (PR-1 R9)", () => {
   const script = () => new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${buildBrowserSeedScript(BROWSER_APP_SETTINGS, null)}`) as (...a: unknown[]) => Promise<string>;
 
@@ -271,5 +324,503 @@ describe("buildBrowserSeedScript when VS Code's database is not what the plugin 
     const indexedDB = { open: () => { const r: { result: unknown; onsuccess?: () => void } = { result: db }; queueMicrotask(() => r.onsuccess?.()); return r; } };
     expect(await script()(indexedDB, fakeStorage(), TextEncoder, TextDecoder)).toBe("error:SecurityError");
     expect(real.state.closed).toBe(1);
+  });
+});
+
+describe("the Extensions section of the settings tab", () => {
+  const OK: SpikeResult = {
+    measuredOn: "2026-10-27",
+    vscodeVersion: "1.145.0-insider",
+    stablePort: { stable: true, result: "Same origin after a restart.", decision: "Store one port per vault." },
+    trustRecord: { found: true, location: "db-x / ItemTable / content.trust.model.key", result: "Written by the Trust click.", decision: "Seed it in PR-2." },
+    settingsRoute: { arrives: true, route: "the IndexedDB write", result: "fontSize 12px to 23px.", decision: "PR-6 builds on the IndexedDB write." },
+    turboConsoleLog: { state: "active", cause: "Restricted Mode kept it from activating", result: "Activation logged after trust.", decision: "Trust is the fix." },
+  };
+  const PORT: PortStatus = { stored: 51789, current: 51789, note: null };
+  const draw = (result: SpikeResult | null, port: PortStatus = PORT) => {
+    const el = new FakeNode("div");
+    renderExtensionsSection(el as unknown as HTMLElement, describeExtensionsSection(result, port));
+    const rows = el.all().filter((n) => n.cls?.includes("workbench-extensions-row"));
+    return {
+      el,
+      text: el.all().map((n) => n.text).join("\n"),
+      row: (name: string) => rows.find((r) => r.children[0]?.text === name),
+      tone: (name: string) => rows.find((r) => r.children[0]?.text === name)?.children[1],
+    };
+  };
+
+  it("measured OK: the decision for each of the four questions, the date and the port in use", () => {
+    const d = draw(OK);
+    expect(d.text).toContain("Extensions");
+    expect(d.row("Measured")?.children[1].text).toBe("2026-10-27, on VS Code 1.145.0-insider.");
+    expect(d.row("Stable port")?.children[1].text).toBe("Same origin after a restart. Decision: Store one port per vault.");
+    expect(d.row("Stable port in use")?.children[1].text).toBe("Port 51789 (stored), in use by the running server.");
+    expect(d.row("Trust record")?.children[1].text).toBe("Found at db-x / ItemTable / content.trust.model.key. Written by the Trust click. Decision: Seed it in PR-2.");
+    expect(d.row("Settings and keybindings")?.children[1].text).toBe("Route: the IndexedDB write. fontSize 12px to 23px. Decision: PR-6 builds on the IndexedDB write.");
+    expect(d.row("Turbo Console Log")?.children[1].text).toBe("active. Cause: Restricted Mode kept it from activating. Activation logged after trust. Decision: Trust is the fix.");
+    expect(d.text).not.toContain("STOP");
+    expect(d.text).not.toContain("not found");
+  });
+
+  it("STOP: the settings route row shows the stop text, in the error colour, and the others are unaffected", () => {
+    const stop: SpikeResult = { ...OK, settingsRoute: { arrives: false, route: null, result: "No route moved editor.fontSize.", decision: "STOP: ask Dan." } };
+    const d = draw(stop);
+    const row = d.tone("Settings and keybindings")!;
+    expect(row.text).toBe(`${STOP_TEXT} No route moved editor.fontSize.`);
+    expect(row.text.startsWith("STOP:")).toBe(true);
+    expect(d.row("Settings and keybindings")?.cls).toContain("workbench-error");
+    expect(row.style.color).toBeFalsy();
+    expect(d.row("Trust record")?.children[1].text).toContain("Found at");
+  });
+
+  it("trust record not found: the row says \"not found\" and claims no location or format", () => {
+    const d = draw({ ...OK, trustRecord: { found: false, location: null, result: "No key with trust in its name changed.", decision: "Build nothing on it." } });
+    const row = d.tone("Trust record")!;
+    expect(row.text).toBe("not found. No key with trust in its name changed. Decision: Build nothing on it.");
+    expect(row.text).not.toContain("Found at");
+    expect(d.row("Trust record")?.cls).toContain("workbench-warning");
+    expect(row.style.color).toBeFalsy();
+  });
+
+  it("no record yet: one line saying so, and the port still shown", () => {
+    const d = draw(null, { stored: null, current: null, note: null });
+    expect(d.row("Extension spike")?.children[1].text).toBe("No spike result recorded yet.");
+    expect(d.row("Stable port in use")?.children[1].text).toContain("None stored yet");
+    expect(d.row("Trust record")).toBeUndefined();
+  });
+
+  it("a failing Turbo Console Log shows the separate finding with its real cause", () => {
+    const d = draw({ ...OK, turboConsoleLog: { state: "failed", cause: "Cannot find module 'x' (extension host log)", result: "Activated, then threw.", decision: "Fix that first." } });
+    expect(d.tone("Turbo Console Log")?.text).toBe("failed. Cause: Cannot find module 'x' (extension host log). Activated, then threw. Decision: Fix that first.");
+  });
+
+  it("no text is drawn in a tone colour: --text-success is 2.6:1 on white, so the tone is a row class (a bar) and the text keeps the theme's own colour", () => {
+    const stop: SpikeResult = { ...OK, settingsRoute: { ...OK.settingsRoute, arrives: false }, trustRecord: { ...OK.trustRecord, found: false } };
+    for (const result of [OK, stop]) {
+      const d = draw(result);
+      expect(d.el.all().map((n) => n.style.color).filter(Boolean)).toEqual([]);
+    }
+    const d = draw(OK);
+    for (const name of ["Stable port", "Trust record", "Settings and keybindings", "Turbo Console Log"]) expect(d.row(name)?.cls).toContain("workbench-ok");
+    expect(d.row("Measured")?.cls).toContain("workbench-info");
+  });
+
+  it("styles.css gives each tone its bar colour from a theme variable", () => {
+    const css = fs.readFileSync(path.join(process.cwd(), "src/styles.css"), "utf8");
+    for (const [tone, v] of [["ok", "--text-success"], ["warning", "--text-warning"], ["error", "--text-error"]]) {
+      expect(css).toMatch(new RegExp(`\\.workbench-extensions-row\\.workbench-${tone}\\s*\\{[^}]*border-left-color:\\s*var\\(${v}\\)`));
+    }
+    expect(css).not.toMatch(/\.workbench-message[^{]*\{[^}]*color:/);
+  });
+
+  it("styles.css lets an Extensions row's text wrap and never clips it (long paths, why-text, snapshot age)", () => {
+    const css = fs.readFileSync(path.join(process.cwd(), "src/styles.css"), "utf8");
+    // Every rule that targets the row or its message, whatever else it sets.
+    const rules = [...css.matchAll(/([^{}]*\.workbench-extensions-row[^{}]*)\{([^}]*)\}/g)].map((m) => m[2]);
+    expect(rules.length).toBeGreaterThan(0);
+    for (const body of rules) {
+      expect(body).not.toMatch(/overflow(-x|-y)?:\s*(hidden|clip)/);
+      expect(body).not.toMatch(/white-space:\s*(nowrap|pre)\b/);
+      expect(body).not.toMatch(/text-overflow:/);
+      expect(body).not.toMatch(/(^|[;\s])(max-)?height:/);
+    }
+    expect(css).toMatch(/\.workbench-extensions-row \.workbench-message\s*\{[^}]*white-space:\s*normal[^}]*overflow-wrap:\s*anywhere/);
+  });
+
+  it.each<[string, PortStatus, string]>([
+    ["nothing stored, no server", { stored: null, current: null, note: null }, "None stored yet: the first server start picks a free port and stores it."],
+    ["nothing stored, server running", { stored: null, current: 52000, note: null }, "Server running on port 52000; it will be stored as this vault's stable port."],
+    ["stored, no server", { stored: 51789, current: null, note: null }, "Stored port 51789. No server is running; the next start tries this port first."],
+    ["stored and in use", { stored: 51789, current: 51789, note: null }, "Port 51789 (stored), in use by the running server."],
+    ["stored but another port in use, with the reason", { stored: 51789, current: 52000, note: "Another program has it." }, "Stored port 51789; the running server is on 52000 this time. Another program has it."],
+  ])("the port line: %s", (_n, port, text) => {
+    const row = describePort(port);
+    expect(row.text).toBe(text);
+    expect(row.tone).toBe(port.note ? "warning" : "info");
+  });
+
+  it("the recorded result shipped in SPIKE_RESULT has all four questions answered, a date, and no STOP", () => {
+    expect(SPIKE_RESULT).not.toBeNull();
+    const r = SPIKE_RESULT!;
+    expect(r.measuredOn).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    for (const q of [r.stablePort, r.trustRecord, r.settingsRoute, r.turboConsoleLog]) {
+      expect(q.result.length).toBeGreaterThan(0);
+      expect(q.decision.length).toBeGreaterThan(0);
+    }
+    expect(r.settingsRoute.arrives).toBe(true);
+    expect(r.settingsRoute.decision).not.toContain("STOP");
+  });
+});
+
+describe("the \"Trust the vault folder\" toggle in the settings tab (G6, E3)", () => {
+  function openTab(initial: Partial<WorkbenchSettings> = {}, outcome: string | null | undefined = null) {
+    let current: WorkbenchSettings = { ...DEFAULT_SETTINGS, ...initial };
+    let last = outcome;
+    const updateSettings = vi.fn(async (patch: Partial<WorkbenchSettings>) => {
+      current = { ...current, ...patch };
+    });
+    const host: SettingsHost = {
+      restartServer: async () => undefined,
+      serverState: () => "running",
+      workbenchSettings: () => current,
+      updateSettings,
+      scanInstances: async () => ({ instances: [], rejected: [], customFailure: null }),
+      verifyCustomCli: async () => ({ ok: false, reason: "no" }),
+      codeCliOverride: () => undefined,
+      portStatus: () => ({ stored: null, current: null, note: null }),
+      spikeResult: () => null,
+      mirroredProfile: () => ({ status: "not-read" }),
+      extensionRows: async () => ({ status: "server-not-running" }),
+      ...(last === undefined ? {} : { trustOutcome: () => last ?? null }),
+    };
+    Setting.reset();
+    const tab = new WorkbenchSettingTab({} as never, {} as never, host);
+    tab.display();
+    const toggle = () => Setting.all.find((s) => s.name === "Trust the vault folder")!;
+    const messages = () => (tab.containerEl as unknown as FakeNode).all().filter((n) => n.cls?.includes("workbench-message")).map((n) => n.text);
+    return { tab, host, updateSettings, toggle, messages, setOutcome: (o: string | null) => void (last = o), current: () => current };
+  }
+
+  it("renders the toggle next to the other toggles, on by default, with a description that says what it does", () => {
+    const { toggle } = openTab();
+    const names = Setting.all.map((s) => s.name);
+    expect(names.indexOf("Trust the vault folder")).toBe(names.indexOf("Shell") + 1);
+    expect(toggle().toggle?.value).toBe(true);
+    expect(toggle().desc).toContain("trusted");
+    expect(toggle().desc).toContain("Only the vault folder is trusted");
+    expect(toggle().desc).toContain("applies at the next tab load");
+    expect(toggle().desc).toContain("Workspaces: Manage Workspace Trust");
+  });
+
+  it("shows the stored value when it is off", () => {
+    expect(openTab({ trustVaultFolder: false }).toggle().toggle?.value).toBe(false);
+  });
+
+  it("onChange saves through updateSettings({ trustVaultFolder })", async () => {
+    const t = openTab();
+    await t.toggle().toggle!.handler!(false);
+    expect(t.updateSettings).toHaveBeenCalledTimes(1);
+    expect(t.updateSettings).toHaveBeenCalledWith({ trustVaultFolder: false });
+    expect(t.current().trustVaultFolder).toBe(false);
+    await t.toggle().toggle!.handler!(true);
+    expect(t.updateSettings).toHaveBeenLastCalledWith({ trustVaultFolder: true });
+  });
+
+  it("turning it off shows how to trust by hand, naming the command; turning it on again clears that line", async () => {
+    const t = openTab();
+    expect(t.messages().filter((m) => m.includes("Manage Workspace Trust"))).toEqual([]);
+    await t.toggle().toggle!.handler!(false);
+    expect(t.messages().join("\n")).toContain('"Workspaces: Manage Workspace Trust"');
+    expect(t.messages().join("\n")).toContain("Restricted Mode");
+    await t.toggle().toggle!.handler!(true);
+    expect(t.messages().filter((m) => m.includes("Manage Workspace Trust"))).toEqual([]);
+  });
+
+  it.each([
+    ["version-mismatch", "is not in the format this plugin knows"],
+    ["no-store", "has no place for the trust record"],
+    ["error:SecurityError", "the page refused the write (SecurityError)"],
+    ["timeout", "did not answer in time"],
+    ["unsupported", "cannot run scripts in the Code tab"],
+  ])("a %s outcome from the host shows a message that names the manual Trust command", (outcome, reason) => {
+    const t = openTab({}, outcome);
+    const text = t.messages().join("\n");
+    expect(text).toContain(reason);
+    expect(text).toContain('"Workspaces: Manage Workspace Trust"');
+    expect(text).toContain("then choose Trust");
+    expect(text).toContain("The Code tab still opens");
+  });
+
+  it("reads the outcome from the host each time the tab is displayed, not from anywhere else", () => {
+    const t = openTab({}, "timeout");
+    expect(t.messages().join("\n")).toContain("did not answer in time");
+    t.setOutcome("seeded");
+    t.tab.display();
+    const text = (t.tab.containerEl as unknown as FakeNode).textContent();
+    expect(text).toContain("The vault folder was trusted when the last Code tab loaded.");
+    expect(text).not.toContain("did not answer in time");
+  });
+
+  it("says nothing about the outcome before any tab has run the seed, and also when the host has no outcome method", () => {
+    expect(openTab({}, null).messages().filter((m) => /trusted/.test(m))).toEqual([]);
+    expect(openTab({}, undefined).messages().filter((m) => /trusted/.test(m))).toEqual([]);
+  });
+
+  it("with the toggle off, the off message wins over an old failure outcome", () => {
+    const text = openTab({ trustVaultFolder: false }, "timeout").messages().join("\n");
+    expect(text).toContain("Trusting is off");
+    expect(text).not.toContain("did not answer in time");
+  });
+});
+
+describe("describeTrust", () => {
+  it("covers every state in plain words", () => {
+    expect(describeTrust(true, null)).toBeNull();
+    expect(describeTrust(true, "seeded")).toEqual({ tone: "ok", text: "The vault folder was trusted when the last Code tab loaded." });
+    expect(describeTrust(false, "seeded")?.tone).toBe("info");
+    expect(describeTrust(true, "error:")?.text).toContain("(unknown error)");
+    expect(describeTrust(true, "something-new")?.text).toContain('the seed reported "something-new"');
+    expect(describeTrust(true, "no-store")?.tone).toBe("warning");
+    expect(MANUAL_TRUST_STEPS).toBe('run "Workspaces: Manage Workspace Trust" from the command palette, then choose Trust');
+  });
+});
+
+describe("the Profile row of the Extensions section (G7, G8, G9, E2, E10)", () => {
+  /** A real lookup against a generated user-data folder, so the row is drawn from what the module really returns. */
+  function lookup(associations: Record<string, string>, vaultPath = "/Users/x/My Vault/Café Ünï"): MirroredProfile {
+    const root = writeUserData(path.join(tempDir(), "Code - Insiders"), { associations });
+    return findMirroredProfile({ userDataRoot: root, vaultPath });
+  }
+  const resolved = (profile: MirroredProfile): ProfileState => ({ status: "resolved", profile });
+
+  it("before the first server start: says the profile is read when the server starts, and names no profile", () => {
+    const row = describeProfile({ status: "not-read" });
+    expect(row).toEqual({ name: "Profile", text: "Not read yet: the profile is read when the server starts.", tone: "info" });
+    for (const name of ["Default", "FDE Practice", "Agents"]) expect(row.text).not.toContain(name);
+  });
+
+  it("chosen from the vault folder: the profile name and where it came from, no fallback line", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: PROFILES.custom.location })));
+    expect(row).toEqual({ name: "Profile", text: "FDE Practice. Chosen from: the vault folder.", tone: "ok" });
+  });
+
+  it("associated with Default: Default, chosen from the vault folder, no fallback line (GP1, GP2)", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: "__default__profile__" })));
+    expect(row).toEqual({ name: "Profile", text: "Default. Chosen from: the vault folder.", tone: "ok" });
+  });
+
+  it("chosen from a parent folder: names the parent", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x")]: PROFILES.custom.location })));
+    expect(row.text).toBe("FDE Practice. Chosen from: a parent folder (file:///Users/x).");
+  });
+
+  it("a profile that reads Default's files says which", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: PROFILES.agents.location })));
+    expect(row.text).toBe("Agents. Chosen from: the vault folder. Reads Default's settings, keybindings.");
+    expect(row.tone).toBe("ok");
+  });
+
+  it("no association: Default, chosen from default, the reason and the vault URI that was tried (G7, E10)", () => {
+    const row = describeProfile(resolved(lookup({})));
+    expect(row).toEqual({
+      name: "Profile",
+      text: "Default. Chosen from: default. Fallback: the vault folder is not associated with a profile in desktop VS Code (vault URI tried: file:///Users/x/My Vault/Café Ünï), so Default is used.",
+      tone: "warning",
+    });
+  });
+
+  it("an unknown profile: the fallback line names the location id (G8)", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: "ffff0000" })));
+    expect(row.text).toBe(
+      'Default. Chosen from: default. Fallback: the vault folder is associated with profile location "ffff0000", which is not in desktop VS Code\'s list of profiles (it was deleted or is unknown), so Default is used.',
+    );
+    expect(row.tone).toBe("warning");
+  });
+
+  it("a profile whose folder is gone (E2)", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: PROFILES.deleted.location })));
+    expect(row.text).toBe(
+      'Default. Chosen from: default. Fallback: the vault folder is associated with profile "Old Profile" (location "d3adbeef"), but its folder under User/profiles/ is missing, so Default is used.',
+    );
+  });
+
+  it("an unreadable storage.json", () => {
+    const root = writeUserData(path.join(tempDir(), "Code - Insiders"));
+    fs.writeFileSync(path.join(root, "User", "globalStorage", "storage.json"), "");
+    const row = describeProfile(resolved(findMirroredProfile({ userDataRoot: root, vaultPath: "/Users/x/Vault" })));
+    expect(row.text).toBe("Default. Chosen from: default. Fallback: desktop VS Code's storage.json could not be read (the file is empty), so Default is used.");
+  });
+
+  it("a profile that could not be worked out (a custom CLI with no known folder): says so and shows no profile", () => {
+    const row = describeProfile({ status: "unavailable", reason: "the user-data folder of this custom VS Code cannot be told" });
+    expect(row).toEqual({
+      name: "Profile",
+      text: "Could not be worked out: the user-data folder of this custom VS Code cannot be told. Default is not assumed; no profile is shown.",
+      tone: "warning",
+    });
+  });
+
+  describe("in the settings tab, against the mock host", () => {
+    function open(profile: () => ProfileState) {
+      const host: SettingsHost = {
+        restartServer: async () => undefined,
+        serverState: () => "running",
+        workbenchSettings: () => ({ ...DEFAULT_SETTINGS }),
+        updateSettings: async () => undefined,
+        scanInstances: async () => ({ instances: [], rejected: [], customFailure: null }),
+        verifyCustomCli: async () => ({ ok: false, reason: "no" }),
+        codeCliOverride: () => undefined,
+        portStatus: () => ({ stored: 51789, current: 51789, note: null }),
+        spikeResult: () => SPIKE_RESULT,
+        mirroredProfile: profile,
+        extensionRows: async () => ({ status: "server-not-running" }),
+      };
+      Setting.reset();
+      const tab = new WorkbenchSettingTab({} as never, {} as never, host);
+      tab.display();
+      const el = tab.containerEl as unknown as FakeNode;
+      const rows = el.all().filter((n) => n.cls?.includes("workbench-extensions-row"));
+      const row = (name: string) => rows.find((r) => r.children[0]?.text === name);
+      return { tab, el, row, text: () => el.textContent() };
+    }
+
+    it("renders the not-read state, with no stale guess", () => {
+      const t = open(() => ({ status: "not-read" }));
+      expect(t.row("Profile")?.children[1].text).toBe("Not read yet: the profile is read when the server starts.");
+      expect(t.row("Profile")?.cls).toContain("workbench-info");
+    });
+
+    it("renders a chosen profile", () => {
+      const t = open(() => resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: PROFILES.custom.location })));
+      expect(t.row("Profile")?.children[1].text).toBe("FDE Practice. Chosen from: the vault folder.");
+      expect(t.row("Profile")?.cls).toContain("workbench-ok");
+    });
+
+    it("renders a fallback with its reason, in the warning tone", () => {
+      const t = open(() => resolved(lookup({})));
+      expect(t.row("Profile")?.children[1].text).toContain("not associated with a profile in desktop VS Code");
+      expect(t.row("Profile")?.cls).toContain("workbench-warning");
+    });
+
+    it("sits in the Extensions section, after the port row, followed by the disabled-lists row", () => {
+      const t = open(() => ({ status: "not-read" }));
+      const names = t.el.all().filter((n) => n.cls?.includes("workbench-extensions-row")).map((r) => r.children[0]?.text);
+      expect(names).toEqual(["Measured", "Stable port", "Stable port in use", "Profile", "Disabled in VS Code", "Trust record", "Settings and keybindings", "Turbo Console Log"]);
+    });
+
+    it("reads the host each time the tab is displayed: a restart's new result shows at once, nothing is cached", () => {
+      let state: ProfileState = { status: "not-read" };
+      const t = open(() => state);
+      expect(t.row("Profile")?.children[1].text).toContain("Not read yet");
+      state = resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: PROFILES.custom.location }));
+      t.tab.display();
+      expect(t.text()).toContain("FDE Practice. Chosen from: the vault folder.");
+      expect(t.text()).not.toContain("Not read yet: the profile is read when the server starts.");
+    });
+
+    it("a host that throws: the Profile row says it could not be shown, and the rest of settings is still drawn", () => {
+      const t = open(() => {
+        throw new Error("secret detail that must not be shown");
+      });
+      expect(t.row("Profile")?.children[1].text).toBe("Could not be worked out: the plugin could not report it. Default is not assumed; no profile is shown.");
+      expect(t.text()).not.toContain("secret detail");
+      expect(Setting.all.find((x) => x.name === "Trust the vault folder")).toBeDefined();
+      expect(t.row("Turbo Console Log")).toBeDefined();
+      expect(t.row("Stable port in use")).toBeDefined();
+      expect(Setting.all.find((x) => x.name === "Restart server")).toBeDefined();
+    });
+  });
+
+  it("a Profile row and a disabled-lists row with no spike result recorded are still drawn, after the port", () => {
+    const el = new FakeNode("div");
+    renderExtensionsSection(el as unknown as HTMLElement, describeExtensionsSection(null, { stored: null, current: null, note: null }, { status: "not-read" }));
+    const names = el.all().filter((n) => n.cls?.includes("workbench-extensions-row")).map((r) => r.children[0]?.text);
+    expect(names).toEqual(["Extension spike", "Stable port in use", "Profile", "Disabled in VS Code"]);
+  });
+
+  it("describeExtensionsSection without a profile argument says not read yet", () => {
+    const view = describeExtensionsSection(null, { stored: null, current: null, note: null });
+    expect(view.rows.find((r) => r.name === "Profile")?.text).toBe("Not read yet: the profile is read when the server starts.");
+  });
+});
+
+describe("the Disabled in VS Code row of the Extensions section (G14, E1)", () => {
+  const NOW = 1_800_000_000_000;
+  const read: MirrorResult = { source: "read", disabled: ["a.b", "c.d", "e.f"], counts: { global: 1, profile: 1, workspace: 2 }, notes: [], at: NOW };
+
+  it("not read yet", () => {
+    expect(describeDisabledLists(null, NOW)).toEqual({ name: "Disabled in VS Code", text: "Not read yet: the disabled lists are read when the server starts.", tone: "info" });
+  });
+
+  it("read: says the lists were read, how many extensions are disabled and from which lists", () => {
+    expect(describeDisabledLists(read, NOW)).toEqual({
+      name: "Disabled in VS Code",
+      text: "Disabled lists read from desktop VS Code at the last server start: 3 extensions disabled (global 1, profile 1, workspace 2).",
+      tone: "ok",
+    });
+  });
+
+  it("read in the Default profile: no profile count (its list is the global one), one extension in the singular, and the notes", () => {
+    const row = describeDisabledLists({ ...read, disabled: ["a.b"], counts: { global: 0, profile: null, workspace: 1 }, notes: ["no workspace storage names the vault"] }, NOW);
+    expect(row.text).toBe(
+      "Disabled lists read from desktop VS Code at the last server start: 1 extension disabled (global 0, workspace 1). Note: no workspace storage names the vault.",
+    );
+  });
+
+  it("snapshot: says the snapshot from an earlier start is used, with its age and why the read failed", () => {
+    const snap: MirrorResult = { source: "snapshot", disabled: ["a.b"], takenAt: NOW - 3 * 3_600_000 - 5 * 60_000, why: "the disabled list could not be read (the global list: sqlite3 was not found on PATH)" };
+    expect(describeDisabledLists(snap, NOW)).toEqual({
+      name: "Disabled in VS Code",
+      text: "Using the snapshot from an earlier start, taken 3 hours ago (1 extension disabled). Why: the disabled list could not be read (the global list: sqlite3 was not found on PATH).",
+      tone: "warning",
+    });
+  });
+
+  it("none: says no extensions are shared, and why", () => {
+    const none: MirrorResult = { source: "none", disabled: [], why: "the disabled list could not be read (the global list: sqlite3 was not found on PATH); there is no earlier snapshot" };
+    expect(describeDisabledLists(none, NOW)).toEqual({
+      name: "Disabled in VS Code",
+      text: "No extensions are shared: the disabled list could not be read (the global list: sqlite3 was not found on PATH); there is no earlier snapshot.",
+      tone: "warning",
+    });
+  });
+
+  it("describeAge: minutes, hours, days, singular and plural, and a clock that ran backwards", () => {
+    expect(describeAge(-5000)).toBe("less than a minute");
+    expect(describeAge(59_000)).toBe("less than a minute");
+    expect(describeAge(60_000)).toBe("1 minute");
+    expect(describeAge(45 * 60_000)).toBe("45 minutes");
+    expect(describeAge(60 * 60_000)).toBe("1 hour");
+    expect(describeAge(23 * 3_600_000)).toBe("23 hours");
+    expect(describeAge(24 * 3_600_000)).toBe("1 day");
+    expect(describeAge(50 * 3_600_000)).toBe("2 days");
+  });
+
+  describe("in the settings tab, against the mock host", () => {
+    function open(disabledLists?: () => MirrorResult | null) {
+      const host: SettingsHost = {
+        restartServer: async () => undefined,
+        serverState: () => "running",
+        workbenchSettings: () => ({ ...DEFAULT_SETTINGS }),
+        updateSettings: async () => undefined,
+        scanInstances: async () => ({ instances: [], rejected: [], customFailure: null }),
+        verifyCustomCli: async () => ({ ok: false, reason: "no" }),
+        codeCliOverride: () => undefined,
+        portStatus: () => ({ stored: 51789, current: 51789, note: null }),
+        spikeResult: () => SPIKE_RESULT,
+        mirroredProfile: () => ({ status: "not-read" }),
+        extensionRows: async () => ({ status: "server-not-running" }),
+        ...(disabledLists ? { disabledLists } : {}),
+      };
+      Setting.reset();
+      const tab = new WorkbenchSettingTab({} as never, {} as never, host);
+      tab.display();
+      const el = tab.containerEl as unknown as FakeNode;
+      const row = el.all().find((n) => n.cls?.includes("workbench-extensions-row") && n.children[0]?.text === "Disabled in VS Code");
+      return { tab, row, text: () => row?.children[1].text };
+    }
+
+    it("a host without the method shows not read yet", () => {
+      expect(open().text()).toContain("Not read yet");
+    });
+
+    it("shows the host's result, and reads it again each time the tab is displayed", () => {
+      let result: MirrorResult | null = null;
+      const t = open(() => result);
+      expect(t.text()).toContain("Not read yet");
+      result = read;
+      t.tab.display();
+      const again = (t.tab.containerEl as unknown as FakeNode).all().find((n) => n.children[0]?.text === "Disabled in VS Code");
+      expect(again?.children[1].text).toContain("3 extensions disabled");
+    });
+
+    it("a host that throws shows not read yet and leaves the rest drawn", () => {
+      const t = open(() => {
+        throw new Error("secret detail");
+      });
+      expect(t.text()).toContain("Not read yet");
+      expect(t.text()).not.toContain("secret");
+      expect(Setting.all.find((x) => x.name === "Restart server")).toBeDefined();
+    });
   });
 });

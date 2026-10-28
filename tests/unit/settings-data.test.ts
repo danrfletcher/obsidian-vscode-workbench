@@ -23,6 +23,8 @@ describe("defaults", () => {
       excludeExtensions: [],
       nonCodeDrawer: true,
       shellPath: "",
+      stablePort: null,
+      trustVaultFolder: true,
     });
     expect(readSettings(null)).toEqual(DEFAULT_SETTINGS);
     expect(readSettings(undefined)).toEqual(DEFAULT_SETTINGS);
@@ -39,6 +41,73 @@ describe("defaults", () => {
     expect(defaultShell({ SHELL: "zsh" })).toBe("/bin/zsh"); // not an absolute path
     expect(effectiveShell({ shellPath: "" }, { SHELL: "/bin/bash" })).toBe("/bin/bash");
     expect(effectiveShell({ shellPath: "  /usr/bin/fish " }, { SHELL: "/bin/bash" })).toBe("/usr/bin/fish");
+  });
+});
+
+describe("the stored stable port", () => {
+  it.each([
+    ["missing", undefined, null],
+    ["null", null, null],
+    ["a string", "8080", null],
+    ["a boolean", true, null],
+    ["an array", [8080], null],
+    ["a fraction", 8080.5, null],
+    ["NaN", Number.NaN, null],
+    ["negative", -1, null],
+    ["zero", 0, null],
+    ["below 1024", 1023, null],
+    ["above 65535", 65536, null],
+    ["far above 65535", 1e9, null],
+    ["Infinity", Infinity, null],
+    ["the lowest valid port", 1024, 1024],
+    ["an ordinary port", 51789, 51789],
+    ["the highest valid port", 65535, 65535],
+  ])("%s reads as %s", (_name, stored, expected) => {
+    expect(readSettings({ stablePort: stored }).stablePort).toBe(expected);
+  });
+
+  it("an invalid stored port does not disturb the other fields", () => {
+    expect(readSettings({ stablePort: 99999, nonCodeDrawer: false, shellPath: "/bin/bash" })).toEqual({ ...DEFAULT_SETTINGS, nonCodeDrawer: false, shellPath: "/bin/bash" });
+  });
+
+  it("round-trips through the data object the plugin saves (the field name is stablePort)", () => {
+    const saved = { ...dataObject({ other: 1 }), stablePort: 51789 };
+    expect(readSettings(JSON.parse(JSON.stringify(saved))).stablePort).toBe(51789);
+  });
+});
+
+describe("the trustVaultFolder setting (G6)", () => {
+  it("is on by default", () => {
+    expect(DEFAULT_SETTINGS.trustVaultFolder).toBe(true);
+    expect(readSettings({}).trustVaultFolder).toBe(true);
+  });
+
+  it("round-trips false and true through the data object the plugin saves", () => {
+    for (const value of [false, true]) {
+      const saved = { ...dataObject({ other: 1 }), trustVaultFolder: value };
+      expect(readSettings(JSON.parse(JSON.stringify(saved))).trustVaultFolder).toBe(value);
+    }
+  });
+
+  it.each([
+    ["a string", "false"],
+    ["the string off", "off"],
+    ["a number", 0],
+    ["the number 1", 1],
+    ["null", null],
+    ["an array", [false]],
+    ["an object", { value: false }],
+    ["missing", undefined],
+  ])("%s reads as the default, on", (_name, stored) => {
+    expect(readSettings({ trustVaultFolder: stored }).trustVaultFolder).toBe(true);
+  });
+
+  it("a corrupt data.json (not an object) still opens, with the toggle on", () => {
+    for (const raw of ["{ not json", 42, [false], null, undefined]) expect(readSettings(raw).trustVaultFolder).toBe(true);
+  });
+
+  it("an off toggle does not disturb the other fields", () => {
+    expect(readSettings({ trustVaultFolder: false, stablePort: 51789 })).toEqual({ ...DEFAULT_SETTINGS, trustVaultFolder: false, stablePort: 51789 });
   });
 });
 
@@ -61,7 +130,7 @@ describe("a corrupt, partial or odd data.json falls back field by field", () => 
       nonCodeDrawer: "yes",
       shellPath: ["/bin/zsh"],
     });
-    expect(s).toEqual({ instanceId: null, customCliPath: "/usr/local/bin/code", excludeExtensions: [], nonCodeDrawer: true, shellPath: "" });
+    expect(s).toEqual({ instanceId: null, customCliPath: "/usr/local/bin/code", excludeExtensions: [], nonCodeDrawer: true, shellPath: "", stablePort: null, trustVaultFolder: true });
   });
 
   it("keeps a false toggle and a saved instance id exactly as stored", () => {

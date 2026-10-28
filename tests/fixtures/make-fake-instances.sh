@@ -16,6 +16,10 @@
 #   UserApplications/             scan root 2 (empty, like a missing ~/Applications)
 #   AppSupport/                   stands in for ~/Library/Application Support
 #     Code - Insiders/User/settings.json (with comments and a trailing comma) and keybindings.json
+#     Code - Insiders/User/globalStorage/storage.json  the vault (<root>/Vault) is associated with the Default profile
+#   Home/.vscode-insiders/extensions/   stands in for ~/.vscode-insiders/extensions
+#     extensions.json and chakrounanas.turbo-console-log-3.29.0/   Turbo Console Log, enabled (the extension spike's fixture)
+#   Vault/                        the vault folder the association above names
 #
 # Every stub `code` answers `serve-web --help` and otherwise runs the fake serve-web server from this
 # folder (fake-code.sh), so a Code tab can start against it. The folder is only ever written under <root>.
@@ -115,6 +119,33 @@ cat >"$user/settings.json" <<'JSONC'
 JSONC
 printf '[\n  { "key": "cmd+k cmd+t", "command": "workbench.action.selectTheme" }\n]\n' >"$user/keybindings.json"
 
+# The extension spike's fixture (tests/render/extension-spike.mjs GP1): Turbo Console Log installed and enabled in the
+# Insiders extensions folder, and the vault associated with the Default profile. Nothing outside <root> is touched.
+mkdir -p "$root/Vault" "$user/globalStorage"
+cat >"$user/globalStorage/storage.json" <<JSON
+{
+  "profileAssociations": {
+    "workspaces": {
+      "file://$root/Vault": "__default__profile__"
+    }
+  },
+  "userDataProfiles": []
+}
+JSON
+ext="$root/Home/.vscode-insiders/extensions"
+mkdir -p "$ext/chakrounanas.turbo-console-log-3.29.0"
+printf '{ "name": "turbo-console-log", "publisher": "ChakrounAnas", "version": "3.29.0", "main": "./out/extension.js" }\n' >"$ext/chakrounanas.turbo-console-log-3.29.0/package.json"
+cat >"$ext/extensions.json" <<JSON
+[
+  {
+    "identifier": { "id": "chakrounanas.turbo-console-log" },
+    "version": "3.29.0",
+    "location": { "\$mid": 1, "path": "$ext/chakrounanas.turbo-console-log-3.29.0", "scheme": "file" }
+  }
+]
+JSON
+
 echo "export WORKBENCH_SCAN_ROOTS='$root/Applications:$root/UserApplications'"
 echo "export WORKBENCH_APP_SUPPORT_ROOT='$root/AppSupport'"
+echo "# spike fixture: extensions $ext   vault $root/Vault"
 echo "# tree: $root   (remove with: $0 clean '$root')"

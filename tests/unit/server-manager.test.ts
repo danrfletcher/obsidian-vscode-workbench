@@ -45,7 +45,20 @@ vi.mock("../../src/process-utils", async (orig) => ({
   signalGroup: (pid: number, sig: string) => void signals.push({ pid, sig, group: true }),
 }));
 
+// The disabled-list reader (it would run sqlite3) and the read of the profile's list are counted; the profile's list is still really read.
+vi.mock("../../src/mirror/mirror", async (orig) => ({
+  ...(await orig<typeof import("../../src/mirror/mirror")>()),
+  mirrorDisabled: vi.fn(),
+}));
+vi.mock("../../src/server/shared-extensions", async (orig) => {
+  const real = await orig<typeof import("../../src/server/shared-extensions")>();
+  return { ...real, readProfileExtensions: vi.fn(real.readProfileExtensions) };
+});
+
+import * as fs from "node:fs";
 import { ChildRegistry } from "../../src/child-registry";
+import { mirrorDisabled, type MirrorRequest, type MirrorResult } from "../../src/mirror/mirror";
+import { MirrorStateCache, readProfileExtensions } from "../../src/server/shared-extensions";
 import { ServerStartError, StartCancelledError, WorkbenchServer, type CodeBuild } from "../../src/server";
 import { ServerManager, type ServerState } from "../../src/server-manager";
 import { tempDir } from "../helpers";
@@ -356,5 +369,184 @@ describe("crash", () => {
     signals.length = 0;
     lastChild().crash();
     await vi.waitFor(() => expect(registry.size).toBe(0));
+  });
+});
+
+
+describe("G2: desktop VS Code is read at the first start and at Restart server, never at an idle restart", () => {
+  const TCL = "chakrounanas.turbo-console-log-3.0.0";
+  const PY = "ms-python.python-2026.10.0";
+  const KEY = "root:/support/Code - Insiders|p1|list";
+
+  let src: string;
+  let listFile: string;
+  let disabledNow: string[];
+  let reread: boolean;
+  let cache: MirrorStateCache;
+  /** How many SIGTERMs had gone out when each read of the disabled lists began: the old server is stopped before the new state is read and linked. */
+  let signalsAtRead: number[];
+
+  const entry = (id: string, folder: string) => ({ identifier: { id }, relativeLocation: folder, location: { $mid: 1, path: path.join(src, folder), scheme: "file" } });
+  const request: MirrorRequest = { instanceId: "vscode-insiders:/a", userDataRoot: "/support/Code - Insiders", vaultPath: "/vault", profile: { location: "p1", isDefault: false, dir: "/support/p1" } };
+  const linksNow = (server: WorkbenchServer | null) => (server ? fs.readdirSync(path.join(server.serverDataDir, "extensions")).filter((n) => n !== "extensions.json").sort() : []);
+
+  /** The wiring of the plugin's createServer: ask the cache, hand the server what to reuse, keep what it read. */
+  function pluginLike(): ServerManager {
+    const m = new ServerManager({
+      registry,
+      healthIntervalMs: 0,
+      create: async () => {
+        const reuse = cache.forStart(KEY, reread);
+        reread = false;
+        return new WorkbenchServer({
+          build: { ...build, extensionsDir: src },
+          runtimeDir,
+          acceptLicense: true,
+          registry,
+          pollIntervalMs: 5,
+          findPort: async () => freshPort++,
+          probe: async () => 302,
+          mirror: request,
+          profileExtensionsFile: listFile,
+          reuseMirror: reuse,
+          onMirrorState: (state) => cache.keep(KEY, state),
+        });
+      },
+    });
+    managers.push(m);
+    return m;
+  }
+
+  beforeEach(() => {
+    src = path.join(tempDir(), "extensions");
+    for (const n of [TCL, PY]) fs.mkdirSync(path.join(src, n), { recursive: true });
+    listFile = path.join(tempDir(), "extensions.json");
+    fs.writeFileSync(listFile, JSON.stringify([entry("chakrounanas.turbo-console-log", TCL), entry("ms-python.python", PY)]));
+    disabledNow = [];
+    reread = false;
+    cache = new MirrorStateCache();
+    signalsAtRead = [];
+    vi.mocked(mirrorDisabled).mockReset();
+    vi.mocked(mirrorDisabled).mockImplementation(async () => {
+      signalsAtRead.push(signals.length);
+      return { source: "read", disabled: [...disabledNow], counts: { global: disabledNow.length, profile: null, workspace: 0 }, notes: [], at: 1 } satisfies MirrorResult;
+    });
+    vi.mocked(readProfileExtensions).mockClear();
+  });
+
+  it("the first start reads once, links the enabled set, and a second ensureStarted on the running server reads nothing", async () => {
+    disabledNow = ["ms-python.python"];
+    const m = pluginLike();
+    await m.ensureStarted();
+    await m.ensureStarted();
+    expect(mirrorDisabled).toHaveBeenCalledTimes(1);
+    expect(readProfileExtensions).toHaveBeenCalledTimes(1);
+    expect(linksNow(m.serverInstance)).toEqual([TCL]);
+  });
+
+  it("an idle stop then a start reuses the snapshot: no disabled-list read, no re-read of the profile's list, and the links are rebuilt from what was read", async () => {
+    const m = pluginLike();
+    await m.ensureStarted();
+    expect(linksNow(m.serverInstance)).toEqual([PY, TCL].sort());
+    await m.stop("idle");
+    expect(m.state).toBe("stopped-by-idle");
+
+    // desktop VS Code changes while the server is idle: an idle restart must not see it
+    disabledNow = ["ms-python.python"];
+    fs.writeFileSync(listFile, JSON.stringify([entry("chakrounanas.turbo-console-log", TCL)]));
+    await m.ensureStarted();
+
+    expect(mirrorDisabled).toHaveBeenCalledTimes(1);
+    expect(readProfileExtensions).toHaveBeenCalledTimes(1);
+    expect(m.state).toBe("running");
+    expect(linksNow(m.serverInstance)).toEqual([PY, TCL].sort());
+    expect(m.serverInstance?.mirror).toMatchObject({ source: "read", disabled: [] });
+  });
+
+  it("Restart server (a new read asked for) reads both again and picks up the change", async () => {
+    const m = pluginLike();
+    await m.ensureStarted();
+    disabledNow = ["ms-python.python"];
+    reread = true;
+    await m.restart();
+    expect(mirrorDisabled).toHaveBeenCalledTimes(2);
+    expect(readProfileExtensions).toHaveBeenCalledTimes(2);
+    expect(linksNow(m.serverInstance)).toEqual([TCL]);
+    // and the read it made is what an idle restart after it reuses
+    await m.stop("idle");
+    disabledNow = [];
+    await m.ensureStarted();
+    expect(mirrorDisabled).toHaveBeenCalledTimes(2);
+    expect(linksNow(m.serverInstance)).toEqual([TCL]);
+  });
+
+  it("between starts the running server's links and extensions.json are untouched, whatever desktop VS Code does (no watcher, no polling)", async () => {
+    vi.useFakeTimers();
+    const m = pluginLike();
+    await m.ensureStarted();
+    const target = path.join((m.serverInstance as WorkbenchServer).serverDataDir, "extensions");
+    const before = [fs.readdirSync(target).sort(), fs.readFileSync(path.join(target, "extensions.json"), "utf8")];
+    disabledNow = ["ms-python.python"];
+    fs.writeFileSync(listFile, "[]");
+    fs.rmSync(path.join(src, PY), { recursive: true });
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect([fs.readdirSync(target).sort(), fs.readFileSync(path.join(target, "extensions.json"), "utf8")]).toEqual(before);
+    expect(mirrorDisabled).toHaveBeenCalledTimes(1);
+    expect(readProfileExtensions).toHaveBeenCalledTimes(1);
+  });
+
+  it("a start for another place (another instance, profile or list) reads again even with no new read asked for", async () => {
+    const m = pluginLike();
+    await m.ensureStarted();
+    await m.stop("idle");
+    cache.keep("root:/elsewhere|p9|list", cache.current as NonNullable<typeof cache.current>);
+    await m.ensureStarted();
+    expect(mirrorDisabled).toHaveBeenCalledTimes(2);
+  });
+
+  it("the old server is stopped before the new state is read and the links are rebuilt: links never change under a running process", async () => {
+    const m = pluginLike();
+    await m.ensureStarted();
+    const old = m.serverInstance as WorkbenchServer;
+    const oldPid = old.pid as number;
+    const target = path.join(old.serverDataDir, "extensions");
+    disabledNow = ["ms-python.python"];
+    reread = true;
+    signals.length = 0;
+    const linksWhenRead: string[][] = [];
+    vi.mocked(mirrorDisabled).mockImplementationOnce(async () => {
+      signalsAtRead.push(signals.filter((s) => s.pid === oldPid && s.sig === "SIGTERM").length);
+      linksWhenRead.push(fs.readdirSync(target).sort());
+      return { source: "read", disabled: [...disabledNow], counts: { global: 1, profile: null, workspace: 0 }, notes: [], at: 2 };
+    });
+    await m.restart();
+    expect(signalsAtRead.at(-1)).toBeGreaterThan(0); // the old process had been sent SIGTERM when the new read began
+    expect(linksWhenRead[0]).toContain(TCL); // and the old set was still whole: it is rebuilt only after the read
+    expect(linksNow(m.serverInstance)).toEqual([TCL]);
+  });
+
+  it("Restart server pressed twice at once: the second call joins the first, one rebuild", async () => {
+    // the plugin's `restarting` guard shares one promise; the manager under it must not read twice for one restart
+    const m = pluginLike();
+    await m.ensureStarted();
+    reread = true;
+    let inFlight: Promise<unknown> | null = null;
+    const press = () => (inFlight ??= m.restart().finally(() => (inFlight = null)));
+    await Promise.all([press(), press()]);
+    expect(mirrorDisabled).toHaveBeenCalledTimes(2); // the first start and the one restart
+  });
+
+  it("a disabled-list read that is cancelled by a stop is not kept: the next start reads", async () => {
+    let release!: (r: MirrorResult) => void;
+    vi.mocked(mirrorDisabled).mockImplementationOnce(() => new Promise<MirrorResult>((resolve) => (release = resolve)));
+    const m = pluginLike();
+    const starting = m.ensureStarted().catch((e: unknown) => e);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    await m.stop("manual");
+    release({ source: "read", disabled: [], counts: { global: 0, profile: null, workspace: 0 }, notes: [], at: 1 });
+    expect(await starting).toBeInstanceOf(StartCancelledError);
+    expect(cache.current).toBeNull();
+    await m.ensureStarted();
+    expect(mirrorDisabled).toHaveBeenCalledTimes(2);
   });
 });

@@ -1,5 +1,6 @@
+import * as net from "node:net";
 import { describe, expect, it } from "vitest";
-import { buildServeWebArgs, parseServeWebHelp, LOOPBACK_HOST } from "../../src/server";
+import { buildServeWebArgs, parseServeWebHelp, pickPort, portIsFree, LOOPBACK_HOST } from "../../src/server";
 
 const base = {
   port: 51234,
@@ -83,5 +84,75 @@ describe("parseServeWebHelp", () => {
   it("refuses a build whose serve-web --help fails", () => {
     expect(parseServeWebHelp(2, "error: unrecognized subcommand 'serve-web'").serveWeb).toBe(false);
     expect(parseServeWebHelp(0, "Usage: code [options]").serveWeb).toBe(false);
+  });
+});
+
+/** A real listener on a free loopback port: another program holding a port. */
+async function listener(): Promise<{ port: number; close(): Promise<void> }> {
+  const srv = net.createServer((sock) => sock.destroy());
+  await new Promise<void>((r) => srv.listen(0, LOOPBACK_HOST, r));
+  return { port: (srv.address() as net.AddressInfo).port, close: () => new Promise<void>((r) => srv.close(() => r())) };
+}
+
+describe("pickPort", () => {
+  it("with nothing stored, takes the free port it is given and has nothing to say", async () => {
+    expect(await pickPort(async () => 52001)).toEqual({ port: 52001, usedStored: false, note: null });
+  });
+
+  it("uses the stored port when it is free, and never asks for another", async () => {
+    let asked = 0;
+    const r = await pickPort(async () => (asked++, 52001), 51900, async (p) => p === 51900);
+    expect(r).toEqual({ port: 51900, usedStored: true, note: null });
+    expect(asked).toBe(0);
+  });
+
+  it("uses a free port and says which port was passed over and why when the stored one is taken", async () => {
+    const r = await pickPort(async () => 52002, 51900, async () => false);
+    expect(r.port).toBe(52002);
+    expect(r.usedStored).toBe(false);
+    expect(r.note).toBe("The stored port 51900 is not available: another program is using it (for example a second Obsidian window on this vault). Using port 52002 for this start; the stored port is kept.");
+  });
+
+  it("with the real probe, a stored port that another process listens on is passed over", async () => {
+    const other = await listener();
+    try {
+      const r = await pickPort(async () => (other.port === 52003 ? 52004 : 52003), other.port);
+      expect(r.port).not.toBe(other.port);
+      expect(r.usedStored).toBe(false);
+      expect(r.note).toContain(`stored port ${other.port} is not available`);
+    } finally {
+      await other.close();
+    }
+  });
+
+  it("with the real probe, a stored port nobody uses is taken", async () => {
+    const l = await listener();
+    const port = l.port;
+    await l.close(); // now free
+    expect((await pickPort(async () => 52005, port)).port).toBe(port);
+  });
+});
+
+describe("portIsFree", () => {
+  it("a connect that never answers counts as in use (the probe cannot tell, so the port is not free)", async () => {
+    // A socket that is never given a server: its connect stays pending, as a full backlog's would.
+    const hung = () => {
+      const s = new net.Socket();
+      s.connect = (() => s) as unknown as typeof s.connect;
+      return s;
+    };
+    expect(await portIsFree(52999, hung, 30)).toBe(false);
+  });
+
+  it.runIf(process.platform !== "win32" && process.getuid?.() !== 0)("a port nobody listens on but that cannot be bound is not free either", async () => {
+    // Port 1: connect is refused, and binding it as a normal user fails with EACCES.
+    expect(await portIsFree(1)).toBe(false);
+  });
+
+  it("is false for a port something listens on, true once it stops, and never throws", async () => {
+    const l = await listener();
+    expect(await portIsFree(l.port)).toBe(false);
+    await l.close();
+    expect(await portIsFree(l.port)).toBe(true);
   });
 });
