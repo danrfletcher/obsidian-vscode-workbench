@@ -5,12 +5,14 @@ import { decide, resolveChoice, SETTLE_MS, SETTLE_POLL_MS, type AutoSave, type B
 import { LicenceDeclinedError } from "./licence";
 import type { CloseDirtyRequest } from "./modals";
 import { fileKey } from "./open-file";
-import { buildFileUrl } from "./paths";
+import { buildFileUri, buildFileUrl } from "./paths";
 import type { CarryResult } from "./rename-carry";
 import type { RunningServer } from "./server";
 import type { ServerState } from "./server-manager";
 import { buildBrowserSeedScript, BROWSER_APP_SETTINGS, type UserDataCopy } from "./settings";
 import { buildThemeSwitchScript, type EmbedChannel, type ThemeSwitchMessage, type ThemeSwitchResult } from "./theme-map";
+import { MANUAL_TRUST_STEPS } from "./trust/trust-message";
+import { buildTrustSeedScript } from "./trust/trust-seed";
 import type { SyncTab } from "./vault-sync";
 
 export const VIEW_TYPE_CODE = "vscode-workbench-code";
@@ -57,6 +59,15 @@ export interface CodeViewHost {
   focusTab?(leaf: WorkspaceLeaf): void | Promise<void>;
   /** The plugin's own theme and chrome settings for this load, laid over the browser profile's user settings (G5, G6). */
   workbenchOverlay?(): Record<string, unknown>;
+  /**
+   * The `trustVaultFolder` setting, read at every tab load: true runs the trust seed (G5), false or absent runs
+   * nothing and leaves whatever is stored alone (G6).
+   */
+  trustVaultFolder?(): boolean;
+  /** Ports of the servers still running, for the trust seed's keep-list. Absent or empty: the seed removes no record. */
+  heldPorts?(): readonly number[];
+  /** What the trust seed answered for the tab that just loaded ("seeded", "version-mismatch", "timeout", ...). The settings tab reads it from the host. */
+  noteTrustOutcome?(outcome: string): void;
   /**
    * A tab made its embed (webview or iframe): let the hotkey bridge watch it. Returns the function that stops watching,
    * called when the embed is replaced or the tab closes. Absent (or a no-op) when the bridge is off.
@@ -171,30 +182,63 @@ interface WebviewLike extends HTMLElement {
  * "unsupported" or "error:<message>"), so the workbench still opens.
  */
 export function runInWebview(el: WebviewLike, script: string, timeoutMs = 8000): Promise<unknown> {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (outcome: unknown) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      resolve(outcome);
-    };
-    const timer = setTimeout(() => finish("timeout"), timeoutMs);
+  return runScriptsInWebview(el, [script], timeoutMs).then((outcomes) => outcomes[0]);
+}
+
+/**
+ * Run `scripts` one after another in the page the webview has just loaded, all after the same `dom-ready` (that
+ * event fires once per page, so a second `runInWebview` on the same page would wait for it in vain). Resolves
+ * with one outcome per script, in order, each as `runInWebview` would give it; a script that fails or times out
+ * does not stop the next one. If the page never reports `dom-ready`, every outcome is "timeout".
+ */
+export async function runScriptsInWebview(el: WebviewLike, scripts: readonly string[], timeoutMs = 8000): Promise<unknown[]> {
+  const ready = await new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
     el.addEventListener(
       "dom-ready",
       () => {
-        if (typeof el.executeJavaScript !== "function") return finish("unsupported");
-        el.executeJavaScript(script).then(finish, (e) => finish(`error:${e instanceof Error ? e.message : String(e)}`));
+        clearTimeout(timer);
+        resolve(true);
       },
       { once: true },
     );
   });
+  if (!ready) return scripts.map(() => "timeout");
+  const execute = el.executeJavaScript;
+  if (typeof execute !== "function") return scripts.map(() => "unsupported");
+  const outcomes: unknown[] = [];
+  for (const script of scripts) {
+    outcomes.push(
+      await new Promise<unknown>((resolve) => {
+        const timer = setTimeout(() => resolve("timeout"), timeoutMs);
+        Promise.resolve()
+          .then(() => execute.call(el, script))
+          .then(
+            (v) => {
+              clearTimeout(timer);
+              resolve(v);
+            },
+            (e) => {
+              clearTimeout(timer);
+              resolve(`error:${e instanceof Error ? e.message : String(e)}`);
+            },
+          );
+      }),
+    );
+  }
+  return outcomes;
 }
 
 /** Say in the console how the browser-profile seed went, so a seed that quietly stops working can be seen. */
 export function logSeedOutcome(outcome: unknown): void {
   if (outcome === "seeded") console.debug("VS Code Workbench: browser profile seeded");
   else console.warn(`VS Code Workbench: the browser profile seed did not apply (${String(outcome)}); the workbench opens with its own defaults, so extension update checks, experiments and telemetry may not be switched off for this tab.`);
+}
+
+/** Say in the console how the trust seed went, the way `logSeedOutcome` does for the settings seed. */
+export function logTrustOutcome(outcome: unknown): void {
+  if (outcome === "seeded") console.debug("VS Code Workbench: vault folder trusted");
+  else console.warn(`VS Code Workbench: the trust seed did not apply (${String(outcome)}); the workbench opens in Restricted Mode. To trust the vault folder by hand, ${MANUAL_TRUST_STEPS}.`);
 }
 
 export function baseName(file: string): string {
@@ -603,6 +647,25 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     // The banner floats over the (dead) page, which stays visible so unsaved text can be copied.
   }
 
+  /**
+   * The trust seed for this load, or null when the setting is off (nothing is run, nothing stored is touched) or the
+   * script cannot be built for this folder (logged; the tab opens in Restricted Mode, never errors or blanks).
+   */
+  private trustSeedScript(server: RunningServer): string | null {
+    if (this.host.trustVaultFolder?.() !== true) return null;
+    try {
+      return buildTrustSeedScript({
+        origin: server.baseUrl,
+        folderUri: buildFileUri(server.baseUrl, this.host.vaultRoot()),
+        heldPorts: this.host.heldPorts?.() ?? [],
+      });
+    } catch (e) {
+      console.warn(`VS Code Workbench: the trust seed was not built (${e instanceof Error ? e.message : String(e)}); the workbench opens in Restricted Mode. To trust the vault folder by hand, ${MANUAL_TRUST_STEPS}.`);
+      this.host.noteTrustOutcome?.(`error:${e instanceof Error ? e.name : "build"}`);
+      return null;
+    }
+  }
+
   private async restartFromBanner(): Promise<void> {
     const loadsBefore = this.loadCount;
     try {
@@ -656,12 +719,15 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
       this.frame = el;
       this.detachBridge = this.host.attachEmbed?.(el) ?? null;
       if (isWebview) {
-        logSeedOutcome(
-          await runInWebview(
-            el as WebviewLike,
-            buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...this.host.workbenchOverlay?.() }, this.host.userDataCopy()),
-          ),
-        );
+        // One page, one dom-ready: both seeds run from it, the settings seed first, then the trust seed.
+        const trust = this.trustSeedScript(server);
+        const settingsSeed = buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...this.host.workbenchOverlay?.() }, this.host.userDataCopy());
+        const outcomes = await runScriptsInWebview(el as WebviewLike, trust === null ? [settingsSeed] : [settingsSeed, trust]);
+        logSeedOutcome(outcomes[0]);
+        if (trust !== null) {
+          logTrustOutcome(outcomes[1]);
+          this.host.noteTrustOutcome?.(String(outcomes[1]));
+        }
         if (this.frame === el) el.setAttribute("src", url);
       }
     } catch (e) {

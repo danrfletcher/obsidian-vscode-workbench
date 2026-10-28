@@ -24,6 +24,7 @@ describe("defaults", () => {
       nonCodeDrawer: true,
       shellPath: "",
       stablePort: null,
+      trustVaultFolder: true,
     });
     expect(readSettings(null)).toEqual(DEFAULT_SETTINGS);
     expect(readSettings(undefined)).toEqual(DEFAULT_SETTINGS);
@@ -75,6 +76,41 @@ describe("the stored stable port", () => {
   });
 });
 
+describe("the trustVaultFolder setting (G6)", () => {
+  it("is on by default", () => {
+    expect(DEFAULT_SETTINGS.trustVaultFolder).toBe(true);
+    expect(readSettings({}).trustVaultFolder).toBe(true);
+  });
+
+  it("round-trips false and true through the data object the plugin saves", () => {
+    for (const value of [false, true]) {
+      const saved = { ...dataObject({ other: 1 }), trustVaultFolder: value };
+      expect(readSettings(JSON.parse(JSON.stringify(saved))).trustVaultFolder).toBe(value);
+    }
+  });
+
+  it.each([
+    ["a string", "false"],
+    ["the string off", "off"],
+    ["a number", 0],
+    ["the number 1", 1],
+    ["null", null],
+    ["an array", [false]],
+    ["an object", { value: false }],
+    ["missing", undefined],
+  ])("%s reads as the default, on", (_name, stored) => {
+    expect(readSettings({ trustVaultFolder: stored }).trustVaultFolder).toBe(true);
+  });
+
+  it("a corrupt data.json (not an object) still opens, with the toggle on", () => {
+    for (const raw of ["{ not json", 42, [false], null, undefined]) expect(readSettings(raw).trustVaultFolder).toBe(true);
+  });
+
+  it("an off toggle does not disturb the other fields", () => {
+    expect(readSettings({ trustVaultFolder: false, stablePort: 51789 })).toEqual({ ...DEFAULT_SETTINGS, trustVaultFolder: false, stablePort: 51789 });
+  });
+});
+
 describe("a corrupt, partial or odd data.json falls back field by field", () => {
   it.each([
     ["a string", "not an object"],
@@ -94,7 +130,7 @@ describe("a corrupt, partial or odd data.json falls back field by field", () => 
       nonCodeDrawer: "yes",
       shellPath: ["/bin/zsh"],
     });
-    expect(s).toEqual({ instanceId: null, customCliPath: "/usr/local/bin/code", excludeExtensions: [], nonCodeDrawer: true, shellPath: "", stablePort: null });
+    expect(s).toEqual({ instanceId: null, customCliPath: "/usr/local/bin/code", excludeExtensions: [], nonCodeDrawer: true, shellPath: "", stablePort: null, trustVaultFolder: true });
   });
 
   it("keeps a false toggle and a saved instance id exactly as stored", () => {

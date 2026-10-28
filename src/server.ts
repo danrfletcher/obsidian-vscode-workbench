@@ -310,6 +310,15 @@ export function findFreePort(): Promise<number> {
 const heldPorts = new Set<number>();
 
 /**
+ * Read-only view of `heldPorts`: the ports of the servers this process started and that are still up, sorted.
+ * A copy, so a caller cannot change what `pickPort` checks. The trust seed uses it to keep the records of
+ * ports a running server still holds.
+ */
+export function heldPortsSnapshot(): number[] {
+  return [...heldPorts].sort((a, b) => a - b);
+}
+
+/**
  * Whether nothing is using `port` on loopback. A connect that gets any answer but "refused" means something
  * is listening (this also catches a program bound to every interface, which a bind on 127.0.0.1 alone can
  * miss); otherwise the port must be bindable. Never rejects: a probe that cannot tell counts as "not free".

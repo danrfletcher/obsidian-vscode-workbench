@@ -5,6 +5,7 @@ import { CUSTOM_ID, KNOWN_BUILDS, type Instance, type ScanResult } from "../inst
 import type { ServerState } from "../server-manager";
 import { addExtension, defaultShell, type WorkbenchSettings } from "./data";
 import { describeExtensionsSection, renderExtensionsSection, type PortStatus, type SpikeResult } from "./extensions-section";
+import { describeTrust, MANUAL_TRUST_STEPS } from "../trust/trust-message";
 
 export interface SettingsHost {
   restartServer(): Promise<void>;
@@ -21,6 +22,8 @@ export interface SettingsHost {
   portStatus(): PortStatus;
   /** What the extension spike recorded; null = nothing recorded yet. */
   spikeResult(): SpikeResult | null;
+  /** What the trust seed answered at the last Code tab load (from the host, not the page); null = no tab has run it yet. */
+  trustOutcome?(): string | null;
 }
 
 type Tone = "error" | "warning" | "ok" | "info";
@@ -62,7 +65,7 @@ interface InstanceViewState {
   customResult: { tone: Tone; text: string } | null;
 }
 
-/** The settings tab: instances, custom CLI, excludes, the drawer toggle, the shell, the extension spike result and Restart server. */
+/** The settings tab: instances, custom CLI, excludes, the drawer toggle, the shell, the trust toggle, the extension spike result and Restart server. */
 export class WorkbenchSettingTab extends PluginSettingTab {
   /** Bumped by every display(): an answer that belongs to an older display is dropped. */
   private renderId = 0;
@@ -84,6 +87,7 @@ export class WorkbenchSettingTab extends PluginSettingTab {
     this.loadInstances(containerEl.createDiv(), render, { appliesNextStart: false, customResult: null });
     this.renderExcludes(containerEl.createDiv());
     this.renderDrawerAndShell(containerEl);
+    this.renderTrust(containerEl.createDiv());
     // Read once, here: the section shows the recorded result and the port as they are when settings opens.
     renderExtensionsSection(containerEl.createDiv(), describeExtensionsSection(this.host.spikeResult(), this.host.portStatus()));
     this.renderRestart(containerEl);
@@ -256,6 +260,31 @@ export class WorkbenchSettingTab extends PluginSettingTab {
         t.setPlaceholder(fallback).setValue(s.shellPath);
         t.onChange((v) => void this.host.updateSettings({ shellPath: v.trim() }));
       });
+  }
+
+  // --- Trust ------------------------------------------------------------------
+
+  /** The "Trust the vault folder" toggle and, under it, what the last trust seed did (G6, E3). */
+  private renderTrust(el: HTMLElement): void {
+    const drawMessage = () => {
+      messageEl.empty();
+      const m = describeTrust(this.host.workbenchSettings().trustVaultFolder, this.host.trustOutcome?.() ?? null);
+      if (m) message(messageEl, m.text, m.tone);
+    };
+    new Setting(el)
+      .setName("Trust the vault folder")
+      .setDesc(
+        `Marks this vault's folder as trusted in Code tabs, so extensions can run without the Restricted Mode banner and a Trust click. Only the vault folder is trusted: no other folder is, and Workspace Trust itself stays on. A change applies at the next tab load. When off, tabs open in Restricted Mode; to trust the folder yourself, ${MANUAL_TRUST_STEPS}.`,
+      )
+      .addToggle((t) => {
+        t.setValue(this.host.workbenchSettings().trustVaultFolder);
+        t.onChange(async (v) => {
+          await this.host.updateSettings({ trustVaultFolder: v });
+          drawMessage();
+        });
+      });
+    const messageEl = el.createDiv();
+    drawMessage();
   }
 
   // --- Restart ---------------------------------------------------------------

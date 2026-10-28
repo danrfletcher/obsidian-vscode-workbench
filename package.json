@@ -12,6 +12,7 @@
     "test": "vitest run --coverage",
     "check:render": "node tests/render/run.mjs",
     "check:user-data": "node tests/render/user-data-check.mjs",
+    "check:trust": "node tests/render/trust-check.mjs",
     "check:workbench": "node tests/render/workbench-check.mjs",
     "check:extensions-spike": "node tests/render/extension-spike.mjs"
   },

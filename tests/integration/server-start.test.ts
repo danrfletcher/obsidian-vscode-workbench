@@ -7,7 +7,7 @@ import * as http from "node:http";
 import * as net from "node:net";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ServerStartError, StartCancelledError, WorkbenchServer, checkServeWebSupport, findFreePort as freePort, type CodeBuild } from "../../src/server";
+import { ServerStartError, StartCancelledError, WorkbenchServer, checkServeWebSupport, findFreePort as freePort, heldPortsSnapshot, type CodeBuild } from "../../src/server";
 import { FAKE_CODE, isAlive, listenersOn, tempDir } from "../helpers";
 
 let runtimeDir: string;
@@ -119,6 +119,27 @@ describe("reuse (a second file reuses the one server)", () => {
     expect(b).toEqual(a);
     expect(c).toEqual(a);
     expect(serverPids()).toHaveLength(1);
+  });
+});
+
+describe("heldPortsSnapshot (the trust seed's keep-list)", () => {
+  it("holds a running server's port, loses it on stop, and is a copy a caller cannot use to change the real set", async () => {
+    const s = make();
+    const r = await s.ensureStarted();
+    const during = heldPortsSnapshot();
+    expect(during).toContain(r.port);
+    during.length = 0;
+    expect(heldPortsSnapshot()).toContain(r.port);
+    await s.stop();
+    expect(heldPortsSnapshot()).not.toContain(r.port);
+  });
+
+  it("lists two running servers sorted", async () => {
+    const [a, b] = [make(), make()];
+    const [ra, rb] = [await a.ensureStarted(), await b.ensureStarted()];
+    const snap = heldPortsSnapshot();
+    expect(snap).toEqual(expect.arrayContaining([ra.port, rb.port]));
+    expect(snap).toEqual([...snap].sort((x, y) => x - y));
   });
 });
 

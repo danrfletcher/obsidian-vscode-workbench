@@ -52,3 +52,52 @@ export function listTsFiles(dir: string): string[] {
   walk(dir, "");
   return out.sort();
 }
+
+/**
+ * A webview stand-in with a scripted `executeJavaScript`: it fires `dom-ready` once, after the first `src` is set
+ * (a webview does when its page has loaded), and answers the settings seed with `executeResult` and the trust seed
+ * (told apart by the database it opens) with `trustResult`. `executed` lists every script it was given, in order.
+ */
+export class FakeWebview {
+  attrs: Record<string, string> = {};
+  style: Record<string, string> = {};
+  children: FakeWebview[] = [];
+  text = "";
+  /** Every value `src` has been set to, in order. */
+  srcs: string[] = [];
+  executed: string[] = [];
+  autoDomReady = true;
+  executeResult: () => Promise<unknown> = async () => "seeded";
+  trustResult: () => Promise<unknown> = async () => "seeded";
+  private listeners: Record<string, (() => void)[]> = {};
+  constructor(public tag: string) {}
+  setAttribute(k: string, v: string) {
+    this.attrs[k] = v;
+    if (k === "src") {
+      this.srcs.push(v);
+      if (this.srcs.length === 1 && this.autoDomReady) setTimeout(() => this.fire("dom-ready"), 0);
+    }
+  }
+  addEventListener(name: string, fn: () => void) {
+    (this.listeners[name] ??= []).push(fn);
+  }
+  fire(name: string) {
+    for (const fn of this.listeners[name]?.splice(0) ?? []) fn();
+  }
+  executeJavaScript(code: string) {
+    this.executed.push(code);
+    return code.includes("vscode-web-state-db-global-shared") ? this.trustResult() : this.executeResult();
+  }
+  appendChild(c: FakeWebview) {
+    this.children.push(c);
+  }
+  addClass() {}
+  empty() {
+    this.children = [];
+    this.text = "";
+  }
+  createDiv(o: { text: string }) {
+    this.text = o.text;
+  }
+  remove() {}
+}

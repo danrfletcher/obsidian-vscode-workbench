@@ -1,11 +1,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BROWSER_APP_SETTINGS, USER_DATA_MARKER_KEY, buildBrowserSeedScript, buildMachineSettings, writeMachineSettings, type UserDataCopy } from "../../src/settings";
 import { excludeGlobs } from "../../src/server/user-data-seed";
 import { STOP_TEXT, describeExtensionsSection, describePort, renderExtensionsSection, type PortStatus, type SpikeResult } from "../../src/settings/extensions-section";
 import { SPIKE_RESULT } from "../../src/settings/spike-result";
-import { FakeNode } from "../mocks/obsidian";
+import { FakeNode, Setting } from "../mocks/obsidian";
+import { WorkbenchSettingTab, type SettingsHost } from "../../src/settings/settings-tab";
+import { DEFAULT_SETTINGS, type WorkbenchSettings } from "../../src/settings/data";
+import { MANUAL_TRUST_STEPS, describeTrust } from "../../src/trust/trust-message";
 import { tempDir } from "../helpers";
 
 describe("writeMachineSettings", () => {
@@ -385,5 +388,116 @@ describe("the Extensions section of the settings tab", () => {
     }
     expect(r.settingsRoute.arrives).toBe(true);
     expect(r.settingsRoute.decision).not.toContain("STOP");
+  });
+});
+
+describe("the \"Trust the vault folder\" toggle in the settings tab (G6, E3)", () => {
+  function openTab(initial: Partial<WorkbenchSettings> = {}, outcome: string | null | undefined = null) {
+    let current: WorkbenchSettings = { ...DEFAULT_SETTINGS, ...initial };
+    let last = outcome;
+    const updateSettings = vi.fn(async (patch: Partial<WorkbenchSettings>) => {
+      current = { ...current, ...patch };
+    });
+    const host: SettingsHost = {
+      restartServer: async () => undefined,
+      serverState: () => "running",
+      workbenchSettings: () => current,
+      updateSettings,
+      scanInstances: async () => ({ instances: [], rejected: [], customFailure: null }),
+      verifyCustomCli: async () => ({ ok: false, reason: "no" }),
+      codeCliOverride: () => undefined,
+      portStatus: () => ({ stored: null, current: null, note: null }),
+      spikeResult: () => null,
+      ...(last === undefined ? {} : { trustOutcome: () => last ?? null }),
+    };
+    Setting.reset();
+    const tab = new WorkbenchSettingTab({} as never, {} as never, host);
+    tab.display();
+    const toggle = () => Setting.all.find((s) => s.name === "Trust the vault folder")!;
+    const messages = () => (tab.containerEl as unknown as FakeNode).all().filter((n) => n.cls?.includes("workbench-message")).map((n) => n.text);
+    return { tab, host, updateSettings, toggle, messages, setOutcome: (o: string | null) => void (last = o), current: () => current };
+  }
+
+  it("renders the toggle next to the other toggles, on by default, with a description that says what it does", () => {
+    const { toggle } = openTab();
+    const names = Setting.all.map((s) => s.name);
+    expect(names.indexOf("Trust the vault folder")).toBe(names.indexOf("Shell") + 1);
+    expect(toggle().toggle?.value).toBe(true);
+    expect(toggle().desc).toContain("trusted");
+    expect(toggle().desc).toContain("Only the vault folder is trusted");
+    expect(toggle().desc).toContain("applies at the next tab load");
+    expect(toggle().desc).toContain("Workspaces: Manage Workspace Trust");
+  });
+
+  it("shows the stored value when it is off", () => {
+    expect(openTab({ trustVaultFolder: false }).toggle().toggle?.value).toBe(false);
+  });
+
+  it("onChange saves through updateSettings({ trustVaultFolder })", async () => {
+    const t = openTab();
+    await t.toggle().toggle!.handler!(false);
+    expect(t.updateSettings).toHaveBeenCalledTimes(1);
+    expect(t.updateSettings).toHaveBeenCalledWith({ trustVaultFolder: false });
+    expect(t.current().trustVaultFolder).toBe(false);
+    await t.toggle().toggle!.handler!(true);
+    expect(t.updateSettings).toHaveBeenLastCalledWith({ trustVaultFolder: true });
+  });
+
+  it("turning it off shows how to trust by hand, naming the command; turning it on again clears that line", async () => {
+    const t = openTab();
+    expect(t.messages().filter((m) => m.includes("Manage Workspace Trust"))).toEqual([]);
+    await t.toggle().toggle!.handler!(false);
+    expect(t.messages().join("\n")).toContain('"Workspaces: Manage Workspace Trust"');
+    expect(t.messages().join("\n")).toContain("Restricted Mode");
+    await t.toggle().toggle!.handler!(true);
+    expect(t.messages().filter((m) => m.includes("Manage Workspace Trust"))).toEqual([]);
+  });
+
+  it.each([
+    ["version-mismatch", "is not in the format this plugin knows"],
+    ["no-store", "has no place for the trust record"],
+    ["error:SecurityError", "the page refused the write (SecurityError)"],
+    ["timeout", "did not answer in time"],
+    ["unsupported", "cannot run scripts in the Code tab"],
+  ])("a %s outcome from the host shows a message that names the manual Trust command", (outcome, reason) => {
+    const t = openTab({}, outcome);
+    const text = t.messages().join("\n");
+    expect(text).toContain(reason);
+    expect(text).toContain('"Workspaces: Manage Workspace Trust"');
+    expect(text).toContain("then choose Trust");
+    expect(text).toContain("The Code tab still opens");
+  });
+
+  it("reads the outcome from the host each time the tab is displayed, not from anywhere else", () => {
+    const t = openTab({}, "timeout");
+    expect(t.messages().join("\n")).toContain("did not answer in time");
+    t.setOutcome("seeded");
+    t.tab.display();
+    const text = (t.tab.containerEl as unknown as FakeNode).textContent();
+    expect(text).toContain("The vault folder was trusted when the last Code tab loaded.");
+    expect(text).not.toContain("did not answer in time");
+  });
+
+  it("says nothing about the outcome before any tab has run the seed, and also when the host has no outcome method", () => {
+    expect(openTab({}, null).messages().filter((m) => /trusted/.test(m))).toEqual([]);
+    expect(openTab({}, undefined).messages().filter((m) => /trusted/.test(m))).toEqual([]);
+  });
+
+  it("with the toggle off, the off message wins over an old failure outcome", () => {
+    const text = openTab({ trustVaultFolder: false }, "timeout").messages().join("\n");
+    expect(text).toContain("Trusting is off");
+    expect(text).not.toContain("did not answer in time");
+  });
+});
+
+describe("describeTrust", () => {
+  it("covers every state in plain words", () => {
+    expect(describeTrust(true, null)).toBeNull();
+    expect(describeTrust(true, "seeded")).toEqual({ tone: "ok", text: "The vault folder was trusted when the last Code tab loaded." });
+    expect(describeTrust(false, "seeded")?.tone).toBe("info");
+    expect(describeTrust(true, "error:")?.text).toContain("(unknown error)");
+    expect(describeTrust(true, "something-new")?.text).toContain('the seed reported "something-new"');
+    expect(describeTrust(true, "no-store")?.tone).toBe("warning");
+    expect(MANUAL_TRUST_STEPS).toBe('run "Workspaces: Manage Workspace Trust" from the command palette, then choose Trust');
   });
 });

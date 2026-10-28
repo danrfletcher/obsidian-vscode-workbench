@@ -24,6 +24,12 @@ export interface WorkbenchSettings {
    * takes a free port and stores it. Only a whole number from 1024 to 65535 counts; anything else reads as null.
    */
   stablePort: number | null;
+  /**
+   * Seed VS Code's Workspace Trust record for the vault folder (and only that folder) at every tab load, so
+   * extensions run without the Restricted Mode banner. Default on. Off: nothing is seeded and the workbench
+   * shows the banner; a record that is already stored is left alone.
+   */
+  trustVaultFolder: boolean;
 }
 
 export const DEFAULT_SETTINGS: Readonly<WorkbenchSettings> = {
@@ -33,6 +39,7 @@ export const DEFAULT_SETTINGS: Readonly<WorkbenchSettings> = {
   nonCodeDrawer: true,
   shellPath: "",
   stablePort: null,
+  trustVaultFolder: true,
 };
 
 export const MIN_STABLE_PORT = 1024;
@@ -102,6 +109,7 @@ export function readSettings(raw: unknown): WorkbenchSettings {
     nonCodeDrawer: typeof o.nonCodeDrawer === "boolean" ? o.nonCodeDrawer : DEFAULT_SETTINGS.nonCodeDrawer,
     shellPath: typeof o.shellPath === "string" ? o.shellPath.trim() : DEFAULT_SETTINGS.shellPath,
     stablePort: portOrNull(o.stablePort),
+    trustVaultFolder: typeof o.trustVaultFolder === "boolean" ? o.trustVaultFolder : DEFAULT_SETTINGS.trustVaultFolder,
   };
 }
 

@@ -1,52 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceLeaf } from "../mocks/obsidian";
-import { CodeView, VIEW_TYPE_CODE, baseName, logSeedOutcome, runInWebview, type CodeViewHost } from "../../src/code-view";
+import { CodeView, VIEW_TYPE_CODE, baseName, logSeedOutcome, logTrustOutcome, runInWebview, runScriptsInWebview, type CodeViewHost } from "../../src/code-view";
 import { LicenceDeclinedError } from "../../src/licence";
 import { BROWSER_APP_SETTINGS, buildBrowserSeedScript } from "../../src/settings";
-
-class FakeEl {
-  attrs: Record<string, string> = {};
-  style: Record<string, string> = {};
-  children: FakeEl[] = [];
-  text = "";
-  /** Every value `src` has been set to, in order. */
-  srcs: string[] = [];
-  executed: string[] = [];
-  /** Fire `dom-ready` after the first src is set (a webview does once its page has loaded). */
-  autoDomReady = true;
-  executeResult: () => Promise<unknown> = async () => "seeded";
-  private listeners: Record<string, (() => void)[]> = {};
-  constructor(public tag: string) {}
-  setAttribute(k: string, v: string) {
-    this.attrs[k] = v;
-    if (k === "src") {
-      this.srcs.push(v);
-      if (this.srcs.length === 1 && this.autoDomReady) setTimeout(() => this.fire("dom-ready"), 0);
-    }
-  }
-  addEventListener(name: string, fn: () => void) {
-    (this.listeners[name] ??= []).push(fn);
-  }
-  fire(name: string) {
-    for (const fn of this.listeners[name]?.splice(0) ?? []) fn();
-  }
-  executeJavaScript(code: string) {
-    this.executed.push(code);
-    return this.executeResult();
-  }
-  appendChild(c: FakeEl) {
-    this.children.push(c);
-  }
-  addClass() {}
-  empty() {
-    this.children = [];
-    this.text = "";
-  }
-  createDiv(o: { text: string }) {
-    this.text = o.text;
-  }
-  remove() {}
-}
+import { FakeWebview as FakeEl } from "../helpers";
+import { buildTrustSeedScript } from "../../src/trust/trust-seed";
 
 function makeView(host: Partial<CodeViewHost> = {}) {
   const full: CodeViewHost = {
@@ -349,6 +307,261 @@ describe("the seed outcome is logged (PR-1 R9)", () => {
     expect(debug).toHaveBeenCalledTimes(1);
     logSeedOutcome("timeout");
     expect(warn.mock.calls.flat().join(" ")).toContain("timeout");
+    debug.mockRestore();
+    warn.mockRestore();
+  });
+});
+
+describe("runScriptsInWebview", () => {
+  it("runs every script after the same dom-ready, in order, and answers one outcome each", async () => {
+    const el = new FakeEl("webview");
+    const order: string[] = [];
+    el.executeJavaScript = (code: string) => {
+      order.push(code);
+      return Promise.resolve(`done:${code}`);
+    };
+    const ready = runScriptsInWebview(el as never, ["a", "b"], 1000);
+    el.fire("dom-ready");
+    expect(await ready).toEqual(["done:a", "done:b"]);
+    expect(order).toEqual(["a", "b"]);
+  });
+
+  it("a script that fails or never answers does not stop the next one", async () => {
+    const el = new FakeEl("webview");
+    const answers: Array<() => Promise<unknown>> = [() => Promise.reject(new Error("rejected")), () => new Promise(() => undefined), async () => "ok"];
+    el.executeJavaScript = () => answers.shift()!();
+    const ready = runScriptsInWebview(el as never, ["a", "b", "c"], 30);
+    el.fire("dom-ready");
+    expect(await ready).toEqual(["error:rejected", "timeout", "ok"]);
+  });
+
+  it("a non-Error rejection is reported by its text, and a throw before a promise exists is an error outcome too", async () => {
+    const el = new FakeEl("webview");
+    const answers: Array<() => Promise<unknown>> = [() => Promise.reject("plain"), () => { throw new Error("sync"); }];
+    el.executeJavaScript = () => answers.shift()!();
+    const ready = runScriptsInWebview(el as never, ["a", "b"], 1000);
+    el.fire("dom-ready");
+    expect(await ready).toEqual(["error:plain", "error:sync"]);
+  });
+
+  it("answers timeout for every script when the page never reports dom-ready, and runs none", async () => {
+    const el = new FakeEl("webview");
+    expect(await runScriptsInWebview(el as never, ["a", "b"], 20)).toEqual(["timeout", "timeout"]);
+    el.fire("dom-ready"); // late: nothing runs now
+    await new Promise((r) => setTimeout(r, 0));
+    expect(el.executed).toEqual([]);
+  });
+
+  it("answers unsupported for every script when the element has no executeJavaScript", async () => {
+    const el = new FakeEl("webview");
+    (el as unknown as { executeJavaScript?: unknown }).executeJavaScript = undefined;
+    const ready = runScriptsInWebview(el as never, ["a", "b"], 1000);
+    el.fire("dom-ready");
+    expect(await ready).toEqual(["unsupported", "unsupported"]);
+    el.fire("dom-ready");
+    const one = new FakeEl("webview");
+    (one as unknown as { executeJavaScript?: unknown }).executeJavaScript = undefined;
+    const single = runInWebview(one as never, "x", 1000);
+    one.fire("dom-ready");
+    expect(await single).toBe("unsupported");
+  });
+});
+
+describe("the trust seed in loadWorkbench (G5, G6, E3, GP3)", () => {
+  const expectedScript = (port = 5555, held: number[] = [port], vault = "/Users/dan/My Vault") =>
+    buildTrustSeedScript({ origin: `http://127.0.0.1:${port}`, folderUri: `vscode-remote://127.0.0.1:${port}${vault.split("/").map(encodeURIComponent).join("/")}`, heldPorts: held });
+  const on = (extra: Partial<CodeViewHost> = {}): Partial<CodeViewHost> => ({ trustVaultFolder: () => true, heldPorts: () => [5555], noteTrustOutcome: vi.fn(), ...extra });
+
+  it("with the setting on, runs the settings seed and then the trust seed, from the same page, before the workbench src is set", async () => {
+    const { view, el } = makeView(on());
+    await view.setState({ file: "a.py" }, {} as never);
+    const wv = el.children[0];
+    expect(wv.executed).toEqual([buildBrowserSeedScript(), expectedScript()]);
+    expect(wv.srcs).toHaveLength(2);
+    expect(wv.srcs[0]).toBe("http://127.0.0.1:5555/"); // both ran on the bare origin
+    expect(wv.srcs[1]).toContain("tkn=tok123");
+    expect(wv.executed[1]).not.toContain("tok123");
+    expect(wv.executed[1]).toContain('"path":"/Users/dan/My Vault"');
+  });
+
+  it("runs on every load: a second tab and a reload each run it again", async () => {
+    const { view: first, el: firstEl } = makeView(on());
+    await first.setState({ file: "a.py" }, {} as never);
+    const { view: second, el: secondEl } = makeView(on());
+    await second.setState({ file: "b.py" }, {} as never);
+    expect(firstEl.children[0].executed.filter((c) => c.includes("content.trust.model.key"))).toHaveLength(1);
+    expect(secondEl.children[0].executed.filter((c) => c.includes("content.trust.model.key"))).toHaveLength(1);
+    let notify: (s: "stopped-by-idle") => void = () => undefined;
+    const reload = makeView(on({ onServerState: ((cb: (s: "stopped-by-idle") => void) => { notify = cb; return () => undefined; }) as never }));
+    await reload.view.onOpen();
+    await reload.view.setState({ file: "a.py" }, {} as never);
+    notify("stopped-by-idle");
+    await reload.view.setState({ file: "a.py" }, {} as never); // stale: reloads
+    expect(reload.el.children.flatMap((c) => c.executed).filter((c) => c.includes("content.trust.model.key"))).toHaveLength(1); // the reload built a fresh element
+  });
+
+  it("with the setting off, never runs the trust script, and tells the host nothing", async () => {
+    const noteTrustOutcome = vi.fn();
+    const { view, el } = makeView({ trustVaultFolder: () => false, heldPorts: () => [5555], noteTrustOutcome });
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].executed).toEqual([buildBrowserSeedScript()]);
+    expect(noteTrustOutcome).not.toHaveBeenCalled();
+  });
+
+  it("without the host methods (an older host), runs only the settings seed", async () => {
+    const { view, el } = makeView();
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].executed).toEqual([buildBrowserSeedScript()]);
+  });
+
+  it("reads the setting at every load: the toggle applies at the next tab load", async () => {
+    let enabled = true;
+    const { view, el } = makeView(on({ trustVaultFolder: () => enabled }));
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].executed).toHaveLength(2);
+    enabled = false;
+    await view.setState({ file: "b.py" }, {} as never);
+    expect(el.children[0].executed).toHaveLength(1);
+  });
+
+  it("passes the ports of running servers, and a missing list as an empty one", async () => {
+    const a = makeView(on({ heldPorts: () => [5555, 6000] }));
+    await a.view.setState({ file: "a.py" }, {} as never);
+    expect(a.el.children[0].executed[1]).toBe(expectedScript(5555, [5555, 6000]));
+    const b = makeView({ trustVaultFolder: () => true });
+    await b.view.setState({ file: "a.py" }, {} as never);
+    expect(b.el.children[0].executed[1]).toBe(expectedScript(5555, []));
+  });
+
+  it("a restart passes the new port", async () => {
+    const { view, el } = makeView(
+      on({
+        ensureServer: async () => ({ baseUrl: "http://127.0.0.1:6001", port: 6001, token: "tok999" }),
+        heldPorts: () => [6001, 7000],
+      }),
+    );
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].executed[1]).toBe(expectedScript(6001, [6001, 7000]));
+  });
+
+  it("logs the outcome to the console and hands it to the host", async () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    const noteTrustOutcome = vi.fn();
+    const { view } = makeView(on({ noteTrustOutcome }));
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(debug.mock.calls.flat().join(" ")).toContain("vault folder trusted");
+    expect(noteTrustOutcome).toHaveBeenCalledWith("seeded");
+    debug.mockRestore();
+  });
+
+  const stubWebviews = (setup: (e: FakeEl) => void) =>
+    vi.stubGlobal("document", {
+      createElement: (t: string) => {
+        const e = new FakeEl(t);
+        setup(e);
+        return e;
+      },
+    });
+
+  it.each(["version-mismatch", "no-store", "error:SecurityError"])(
+    "still opens the workbench when the trust seed answers %s, warns with the manual steps, and tells the host",
+    async (outcome) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const noteTrustOutcome = vi.fn();
+      const { view, el } = makeView(on({ noteTrustOutcome }));
+      stubWebviews((e) => (e.trustResult = async () => outcome));
+      await view.setState({ file: "a.py" }, {} as never);
+      expect(el.children[0].srcs[1]).toContain("tkn=tok123");
+      expect(noteTrustOutcome).toHaveBeenCalledWith(outcome);
+      const text = warn.mock.calls.flat().join(" ");
+      expect(text).toContain(outcome);
+      expect(text).toContain("Workspaces: Manage Workspace Trust");
+      warn.mockRestore();
+    },
+  );
+
+  it("a rejected trust script is an error outcome and the tab still opens", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const noteTrustOutcome = vi.fn();
+    const { view, el } = makeView(on({ noteTrustOutcome }));
+    stubWebviews((e) =>
+      (e.trustResult = async () => {
+        throw new Error("Script failed to execute");
+      }),
+    );
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].srcs[1]).toContain("tkn=tok123");
+    expect(noteTrustOutcome).toHaveBeenCalledWith("error:Script failed to execute");
+    warn.mockRestore();
+  });
+
+  it("a webview without executeJavaScript: both seeds answer unsupported and the tab still opens", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const noteTrustOutcome = vi.fn();
+    const { view, el } = makeView(on({ noteTrustOutcome }));
+    stubWebviews((e) => ((e as unknown as { executeJavaScript?: unknown }).executeJavaScript = undefined));
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].srcs[1]).toContain("tkn=tok123");
+    expect(noteTrustOutcome).toHaveBeenCalledWith("unsupported");
+    warn.mockRestore();
+  });
+
+  it("a page that never reports dom-ready: the seeds time out and the tab still opens", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const noteTrustOutcome = vi.fn();
+      const { view, el } = makeView(on({ noteTrustOutcome }));
+      stubWebviews((e) => (e.autoDomReady = false));
+      const loading = view.setState({ file: "a.py" }, {} as never);
+      await vi.advanceTimersByTimeAsync(8001);
+      await loading;
+      expect(el.children[0].executed).toEqual([]);
+      expect(el.children[0].srcs[1]).toContain("tkn=tok123");
+      expect(noteTrustOutcome).toHaveBeenCalledWith("timeout");
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("an iframe tab runs no seed at all, so no trust script", async () => {
+    const noteTrustOutcome = vi.fn();
+    const { view, el } = makeView(on({ embedElement: () => "iframe", noteTrustOutcome }));
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].executed).toEqual([]);
+    expect(noteTrustOutcome).not.toHaveBeenCalled();
+  });
+
+  it("a vault folder the seed refuses to name (the file system root) logs why, opens the tab in Restricted Mode and tells the host", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const noteTrustOutcome = vi.fn();
+    const { view, el } = makeView(on({ vaultRoot: () => "/", noteTrustOutcome }));
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].executed).toEqual([buildBrowserSeedScript()]);
+    expect(el.children[0].srcs[1]).toContain("tkn=tok123");
+    expect(warn.mock.calls.flat().join(" ")).toContain("file system root");
+    expect(noteTrustOutcome).toHaveBeenCalledWith("error:Error");
+    warn.mockRestore();
+  });
+
+  it("a vault path with spaces and non-ASCII characters is encoded like the URL builder's, and recorded decoded", async () => {
+    const vault = "/Users/dan/Mon Coffre/Zürich 文件";
+    const { view, el } = makeView(on({ vaultRoot: () => vault }));
+    await view.setState({ file: "a.py" }, {} as never);
+    const script = el.children[0].executed[1];
+    expect(script).toBe(expectedScript(5555, [5555], vault));
+    expect(script).toContain(`"path":${JSON.stringify(vault)}`);
+  });
+
+  it("logTrustOutcome: seeded is a debug line, anything else a warning that names the manual command", () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    logTrustOutcome("seeded");
+    expect(warn).not.toHaveBeenCalled();
+    expect(debug).toHaveBeenCalledTimes(1);
+    logTrustOutcome("no-store");
+    expect(warn.mock.calls.flat().join(" ")).toMatch(/no-store.*Workspaces: Manage Workspace Trust/);
     debug.mockRestore();
     warn.mockRestore();
   });

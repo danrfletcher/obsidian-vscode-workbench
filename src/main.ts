@@ -23,6 +23,7 @@ import {
   cachedServerCommits,
   checkServeWebSupport,
   findNewestBuild,
+  heldPortsSnapshot,
   removePartialDownloads,
   type CodeBuild,
   type PortPick,
@@ -114,6 +115,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private cachedBefore: ReadonlySet<string> = new Set();
   /** Why the last start did not use the stored stable port (null when it did, or none is stored). */
   private portNote: string | null = null;
+  /** What the trust seed answered at the last Code tab load that ran it; shown in settings. In memory only: nothing about it is stored. */
+  private lastTrustOutcome: string | null = null;
   /** Tests only: replaces the reachability check that turns a failed download into "the network is unreachable". */
   private downloadHostReachable?: () => Promise<boolean>;
 
@@ -423,6 +426,24 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   workbenchOverlay(): Record<string, unknown> {
     return workbenchOverlay({ dark: this.isDark() });
+  }
+
+  /** Read at every tab load, so the toggle applies at the next load (G6). */
+  trustVaultFolder(): boolean {
+    return this.workbenchSettings().trustVaultFolder;
+  }
+
+  heldPorts(): readonly number[] {
+    return heldPortsSnapshot();
+  }
+
+  noteTrustOutcome(outcome: string): void {
+    this.lastTrustOutcome = outcome;
+  }
+
+  /** The trust seed's last answer, for the settings tab (SettingsHost). null until a Code tab has loaded with the seed on. */
+  trustOutcome(): string | null {
+    return this.lastTrustOutcome;
   }
 
   autoSave(): AutoSave {
