@@ -140,6 +140,13 @@ const activations = (serverData) => {
   return fs.existsSync(f) ? fs.readFileSync(f, "utf8").split("\n").filter(Boolean).length : 0;
 };
 
+// What the plugin shares since PR-5: the extensions the profile lists. This check has no desktop state, so it shares every entry of the folder's own extensions.json.
+function listedIn(dir) {
+  const file = path.join(dir, "extensions.json");
+  if (!fs.existsSync(file)) return [];
+  return JSON.parse(fs.readFileSync(file, "utf8")).map((entry) => ({ id: String(entry.identifier?.id ?? "").toLowerCase(), folder: entry.relativeLocation, entry }));
+}
+
 const cliData = path.join(work, "cli-data");
 if (haveServer) fs.cpSync(CLI_DATA_SRC, cliData, { recursive: true, mode: fs.constants.COPYFILE_FICLONE });
 else fs.mkdirSync(cliData, { recursive: true });
@@ -148,7 +155,7 @@ else fs.mkdirSync(cliData, { recursive: true });
 async function startServer(name, port) {
   const serverData = path.join(work, `server-data-${name}`);
   fs.mkdirSync(serverData, { recursive: true });
-  pluginServer.shareExtensions(extSrc, serverData);
+  pluginServer.shareExtensions(extSrc, serverData, listedIn(extSrc));
   const token = crypto.randomBytes(12).toString("hex");
   const tokenFile = path.join(work, `token-${name}`);
   fs.writeFileSync(tokenFile, token, { mode: 0o600 });

@@ -38,6 +38,7 @@ import { EmbedKeyRelay, type RelayFrame } from "./hotkey/embed-key-relay";
 import { resolveChords, type BridgeAction, type HotkeyLike } from "./hotkey/hotkey-bridge";
 import { profileForInstance, userDataRootFor, type ProfileState } from "./profile/mirrored-profile";
 import type { MirrorRequest, MirrorResult } from "./mirror/mirror";
+import { MirrorStateCache, profileExtensionsFile } from "./server/shared-extensions";
 import { instanceUserDir, seedUserData } from "./server/user-data-seed";
 import { dataObject, effectiveShell, readSettings, type WorkbenchSettings } from "./settings/data";
 import { type PortStatus, type SpikeResult } from "./settings/extensions-section";
@@ -127,6 +128,12 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private profileStale = true;
   /** What the last server start read of desktop VS Code's disabled lists (read, snapshot or none); null until a start has read them. Shown in settings. */
   private mirror: MirrorResult | null = null;
+  /**
+   * Everything the last read of desktop VS Code gave: the disabled lists and the profile's extension list. Every start
+   * shares from it; it is read again only when the profile is (Obsidian start, Restart server, another instance), never
+   * on an idle restart.
+   */
+  private mirrorCache = new MirrorStateCache();
   /** What the trust seed answered at the last Code tab load that ran it; shown in settings. In memory only: nothing about it is stored. */
   private lastTrustOutcome: string | null = null;
   /** Tests only: replaces the reachability check that turns a failed download into "the network is unreachable". */
@@ -620,8 +627,12 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       // The server for this VS Code build is not on disk yet: the start below downloads it (this is the progress notice).
       new Notice("VS Code Workbench: downloading the VS Code server. The first run needs internet and can take a minute.", 8000);
     }
-    this.mirrorProfile(chosen);
-    this.mirror = null; // the new start reads the lists again; until it has, settings says "not read yet"
+    const reread = this.mirrorProfile(chosen);
+    const extensionsFile = this.profileExtensionsFile(build);
+    const stateKey = `${this.profileSource}|${this.profile.status === "resolved" ? this.profile.profile.location : ""}|${extensionsFile ?? ""}`;
+    // An idle restart (nothing asked for a new read, same place) shares from the state it already has: no sqlite3, no re-read of the profile's list.
+    const reuse = this.mirrorCache.forStart(stateKey, reread);
+    this.mirror = reuse ? reuse.disabled : null; // a new read: until it has finished, settings says "not read yet"
     const server = new WorkbenchServer({
       build: o.commitOverride ? { ...build, commit: o.commitOverride } : build,
       runtimeDir,
@@ -633,8 +644,13 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       storedPort: this.workbenchSettings().stablePort,
       onPortPick: (pick) => this.notePort(pick),
       mirror: this.mirrorRequest(chosen),
+      profileExtensionsFile: extensionsFile,
+      reuseMirror: reuse,
       onMirror: (result) => {
         if (!this.unloaded) this.mirror = result;
+      },
+      onMirrorState: (state) => {
+        if (!this.unloaded) this.mirrorCache.keep(stateKey, state);
       },
     });
     writeMachineSettings(server.serverDataDir, { dark: this.isDark() });
@@ -672,11 +688,13 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
    * (an idle restart on the same instance keeps the result, G2). A start on a different instance (or user-data
    * folder) than the one the result was read for reads again, so settings never shows another instance's profile
    * (E6, F9). It only reads, and a failure is a result shown in settings: the start goes on.
+   * Returns whether it read (true) or kept the result it had (false); the disabled lists and the profile's extension
+   * list are read again exactly when this is true.
    */
-  private mirrorProfile(instance: Instance): void {
+  private mirrorProfile(instance: Instance): boolean {
     const found = userDataRootFor({ instance, appSupport: appSupportRoot(), configuredFolder: this.data_.userDataFolder });
     const source = "root" in found ? `root:${found.root}` : `reason:${found.reason}`;
-    if (!this.profileStale && source === this.profileSource) return;
+    if (!this.profileStale && source === this.profileSource) return false;
     this.profileStale = false;
     this.profileSource = source;
     try {
@@ -689,6 +707,12 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     } catch {
       this.profile = { status: "unavailable", reason: "the lookup failed" };
     }
+    return true;
+  }
+
+  /** The mirrored profile's `extensions.json` (its own, or Default's for Default and for a profile that reads Default's); null when the profile is unknown. */
+  private profileExtensionsFile(build: CodeBuild): string | null {
+    return this.profile.status === "resolved" ? profileExtensionsFile(this.profile.profile, build.extensionsDir) : null;
   }
 
   mirroredProfile(): ProfileState {
@@ -712,6 +736,11 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   /** The disabled-list read of the last server start, for settings. */
   disabledLists(): MirrorResult | null {
     return this.mirror;
+  }
+
+  /** Shared links whose extension folder has been removed since the last start (E5). Read-only; the next start rebuilds the set. */
+  danglingExtensionLinks(): string[] {
+    return this.manager.serverInstance?.danglingLinks() ?? [];
   }
 
   userDataCopy(): UserDataCopy | null {

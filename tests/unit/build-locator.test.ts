@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { compareVersions, findNewestBuild, parseVersion, rewriteExtensionsJson, shareExtensions } from "../../src/server";
+import { readProfileExtensions, type ProfileExtension } from "../../src/server/shared-extensions";
 import { tempDir } from "../helpers";
 
 function fakeInstall(root: string, name: string, version: string, dataFolderName: string, commit?: string): string {
@@ -55,20 +56,21 @@ describe("findNewestBuild", () => {
 });
 
 describe("shareExtensions (F3: the instance's folder is only read)", () => {
+  /** An instance's extensions folder whose own extensions.json lists both extensions (the Default profile's list). */
   function instanceExtensions(): string {
     const dir = path.join(tempDir(), "extensions");
     fs.mkdirSync(path.join(dir, "ms-python.python-1.0"), { recursive: true });
     fs.writeFileSync(path.join(dir, "ms-python.python-1.0", "package.json"), "{}");
     fs.mkdirSync(path.join(dir, "ms-python.vscode-pylance-2.0"), { recursive: true });
-    fs.writeFileSync(path.join(dir, "extensions.json"), '[{"id":"ms-python.python"}]');
+    fs.writeFileSync(path.join(dir, "extensions.json"), JSON.stringify([realEntry(dir, "ms-python.python", "1.0"), realEntry(dir, "ms-python.vscode-pylance", "2.0")]));
     fs.writeFileSync(path.join(dir, ".obsolete"), "{}");
     return dir;
   }
 
-  it("symlinks each extension dir, copies extensions.json and skips dotfiles", () => {
+  it("symlinks each listed extension dir, writes extensions.json and skips dotfiles", () => {
     const src = instanceExtensions();
     const data = tempDir();
-    expect(shareExtensions(src, data)).toEqual({ linked: 2 });
+    expect(shareExtensions(src, data, listedIn(src))).toEqual({ linked: 2 });
     const t = path.join(data, "extensions");
     expect(fs.lstatSync(path.join(t, "ms-python.python-1.0")).isSymbolicLink()).toBe(true);
     expect(fs.readFileSync(path.join(t, "ms-python.python-1.0", "package.json"), "utf8")).toBe("{}");
@@ -80,7 +82,7 @@ describe("shareExtensions (F3: the instance's folder is only read)", () => {
     const src = instanceExtensions();
     const before = fs.readdirSync(src).sort();
     const json = fs.readFileSync(path.join(src, "extensions.json"), "utf8");
-    shareExtensions(src, tempDir());
+    shareExtensions(src, tempDir(), listedIn(src));
     // editing the copy must not reach the original
     expect(fs.readdirSync(src).sort()).toEqual(before);
     expect(fs.readFileSync(path.join(src, "extensions.json"), "utf8")).toBe(json);
@@ -89,24 +91,30 @@ describe("shareExtensions (F3: the instance's folder is only read)", () => {
   it("drops links to extensions that were removed since the last run", () => {
     const src = instanceExtensions();
     const data = tempDir();
-    shareExtensions(src, data);
+    shareExtensions(src, data, listedIn(src));
     fs.rmSync(path.join(src, "ms-python.vscode-pylance-2.0"), { recursive: true });
-    shareExtensions(src, data);
+    shareExtensions(src, data, listedIn(src)); // the profile still lists it, its folder is gone
     expect(fs.readdirSync(path.join(data, "extensions")).sort()).toEqual(["extensions.json", "ms-python.python-1.0"]);
+    const entries = JSON.parse(fs.readFileSync(path.join(data, "extensions", "extensions.json"), "utf8")) as { relativeLocation: string }[];
+    expect(entries.map((e) => e.relativeLocation)).toEqual(["ms-python.python-1.0"]);
   });
 
-  it("skips a dangling symlink in the instance's extensions folder instead of failing the start (PR-1 R6)", () => {
+  it("skips a dangling symlink in the instance's extensions folder instead of failing the start (PR-1 R6): linked nowhere, no entry", () => {
     const src = instanceExtensions();
     fs.symlinkSync(path.join(src, "gone-for-good"), path.join(src, "dangling.ext-1.0"), "dir");
+    const list = JSON.parse(fs.readFileSync(path.join(src, "extensions.json"), "utf8")) as unknown[];
+    fs.writeFileSync(path.join(src, "extensions.json"), JSON.stringify([...list, realEntry(src, "dangling.ext", "1.0")]));
     const data = tempDir();
-    expect(shareExtensions(src, data)).toEqual({ linked: 2 });
+    expect(shareExtensions(src, data, listedIn(src))).toEqual({ linked: 2 });
     expect(fs.readdirSync(path.join(data, "extensions")).sort()).toEqual(["extensions.json", "ms-python.python-1.0", "ms-python.vscode-pylance-2.0"]);
+    expect(fs.readFileSync(path.join(data, "extensions", "extensions.json"), "utf8")).not.toContain("dangling");
   });
 
-  it("creates an empty extensions dir when the instance has none", () => {
+  it("creates an empty extensions dir and an empty list when the instance has none", () => {
     const data = tempDir();
-    expect(shareExtensions(null, data)).toEqual({ linked: 0 });
+    expect(shareExtensions(null, data, [])).toEqual({ linked: 0 });
     expect(fs.existsSync(path.join(data, "extensions"))).toBe(true);
+    expect(fs.readFileSync(path.join(data, "extensions", "extensions.json"), "utf8")).toBe("[]");
   });
 });
 
@@ -120,6 +128,13 @@ function realEntry(dir: string, id: string, version: string): Record<string, unk
     relativeLocation: folder,
     metadata: { installedTimestamp: 1772655254049, pinned: false, source: "gallery", updated: false, private: false },
   };
+}
+
+/** The extensions an instance's own extensions.json lists, read the way a start reads it. */
+function listedIn(dir: string): ProfileExtension[] {
+  const r = readProfileExtensions(path.join(dir, "extensions.json"));
+  if (!r.ok) throw new Error(r.why);
+  return r.extensions;
 }
 
 describe("extensions.json holds no path into the instance's folder (F3)", () => {
@@ -140,7 +155,7 @@ describe("extensions.json holds no path into the instance's folder (F3)", () => 
   it("rewrites every location to the symlink under the server data dir; nothing under sourceDir remains", () => {
     const { src, names } = realInstance();
     const data = tempDir();
-    shareExtensions(src, data);
+    shareExtensions(src, data, listedIn(src));
     const target = path.join(data, "extensions");
     const raw = fs.readFileSync(path.join(target, "extensions.json"), "utf8");
     expect(raw).not.toContain(src);
@@ -180,7 +195,7 @@ describe("extensions.json holds no path into the instance's folder (F3)", () => 
   it("removing an extension through the shared link (uninstall in the embed) leaves the instance's folder intact", () => {
     const { src, names } = realInstance();
     const data = tempDir();
-    shareExtensions(src, data);
+    shareExtensions(src, data, listedIn(src));
     const link = path.join(data, "extensions", names[0]);
     fs.rmSync(link, { recursive: true, force: true });
     expect(fs.existsSync(link)).toBe(false);

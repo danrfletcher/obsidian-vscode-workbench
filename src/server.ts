@@ -19,6 +19,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ChildRegistry } from "./child-registry";
 import { mirrorDisabled, mirrorTmpRoot, type MirrorRequest, type MirrorResult, type MirrorOptions } from "./mirror/mirror";
+import {
+  danglingSharedLinks,
+  enabledExtensions,
+  EXTENSIONS_LIST_FILE,
+  readProfileExtensions,
+  type MirrorState,
+  type ProfileExtension,
+} from "./server/shared-extensions";
 import { isAlive, listDescendants, pidsWithCommandContaining, signal, signalGroup } from "./process-utils";
 
 export { descendantsFromPs, listDescendants } from "./process-utils";
@@ -259,36 +267,45 @@ function isDirectory(p: string): boolean {
 }
 
 /**
- * Make the chosen build's installed extensions visible to the server without
- * touching that build's folder (F3): each extension directory is symlinked into
- * the plugin-owned server data dir, and extensions.json is rewritten (see
- * rewriteExtensionsJson) rather than copied or linked.
+ * Make exactly the enabled extensions visible to the server without touching the
+ * build's folder (F3). Every symlink under `<serverDataDir>/extensions` is removed
+ * first (a link is unlinked, never what it points at, so nothing in the instance's
+ * folder is touched), then each extension in `enabled` whose folder is in
+ * `sourceDir` is symlinked, and extensions.json is written from those entries only
+ * (see rewriteExtensionsJson: every `location` is the same-named link). An entry
+ * whose folder is missing or dangling is skipped and not written; a folder in
+ * `sourceDir` that `enabled` does not name is not shared. With nothing enabled
+ * there are no links and extensions.json is `[]`.
  * serve-web has no --extensions-dir flag, so this is how sharing is done.
  */
-export function shareExtensions(sourceDir: string | null, serverDataDir: string): { linked: number } {
+export function shareExtensions(sourceDir: string | null, serverDataDir: string, enabled: readonly ProfileExtension[]): { linked: number } {
   const target = path.join(serverDataDir, "extensions");
   fs.mkdirSync(target, { recursive: true });
-  if (!sourceDir || !fs.existsSync(sourceDir)) return { linked: 0 };
-  // Drop links from a previous run so removed extensions disappear.
+  // The previous start's set goes first, extensions.json included if it was ever a link, so the write below can never go through one.
   for (const name of fs.readdirSync(target)) {
     const p = path.join(target, name);
-    if (fs.lstatSync(p).isSymbolicLink()) fs.unlinkSync(p); // unlink the link itself, never the instance's folder
+    if (fs.lstatSync(p).isSymbolicLink()) fs.unlinkSync(p);
   }
-  let linked = 0;
-  for (const name of fs.readdirSync(sourceDir)) {
-    const src = path.join(sourceDir, name);
-    const dst = path.join(target, name);
-    if (name === "extensions.json") {
-      fs.writeFileSync(dst, rewriteExtensionsJson(fs.readFileSync(src, "utf8"), target));
-    } else if (name.startsWith(".")) {
-      continue;
-    } else if (isDirectory(src)) {
-      if (!fs.existsSync(dst)) fs.symlinkSync(src, dst, "dir");
-      linked++;
+  const shared: Record<string, unknown>[] = [];
+  if (sourceDir) {
+    for (const ext of enabled) {
+      const src = path.join(sourceDir, ext.folder);
+      const dst = path.join(target, ext.folder);
+      if (!isDirectory(src)) continue; // removed, or a dangling link
+      try {
+        fs.symlinkSync(src, dst, "dir");
+      } catch {
+        continue; // something that is not ours already sits at that name: it is neither linked nor listed
+      }
+      shared.push(ext.entry);
     }
   }
-  return { linked };
+  fs.writeFileSync(path.join(target, EXTENSIONS_LIST_FILE), rewriteExtensionsJson(JSON.stringify(shared), target));
+  return { linked: shared.length };
 }
+
+/** Shared links whose extension folder has since gone (E5): read-only, for the settings list to call when it opens. */
+export { danglingSharedLinks };
 
 // ---------------------------------------------------------------------------
 // Ports and probing
@@ -589,6 +606,18 @@ export interface ServerOptions {
   mirror?: MirrorRequest;
   /** Called with the mirror's answer as soon as the read is done, before anything is shared or spawned. */
   onMirror?: (result: MirrorResult) => void;
+  /**
+   * The profile's `extensions.json` (PR-5): the list the shared set is taken from. Read once, together with the
+   * disabled lists, whenever those are read; null = cannot be located, so nothing is shared.
+   */
+  profileExtensionsFile?: string | null;
+  /**
+   * The state of an earlier read to share from instead of reading again (an idle restart, G2): no `sqlite3` call and
+   * no read of the profile's `extensions.json`. Only the plugin passes it, and only when nothing asked for a new read.
+   */
+  reuseMirror?: MirrorState | null;
+  /** Called with everything a read produced (the disabled lists and the profile's list), for the plugin to keep. */
+  onMirrorState?: (state: MirrorState) => void;
   /** Tests only: the file system and `sqlite3` runner the read uses. */
   mirrorDeps?: MirrorOptions["deps"];
 }
@@ -619,6 +648,7 @@ export class WorkbenchServer {
   private exit: ExitInfo | null = null;
   private exitListeners: Array<(info: ExitInfo) => void> = [];
   private mirrorResult: MirrorResult | null = null;
+  private mirrorState: MirrorState | null = null;
   private mirrorAbort: AbortController | null = null;
 
   constructor(private readonly opts: ServerOptions) {}
@@ -686,13 +716,15 @@ export class WorkbenchServer {
     fs.mkdirSync(this.serverDataDir, { recursive: true });
     fs.mkdirSync(cliDataDir, { recursive: true });
 
-    // Read desktop VS Code's disabled lists once per start, before any extension is shared (PR-5 shares only
-    // the enabled ones). A failed read is an answer (snapshot, or none), never an error: the start goes on.
+    // Read desktop VS Code's disabled lists and the profile's extension list once per read (Restart server or
+    // Obsidian start; an idle restart reuses the earlier state), before any extension is shared. A failed read is
+    // an answer (snapshot, or none), never an error: the start goes on.
     await this.readMirror();
     if (this.stopRequested) throw new StartCancelledError(); // stop() came in during the read: its temp copy is already gone
 
     const token = createTokenFile(tokenFile);
-    shareExtensions(build.extensionsDir, this.serverDataDir);
+    // Only now, with the previous server already stopped (restart awaits stop before it creates the next one), are the links rebuilt.
+    shareExtensions(build.extensionsDir, this.serverDataDir, enabledExtensions(this.mirrorState));
     const picked = await pickPort(this.opts.findPort, this.opts.storedPort ?? null);
     const port = picked.port;
     if (this.stopRequested) throw new StartCancelledError(); // stop() came in before the spawn: nothing to kill
@@ -780,6 +812,13 @@ export class WorkbenchServer {
 
   private async readMirror(): Promise<void> {
     this.mirrorResult = null;
+    this.mirrorState = null;
+    const reuse = this.opts.reuseMirror;
+    if (reuse) {
+      this.mirrorResult = reuse.disabled;
+      this.mirrorState = reuse;
+      return;
+    }
     const request = this.opts.mirror;
     if (!request) return;
     const abort = new AbortController();
@@ -793,14 +832,26 @@ export class WorkbenchServer {
       });
       if (abort.signal.aborted) return;
       this.mirrorResult = result;
-      try {
-        this.opts.onMirror?.(result);
-      } catch {
-        /* a listener's fault never stops the start */
+      // With no disabled list at all nothing is shared, so the profile's list is not read either.
+      const extensions: MirrorState["extensions"] =
+        result.source === "none" ? { ok: false, why: "the disabled list is unknown" } : readProfileExtensions(this.opts.profileExtensionsFile ?? null);
+      const state: MirrorState = { disabled: result, extensions };
+      this.mirrorState = state;
+      for (const notify of [() => this.opts.onMirror?.(result), () => this.opts.onMirrorState?.(state)]) {
+        try {
+          notify();
+        } catch {
+          /* a listener's fault never stops the start */
+        }
       }
     } finally {
       if (this.mirrorAbort === abort) this.mirrorAbort = null;
     }
+  }
+
+  /** Shared links whose extension folder has been removed since the start (E5). Read-only. */
+  danglingLinks(): string[] {
+    return danglingSharedLinks(this.serverDataDir);
   }
 
   private pushLog(line: string, token: string): void {

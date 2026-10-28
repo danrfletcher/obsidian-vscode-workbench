@@ -413,3 +413,48 @@ describe("the mirror read at server start (PR-4)", () => {
     expect(s.mirror).toBeNull();
   });
 });
+
+describe("the shared extensions at server start (PR-5)", () => {
+  const TCL = "chakrounanas.turbo-console-log-3.0.0";
+  const PY = "ms-python.python-2026.10.0";
+  const request = (t: ReturnType<typeof buildTree>): MirrorRequest => ({
+    instanceId: "vscode-insiders:/Applications/Visual Studio Code.app",
+    userDataRoot: t.userDataRoot,
+    vaultPath: t.vault,
+    profile: { location: "__default__profile__", isDefault: true, dir: path.join(t.userDataRoot, "User") },
+  });
+  const entry = (dir: string, id: string, folder: string) => ({ identifier: { id }, relativeLocation: folder, location: { $mid: 1, path: path.join(dir, folder), scheme: "file" } });
+  const linksOf = (s: WorkbenchServer) => fs.readdirSync(path.join(s.serverDataDir, "extensions")).filter((n) => n !== "extensions.json").sort();
+
+  it("the on-disk extensions folder holds exactly the enabled links, and the list is written before the child is spawned", async () => {
+    const t = buildTree({ base: tempDir(), global: ["--disabled", "ms-python.python"] });
+    const ext = path.join(t.base, "Home", ".vscode-insiders", "extensions");
+    for (const n of [TCL, PY, "other.unlisted-1.0.0"]) fs.mkdirSync(path.join(ext, n), { recursive: true });
+    const list = path.join(ext, "extensions.json");
+    fs.writeFileSync(list, JSON.stringify([entry(ext, "chakrounanas.turbo-console-log", TCL), entry(ext, "ms-python.python", PY)]));
+    const before = snapshotTree(ext);
+    let seen: string[] | null = null;
+    const s = make({}, { build: { ...build, extensionsDir: ext }, mirror: request(t), profileExtensionsFile: list, onPortPick: () => (seen = linksOf(s)) });
+    await s.ensureStarted();
+    expect(seen).toEqual([TCL]); // linked before the port was picked and the child spawned
+    expect(linksOf(s)).toEqual([TCL]);
+    expect(fs.lstatSync(path.join(s.serverDataDir, "extensions", TCL)).isSymbolicLink()).toBe(true);
+    const written = JSON.parse(fs.readFileSync(path.join(s.serverDataDir, "extensions", "extensions.json"), "utf8")) as Array<{ relativeLocation: string; location: { path: string } }>;
+    expect(written.map((e) => e.relativeLocation)).toEqual([TCL]);
+    expect(written[0].location.path).toBe(path.join(s.serverDataDir, "extensions", TCL));
+    expect(snapshotTree(ext)).toEqual(before);
+  });
+
+  it("nothing readable (no database, no snapshot): the server still starts, with no links and an empty list", async () => {
+    const t = buildTree({ base: tempDir(), global: null });
+    const ext = path.join(t.base, "Home", ".vscode-insiders", "extensions");
+    fs.mkdirSync(path.join(ext, TCL), { recursive: true });
+    const list = path.join(ext, "extensions.json");
+    fs.writeFileSync(list, JSON.stringify([entry(ext, "chakrounanas.turbo-console-log", TCL)]));
+    const s = make({}, { build: { ...build, extensionsDir: ext }, mirror: request(t), profileExtensionsFile: list });
+    await s.ensureStarted();
+    expect(s.mirror?.source).toBe("none");
+    expect(linksOf(s)).toEqual([]);
+    expect(fs.readFileSync(path.join(s.serverDataDir, "extensions", "extensions.json"), "utf8")).toBe("[]");
+  });
+});
