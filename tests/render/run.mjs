@@ -65,9 +65,30 @@ await build({
   outfile: path.join(outDir, "messages.mjs"),
   logLevel: "error",
 });
-const { describeFailure, ServerStartError } = await import(pathToFileURL(path.join(outDir, "messages.mjs")).href);
+const { describeFailure, ServerStartError, findMirroredProfile, describeExtensionsSection, SPIKE_RESULT } = await import(pathToFileURL(path.join(outDir, "messages.mjs")).href);
+const { PROFILES, vscodeFolderUri, writeUserData } = await import(pathToFileURL(path.join(root, "tests/fixtures/make-fake-user-data.mjs")).href);
 
 fs.writeFileSync(path.join(outDir, "app.css"), readAsar(ASAR, "app.css"));
+fs.copyFileSync(path.join(root, "styles.css"), path.join(outDir, "plugin.css"));
+
+// The Profile row of the Extensions section, from the real lookup against generated user-data folders.
+const SPACE_VAULT = "/Users/x/My Vault/Café Ünï";
+function profileScenario(name, vaultPath, associations) {
+  const userDataRoot = writeUserData(path.join(fs.mkdtempSync(path.join(outDir, "userdata-")), "Code - Insiders"), { associations });
+  const profile = findMirroredProfile({ userDataRoot, vaultPath });
+  const state = { status: "resolved", profile };
+  const port = { stored: 51789, current: 51789, note: null };
+  return { name, kind: "settings-section", view: describeExtensionsSection(SPIKE_RESULT, port, state) };
+}
+const notRead = { name: "profile-not-read", kind: "settings-section", view: describeExtensionsSection(SPIKE_RESULT, { stored: 51789, current: 51789, note: null }, { status: "not-read" }) };
+const profileScenarios = [
+  notRead,
+  profileScenario("profile-default", SPACE_VAULT, { [vscodeFolderUri(SPACE_VAULT)]: "__default__profile__" }),
+  profileScenario("profile-fde-practice", SPACE_VAULT, { [vscodeFolderUri(SPACE_VAULT)]: PROFILES.custom.location }),
+  profileScenario("profile-unknown", SPACE_VAULT, { [vscodeFolderUri(SPACE_VAULT)]: "ffff0000" }),
+  profileScenario("profile-deleted-folder", SPACE_VAULT, { [vscodeFolderUri(SPACE_VAULT)]: PROFILES.deleted.location }),
+  profileScenario("profile-no-association-accents", SPACE_VAULT, {}),
+];
 
 // The download failure the way the CLI logs it.
 const DNS =
@@ -95,6 +116,8 @@ const scenarios = [
   { name: "quit-save-or-discard-modal", kind: "modal", prompt: "quit-save-or-discard", files: ["a.py", "b.ts", "Makefile", "scripts/estimate_time.py", "notes/ünï.ts", "seventh.rs"] },
   { name: "quit-save-failed-modal", kind: "modal", prompt: "quit-save-failed", files: ["Untitled-1", "scripts/estimate_time.py"] },
   { name: "restart-with-dirty-modal", kind: "modal", prompt: "restart-with-dirty", files: ["a.py", "scripts/estimate_time.py"] },
+  // The Profile row of the settings Extensions section (PR-3: G7, G8, E2, E10), drawn with the plugin's styles.css.
+  ...profileScenarios,
 ];
 const windows = [
   [1280, 800],
@@ -119,7 +142,7 @@ for (const sc of scenarios) {
       const page = path.join(outDir, `${id}.html`);
       fs.writeFileSync(
         page,
-        `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="app.css"></head>` +
+        `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="app.css">${sc.kind === "settings-section" ? '<link rel="stylesheet" href="plugin.css">' : ""}</head>` +
           `<body class="${theme} is-frameless mod-macos"><pre id="result" style="display:none"></pre>` +
           `<script src="entry.js"></script>` +
           `<script>render.run(${JSON.stringify(sc)}).then(r => { document.getElementById("result").textContent = JSON.stringify(r); }, e => { document.getElementById("result").textContent = JSON.stringify({ ok: false, error: String(e) }); });</script>` +
@@ -136,7 +159,7 @@ for (const sc of scenarios) {
       }
       chrome([size, "--virtual-time-budget=2000", `--screenshot=${path.join(outDir, `${id}.png`)}`, pathToFileURL(page).href]);
       const lines = (r.results ?? []).map((x) => `${x.label} ${x.box} ${x.textLines} lines`).join("; ");
-      console.log(`${r.ok ? "ok  " : "FAIL"} ${id} (window ${r.window ?? "?"}) ${lines}${r.buttons ? ` buttons: ${r.buttons.join(" | ")}` : ""}`);
+      console.log(`${r.ok ? "ok  " : "FAIL"} ${id} (window ${r.window ?? "?"}) ${lines}${r.buttons ? ` buttons: ${r.buttons.join(" | ")}` : ""}${r.profileRow ? ` profile row: ${r.profileRow}` : ""}`);
       for (const x of r.results ?? []) for (const p of x.problems) console.log(`       ${p}`);
       if (r.error) console.log(`       ${r.error}`);
       if (!r.ok) failed++;

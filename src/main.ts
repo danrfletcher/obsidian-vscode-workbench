@@ -36,6 +36,7 @@ import { InstanceService } from "./instances/service";
 import { DrawerToggle } from "./hotkey/drawer-toggle";
 import { EmbedKeyRelay, type RelayFrame } from "./hotkey/embed-key-relay";
 import { resolveChords, type BridgeAction, type HotkeyLike } from "./hotkey/hotkey-bridge";
+import { profileForInstance, userDataRootFor, type ProfileState } from "./profile/mirrored-profile";
 import { instanceUserDir, seedUserData } from "./server/user-data-seed";
 import { dataObject, effectiveShell, readSettings, type WorkbenchSettings } from "./settings/data";
 import { type PortStatus, type SpikeResult } from "./settings/extensions-section";
@@ -58,6 +59,8 @@ const FOCUS_RESCAN_MS = 30_000;
 interface WorkbenchData extends Partial<WorkbenchSettings> {
   /** Hand-edited; path to a `code` CLI. When set it overrides the instance chosen in the settings tab. */
   codeCliPath?: string;
+  /** Hand-edited; the user-data folder of a custom CLI: a folder name under Application Support, or an absolute path. Used for a custom CLI only. */
+  userDataFolder?: string;
   /** Hand-edited; vault-relative file the ribbon opens when no openable active file exists. */
   spikeFile?: string;
   /** Hand-edited; what a click on an extensionless file does: "intercept" (Code tab, the default) or "system-app". */
@@ -115,6 +118,12 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private cachedBefore: ReadonlySet<string> = new Set();
   /** Why the last start did not use the stored stable port (null when it did, or none is stored). */
   private portNote: string | null = null;
+  /** The mirrored profile as the last read left it. Read at the first start, at Restart server and when a start's instance differs from the one it was read for; never on an idle restart on the same instance or when settings opens. */
+  private profile: ProfileState = { status: "not-read" };
+  /** Where `profile` was read from (the instance's user-data folder, or why it cannot be told); null until a read. A start on another instance finds this different and reads again. */
+  private profileSource: string | null = null;
+  /** The next server start reads the profile: true from Obsidian start until a start reads it, and again from each Restart server. */
+  private profileStale = true;
   /** What the trust seed answered at the last Code tab load that ran it; shown in settings. In memory only: nothing about it is stored. */
   private lastTrustOutcome: string | null = null;
   /** Tests only: replaces the reachability check that turns a failed download into "the network is unreachable". */
@@ -622,6 +631,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     writeMachineSettings(server.serverDataDir, { dark: this.isDark() });
     this.themeSync.markApplied(this.isDark());
     this.seedUserData(server.userDataDir, chosen);
+    this.mirrorProfile(chosen);
     return server;
   }
 
@@ -647,6 +657,34 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       this.copy = null;
       new Notice("VS Code Workbench: could not copy the instance's settings, so the editor starts without them.", 10000);
     }
+  }
+
+  /**
+   * Read which profile desktop VS Code uses for the vault, once per Obsidian start and once per Restart server
+   * (an idle restart on the same instance keeps the result, G2). A start on a different instance (or user-data
+   * folder) than the one the result was read for reads again, so settings never shows another instance's profile
+   * (E6, F9). It only reads, and a failure is a result shown in settings: the start goes on.
+   */
+  private mirrorProfile(instance: Instance): void {
+    const found = userDataRootFor({ instance, appSupport: appSupportRoot(), configuredFolder: this.data_.userDataFolder });
+    const source = "root" in found ? `root:${found.root}` : `reason:${found.reason}`;
+    if (!this.profileStale && source === this.profileSource) return;
+    this.profileStale = false;
+    this.profileSource = source;
+    try {
+      this.profile = profileForInstance({
+        instance,
+        vaultPath: this.vaultRoot(),
+        appSupport: appSupportRoot(),
+        configuredFolder: this.data_.userDataFolder,
+      });
+    } catch {
+      this.profile = { status: "unavailable", reason: "the lookup failed" };
+    }
+  }
+
+  mirroredProfile(): ProfileState {
+    return this.profile;
   }
 
   userDataCopy(): UserDataCopy | null {
@@ -707,6 +745,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
         const dirty = (await this.dirtyViews()).map((v) => baseName(v.filePath));
         if (dirty.length && !(await promptRestartWithDirty(this.app, dirty))) return;
       }
+      this.profileStale = true; // the user chose to re-read desktop VS Code's state
       try {
         await this.startFlow((o) => this.manager.restart(o));
       } catch (e) {

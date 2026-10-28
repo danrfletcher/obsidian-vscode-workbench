@@ -3,12 +3,14 @@ import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { BROWSER_APP_SETTINGS, USER_DATA_MARKER_KEY, buildBrowserSeedScript, buildMachineSettings, writeMachineSettings, type UserDataCopy } from "../../src/settings";
 import { excludeGlobs } from "../../src/server/user-data-seed";
-import { STOP_TEXT, describeExtensionsSection, describePort, renderExtensionsSection, type PortStatus, type SpikeResult } from "../../src/settings/extensions-section";
+import { STOP_TEXT, describeExtensionsSection, describePort, describeProfile, renderExtensionsSection, type PortStatus, type SpikeResult } from "../../src/settings/extensions-section";
 import { SPIKE_RESULT } from "../../src/settings/spike-result";
 import { FakeNode, Setting } from "../mocks/obsidian";
 import { WorkbenchSettingTab, type SettingsHost } from "../../src/settings/settings-tab";
 import { DEFAULT_SETTINGS, type WorkbenchSettings } from "../../src/settings/data";
 import { MANUAL_TRUST_STEPS, describeTrust } from "../../src/trust/trust-message";
+import { findMirroredProfile, type MirroredProfile, type ProfileState } from "../../src/profile/mirrored-profile";
+import { PROFILES, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
 import { tempDir } from "../helpers";
 
 describe("writeMachineSettings", () => {
@@ -408,6 +410,7 @@ describe("the \"Trust the vault folder\" toggle in the settings tab (G6, E3)", (
       codeCliOverride: () => undefined,
       portStatus: () => ({ stored: null, current: null, note: null }),
       spikeResult: () => null,
+      mirroredProfile: () => ({ status: "not-read" }),
       ...(last === undefined ? {} : { trustOutcome: () => last ?? null }),
     };
     Setting.reset();
@@ -499,5 +502,163 @@ describe("describeTrust", () => {
     expect(describeTrust(true, "something-new")?.text).toContain('the seed reported "something-new"');
     expect(describeTrust(true, "no-store")?.tone).toBe("warning");
     expect(MANUAL_TRUST_STEPS).toBe('run "Workspaces: Manage Workspace Trust" from the command palette, then choose Trust');
+  });
+});
+
+describe("the Profile row of the Extensions section (G7, G8, G9, E2, E10)", () => {
+  /** A real lookup against a generated user-data folder, so the row is drawn from what the module really returns. */
+  function lookup(associations: Record<string, string>, vaultPath = "/Users/x/My Vault/Café Ünï"): MirroredProfile {
+    const root = writeUserData(path.join(tempDir(), "Code - Insiders"), { associations });
+    return findMirroredProfile({ userDataRoot: root, vaultPath });
+  }
+  const resolved = (profile: MirroredProfile): ProfileState => ({ status: "resolved", profile });
+
+  it("before the first server start: says the profile is read when the server starts, and names no profile", () => {
+    const row = describeProfile({ status: "not-read" });
+    expect(row).toEqual({ name: "Profile", text: "Not read yet: the profile is read when the server starts.", tone: "info" });
+    for (const name of ["Default", "FDE Practice", "Agents"]) expect(row.text).not.toContain(name);
+  });
+
+  it("chosen from the vault folder: the profile name and where it came from, no fallback line", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: PROFILES.custom.location })));
+    expect(row).toEqual({ name: "Profile", text: "FDE Practice. Chosen from: the vault folder.", tone: "ok" });
+  });
+
+  it("associated with Default: Default, chosen from the vault folder, no fallback line (GP1, GP2)", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: "__default__profile__" })));
+    expect(row).toEqual({ name: "Profile", text: "Default. Chosen from: the vault folder.", tone: "ok" });
+  });
+
+  it("chosen from a parent folder: names the parent", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x")]: PROFILES.custom.location })));
+    expect(row.text).toBe("FDE Practice. Chosen from: a parent folder (file:///Users/x).");
+  });
+
+  it("a profile that reads Default's files says which", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: PROFILES.agents.location })));
+    expect(row.text).toBe("Agents. Chosen from: the vault folder. Reads Default's settings, keybindings.");
+    expect(row.tone).toBe("ok");
+  });
+
+  it("no association: Default, chosen from default, the reason and the vault URI that was tried (G7, E10)", () => {
+    const row = describeProfile(resolved(lookup({})));
+    expect(row).toEqual({
+      name: "Profile",
+      text: "Default. Chosen from: default. Fallback: the vault folder is not associated with a profile in desktop VS Code (vault URI tried: file:///Users/x/My Vault/Café Ünï), so Default is used.",
+      tone: "warning",
+    });
+  });
+
+  it("an unknown profile: the fallback line names the location id (G8)", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: "ffff0000" })));
+    expect(row.text).toBe(
+      'Default. Chosen from: default. Fallback: the vault folder is associated with profile location "ffff0000", which is not in desktop VS Code\'s list of profiles (it was deleted or is unknown), so Default is used.',
+    );
+    expect(row.tone).toBe("warning");
+  });
+
+  it("a profile whose folder is gone (E2)", () => {
+    const row = describeProfile(resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: PROFILES.deleted.location })));
+    expect(row.text).toBe(
+      'Default. Chosen from: default. Fallback: the vault folder is associated with profile "Old Profile" (location "d3adbeef"), but its folder under User/profiles/ is missing, so Default is used.',
+    );
+  });
+
+  it("an unreadable storage.json", () => {
+    const root = writeUserData(path.join(tempDir(), "Code - Insiders"));
+    fs.writeFileSync(path.join(root, "User", "globalStorage", "storage.json"), "");
+    const row = describeProfile(resolved(findMirroredProfile({ userDataRoot: root, vaultPath: "/Users/x/Vault" })));
+    expect(row.text).toBe("Default. Chosen from: default. Fallback: desktop VS Code's storage.json could not be read (the file is empty), so Default is used.");
+  });
+
+  it("a profile that could not be worked out (a custom CLI with no known folder): says so and shows no profile", () => {
+    const row = describeProfile({ status: "unavailable", reason: "the user-data folder of this custom VS Code cannot be told" });
+    expect(row).toEqual({
+      name: "Profile",
+      text: "Could not be worked out: the user-data folder of this custom VS Code cannot be told. Default is not assumed; no profile is shown.",
+      tone: "warning",
+    });
+  });
+
+  describe("in the settings tab, against the mock host", () => {
+    function open(profile: () => ProfileState) {
+      const host: SettingsHost = {
+        restartServer: async () => undefined,
+        serverState: () => "running",
+        workbenchSettings: () => ({ ...DEFAULT_SETTINGS }),
+        updateSettings: async () => undefined,
+        scanInstances: async () => ({ instances: [], rejected: [], customFailure: null }),
+        verifyCustomCli: async () => ({ ok: false, reason: "no" }),
+        codeCliOverride: () => undefined,
+        portStatus: () => ({ stored: 51789, current: 51789, note: null }),
+        spikeResult: () => SPIKE_RESULT,
+        mirroredProfile: profile,
+      };
+      Setting.reset();
+      const tab = new WorkbenchSettingTab({} as never, {} as never, host);
+      tab.display();
+      const el = tab.containerEl as unknown as FakeNode;
+      const rows = el.all().filter((n) => n.cls?.includes("workbench-extensions-row"));
+      const row = (name: string) => rows.find((r) => r.children[0]?.text === name);
+      return { tab, el, row, text: () => el.textContent() };
+    }
+
+    it("renders the not-read state, with no stale guess", () => {
+      const t = open(() => ({ status: "not-read" }));
+      expect(t.row("Profile")?.children[1].text).toBe("Not read yet: the profile is read when the server starts.");
+      expect(t.row("Profile")?.cls).toContain("workbench-info");
+    });
+
+    it("renders a chosen profile", () => {
+      const t = open(() => resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: PROFILES.custom.location })));
+      expect(t.row("Profile")?.children[1].text).toBe("FDE Practice. Chosen from: the vault folder.");
+      expect(t.row("Profile")?.cls).toContain("workbench-ok");
+    });
+
+    it("renders a fallback with its reason, in the warning tone", () => {
+      const t = open(() => resolved(lookup({})));
+      expect(t.row("Profile")?.children[1].text).toContain("not associated with a profile in desktop VS Code");
+      expect(t.row("Profile")?.cls).toContain("workbench-warning");
+    });
+
+    it("sits in the Extensions section, after the port row, and is the only row added", () => {
+      const t = open(() => ({ status: "not-read" }));
+      const names = t.el.all().filter((n) => n.cls?.includes("workbench-extensions-row")).map((r) => r.children[0]?.text);
+      expect(names).toEqual(["Measured", "Stable port", "Stable port in use", "Profile", "Trust record", "Settings and keybindings", "Turbo Console Log"]);
+    });
+
+    it("reads the host each time the tab is displayed: a restart's new result shows at once, nothing is cached", () => {
+      let state: ProfileState = { status: "not-read" };
+      const t = open(() => state);
+      expect(t.row("Profile")?.children[1].text).toContain("Not read yet");
+      state = resolved(lookup({ [vscodeFolderUri("/Users/x/My Vault/Café Ünï")]: PROFILES.custom.location }));
+      t.tab.display();
+      expect(t.text()).toContain("FDE Practice. Chosen from: the vault folder.");
+      expect(t.text()).not.toContain("Not read yet");
+    });
+
+    it("a host that throws: the Profile row says it could not be shown, and the rest of settings is still drawn", () => {
+      const t = open(() => {
+        throw new Error("secret detail that must not be shown");
+      });
+      expect(t.row("Profile")?.children[1].text).toBe("Could not be worked out: the plugin could not report it. Default is not assumed; no profile is shown.");
+      expect(t.text()).not.toContain("secret detail");
+      expect(Setting.all.find((x) => x.name === "Trust the vault folder")).toBeDefined();
+      expect(t.row("Turbo Console Log")).toBeDefined();
+      expect(t.row("Stable port in use")).toBeDefined();
+      expect(Setting.all.find((x) => x.name === "Restart server")).toBeDefined();
+    });
+  });
+
+  it("a Profile row with no spike result recorded is still drawn, after the port", () => {
+    const el = new FakeNode("div");
+    renderExtensionsSection(el as unknown as HTMLElement, describeExtensionsSection(null, { stored: null, current: null, note: null }, { status: "not-read" }));
+    const names = el.all().filter((n) => n.cls?.includes("workbench-extensions-row")).map((r) => r.children[0]?.text);
+    expect(names).toEqual(["Extension spike", "Stable port in use", "Profile"]);
+  });
+
+  it("describeExtensionsSection without a profile argument says not read yet", () => {
+    const view = describeExtensionsSection(null, { stored: null, current: null, note: null });
+    expect(view.rows.find((r) => r.name === "Profile")?.text).toBe("Not read yet: the profile is read when the server starts.");
   });
 });

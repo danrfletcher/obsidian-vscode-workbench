@@ -4,8 +4,11 @@
  * stable port in use and the date of the measurement.
  *
  * It shows a recorded result. Nothing here reads desktop VS Code's state, starts a timer or watches a file
- * (F7): it is drawn from `SPIKE_RESULT` and the host's port status each time the settings tab is opened.
+ * (F7): it is drawn from `SPIKE_RESULT`, the host's port status and the host's last profile result each time
+ * the settings tab is opened. The profile is read by the server start (src/profile/mirrored-profile.ts), never here.
  */
+import type { MirroredProfile, ProfileState } from "../profile/mirrored-profile";
+import { PROFILE_KINDS } from "../profile/profile-kinds";
 
 /** The marker the section and the doc use when the spike says the profile's settings and keybindings never reach the tab (F8). */
 export const STOP_MARKER = "STOP";
@@ -69,17 +72,42 @@ export function describePort(port: PortStatus): SectionRow {
   return { name: "Stable port in use", text, tone: note ? "warning" : "info" };
 }
 
-/** Everything the section shows, as plain data. `result` null = nothing recorded yet. */
-export function describeExtensionsSection(result: SpikeResult | null, port: PortStatus): SectionView {
+const CHOSEN_FROM: Record<MirroredProfile["chosenFrom"], (p: MirroredProfile) => string> = {
+  "vault-folder": () => "the vault folder",
+  "parent-folder": (p) => `a parent folder (${p.matchedUri ?? "unknown"})`,
+  default: () => "default",
+};
+
+/** The Profile row: the profile desktop VS Code uses for the vault, where it was chosen from, and the reason for any fallback. */
+export function describeProfile(state: ProfileState): SectionRow {
+  const name = "Profile";
+  if (state.status === "not-read") {
+    return { name, text: "Not read yet: the profile is read when the server starts.", tone: "info" };
+  }
+  if (state.status === "unavailable") {
+    return { name, text: `Could not be worked out: ${state.reason}. Default is not assumed; no profile is shown.`, tone: "warning" };
+  }
+  const p = state.profile;
+  let text = `${p.name}. Chosen from: ${CHOSEN_FROM[p.chosenFrom](p)}.`;
+  const fromDefault = PROFILE_KINDS.filter((k) => !p.isDefault && p.files[k].from === "default");
+  if (fromDefault.length > 0) text += ` Reads Default's ${fromDefault.join(", ")}.`;
+  if (p.fallback) text += ` Fallback: ${p.reason}.`;
+  return { name, text, tone: p.fallback ? "warning" : "ok" };
+}
+
+/** Everything the section shows, as plain data. `result` null = nothing recorded yet. `profile` defaults to not read yet. */
+export function describeExtensionsSection(result: SpikeResult | null, port: PortStatus, profile: ProfileState = { status: "not-read" }): SectionView {
   const rows: SectionRow[] = [];
   if (result === null) {
     rows.push({ name: "Extension spike", text: "No spike result recorded yet.", tone: "info" });
     rows.push(describePort(port));
+    rows.push(describeProfile(profile));
     return { heading: "Extensions", rows };
   }
   rows.push({ name: "Measured", text: `${result.measuredOn}, on VS Code ${result.vscodeVersion}.`, tone: "info" });
   rows.push({ name: "Stable port", text: `${result.stablePort.result} Decision: ${result.stablePort.decision}`, tone: result.stablePort.stable ? "ok" : "warning" });
   rows.push(describePort(port));
+  rows.push(describeProfile(profile));
 
   const t = result.trustRecord;
   rows.push(

@@ -45,14 +45,21 @@ describe("F7: no file watchers on the instance's folders; the spike reads state 
 });
 
 describe("F8: nothing in src/ builds or wires the profile settings mirror", () => {
-  it("src/ does not mention user data profiles at all", () => {
-    expect(grep(/userDataProfiles|profileAssociations|__default__profile__|User\/profiles|"profiles"/)).toEqual([]);
+  it("only the read-only profile finder (PR-3) mentions user data profiles", () => {
+    expect(grep(/userDataProfiles|profileAssociations|__default__profile__|User\/profiles|"profiles"/)).toEqual(["src/profile/mirrored-profile.ts"]);
+  });
+
+  it("the profile finder has no way to write: no write, create, rename, delete or watch call, and no child process", () => {
+    const code = fs.readFileSync(path.join(root, "src/profile/mirrored-profile.ts"), "utf8").replace(/^\s*(\*|\/\/|\/\*).*$/gm, "");
+    expect(code).not.toMatch(/writeFile|appendFile|mkdir|rmSync|rmdir|unlink|rename|copyFile|cpSync|chmod|chown|utimes|symlink|truncate|createWriteStream|\bopenSync\b|\bwatch|child_process|sqlite/);
+    expect(code).toMatch(/readFileSync/);
   });
 
   it("the only files in src/ that use a settings.json path literal are the ones that already did before the spike", () => {
     // The copy of the chosen instance's Default settings (G16/G17), the Machine file and the IndexedDB key. A new
     // reader of a profile's settings.json would show up here; add a file to this list only on purpose.
-    expect(grep(/["'`](\/User\/)?settings\.json["'`]/).sort()).toEqual(["src/server/user-data-seed.ts", "src/settings.ts", "src/workbench-db.ts"].sort());
+    // src/profile/mirrored-profile.ts (PR-3) is listed because its doc comment names the file; it never opens one.
+    expect(grep(/["'`](\/User\/)?settings\.json["'`]/).sort()).toEqual(["src/profile/mirrored-profile.ts", "src/server/user-data-seed.ts", "src/settings.ts", "src/workbench-db.ts"].sort());
   });
 });
 

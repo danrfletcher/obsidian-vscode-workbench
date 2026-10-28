@@ -6,6 +6,7 @@
  */
 import { Notice } from "./obsidian-shim.mjs";
 import { promptReuseBuild, promptCloseDirty, promptSaveOrDiscard, promptSaveFailed, promptRestartWithDirty } from "../../src/modals";
+import { renderExtensionsSection } from "../../src/settings/extensions-section";
 
 const TOL = 0.5;
 
@@ -83,6 +84,17 @@ async function run(scenario) {
     new Notice(scenario.message, 15000);
     out.results.push(measure(document.querySelector(".notice"), "notice"));
     out.results.push(measure(document.querySelector(".notice-container"), "notice-container"));
+  } else if (scenario.kind === "settings-section") {
+    // The Extensions section of the settings tab, drawn by the plugin's own renderer from a view built in node.
+    // Settings scrolls, so the section may be taller than the window; the Profile row is scrolled into view and
+    // measured (text lines against the window width and any clipping ancestor), as a reader would see it.
+    const holder = document.body.createDiv({ cls: "workbench-render-settings" });
+    renderExtensionsSection(holder, scenario.view);
+    const profileRow = [...holder.querySelectorAll(".workbench-extensions-row")].find((r) => r.firstChild?.textContent === "Profile");
+    if (!profileRow) throw new Error("no Profile row in the Extensions section");
+    profileRow.scrollIntoView({ block: "center" });
+    out.results.push(measure(profileRow, "profile-row"));
+    out.profileRow = profileRow.lastChild?.textContent ?? null;
   } else {
     const answer = openPrompt(scenario);
     void answer;

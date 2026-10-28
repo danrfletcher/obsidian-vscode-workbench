@@ -6,6 +6,7 @@ import type { ServerState } from "../server-manager";
 import { addExtension, defaultShell, type WorkbenchSettings } from "./data";
 import { describeExtensionsSection, renderExtensionsSection, type PortStatus, type SpikeResult } from "./extensions-section";
 import { describeTrust, MANUAL_TRUST_STEPS } from "../trust/trust-message";
+import type { ProfileState } from "../profile/mirrored-profile";
 
 export interface SettingsHost {
   restartServer(): Promise<void>;
@@ -22,6 +23,8 @@ export interface SettingsHost {
   portStatus(): PortStatus;
   /** What the extension spike recorded; null = nothing recorded yet. */
   spikeResult(): SpikeResult | null;
+  /** The profile the last server start resolved (or "not read" before the first start). Read from the host, never from disk here. */
+  mirroredProfile(): ProfileState;
   /** What the trust seed answered at the last Code tab load (from the host, not the page); null = no tab has run it yet. */
   trustOutcome?(): string | null;
 }
@@ -89,8 +92,17 @@ export class WorkbenchSettingTab extends PluginSettingTab {
     this.renderDrawerAndShell(containerEl);
     this.renderTrust(containerEl.createDiv());
     // Read once, here: the section shows the recorded result and the port as they are when settings opens.
-    renderExtensionsSection(containerEl.createDiv(), describeExtensionsSection(this.host.spikeResult(), this.host.portStatus()));
+    renderExtensionsSection(containerEl.createDiv(), describeExtensionsSection(this.host.spikeResult(), this.host.portStatus(), this.profileState()));
     this.renderRestart(containerEl);
+  }
+
+  /** The host's profile result; a host that throws gives a row saying so and leaves the rest of settings drawn. */
+  private profileState(): ProfileState {
+    try {
+      return this.host.mirroredProfile();
+    } catch {
+      return { status: "unavailable", reason: "the plugin could not report it" };
+    }
   }
 
   // --- Instances -----------------------------------------------------------
