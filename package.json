@@ -1,0 +1,32 @@
+{
+  "name": "obsidian-vscode-workbench",
+  "version": "0.1.0",
+  "description": "Open vault files in a real VS Code editor (code serve-web) inside an Obsidian tab.",
+  "main": "main.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --coverage",
+    "check:render": "node tests/render/run.mjs",
+    "check:user-data": "node tests/render/user-data-check.mjs",
+    "check:trust": "node tests/render/trust-check.mjs",
+    "check:workbench": "node tests/render/workbench-check.mjs",
+    "check:extensions-spike": "node tests/render/extension-spike.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^5.0.5",
+    "esbuild": "^0.28.2",
+    "jsdom": "^29.1.1",
+    "obsidian": "^1.14.4",
+    "typescript": "^5.9.0",
+    "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0"
+  }
+}

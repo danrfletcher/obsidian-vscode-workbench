@@ -1,0 +1,8 @@
+2026-10-28 09:00:01.100 [info] Extension host with pid 4242 started
+2026-10-28 09:00:01.110 [info] Lock '/scratch/server-data/data/User/workspaceStorage/6185d714/vscode.lock': Lock acquired.
+2026-10-28 09:00:01.200 [info] ExtensionService#_doActivateExtension vscode.git-base, startup: true, activationEvent: '*'
+2026-10-28 09:00:01.210 [info] Eager extensions activated
+2026-10-28 09:00:02.300 [info] ExtensionService#_doActivateExtension ChakrounAnas.turbo-console-log, startup: false, activationEvent: 'onStartupFinished'
+2026-10-28 09:00:02.400 [info] ExtensionService#_doActivateExtension esbenp.prettier-vscode, startup: false, activationEvent: 'onLanguage:javascript'
+2026-10-28 09:00:02.500 [info] ExtensionService#_doActivateExtension ms-python.python, startup: false, activationEvent: 'onLanguage:python'
+2026-10-28 09:00:02.600 [info] ExtensionService#_doActivateExtension redhat.vscode-yaml, startup: false, activationEvent: 'onLanguage:yaml'

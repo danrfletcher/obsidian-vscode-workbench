@@ -1,0 +1,10 @@
+{
+  "chakrounanas.turbo-console-log": { "displayName": "Turbo Console Log" },
+  "ms-python.python": { "displayName": "Python" },
+  "ms-python.vscode-pylance": { "displayName": "Pylance" },
+  "ms-vscode.cpptools": { "displayName": "C/C++" },
+  "esbenp.prettier-vscode": { "displayName": "Prettier - Code formatter" },
+  "dbaeumer.vscode-eslint": { "displayName": "ESLint" },
+  "eamodio.gitlens": { "displayName": "GitLens — Git supercharged" },
+  "redhat.vscode-yaml": { "displayName": "%displayName%", "nls": { "displayName": "YAML" } }
+}
