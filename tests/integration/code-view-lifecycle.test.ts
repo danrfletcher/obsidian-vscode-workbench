@@ -544,7 +544,7 @@ describe("vault events (G3, G4)", () => {
     await new Promise((r) => setTimeout(r, 1300)); // a watch look sees this file's tab dirty
     fs.writeFileSync(path.join(root, "a.py"), "edited\n"); // Cmd+S in the renamed file's buffer
     first.fileTab = "clean"; // the other editor keeps the page dirty
-    await vi.waitFor(() => expect(w.carried).toHaveLength(1), { timeout: 4000 });
+    await vi.waitFor(() => expect(w.carried).toHaveLength(1), { timeout: 10000 });
     expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true); // no reload: the other editor's text would go with it
     expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited\n");
     expect(fs.existsSync(path.join(root, "a.py"))).toBe(false);
@@ -553,17 +553,17 @@ describe("vault events (G3, G4)", () => {
     await new Promise((r) => setTimeout(r, 1300));
     fs.writeFileSync(path.join(root, "a.py"), "edited again\n");
     first.fileTab = "clean";
-    await vi.waitFor(() => expect(w.carried).toHaveLength(2), { timeout: 4000 });
+    await vi.waitFor(() => expect(w.carried).toHaveLength(2), { timeout: 10000 });
     expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited again\n");
     expect(fs.existsSync(path.join(root, "a.py"))).toBe(false);
     expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true);
     first.dirty = false; // the other editor is saved: now the embed moves to the renamed file
-    await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"), { timeout: 4000 });
+    await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"), { timeout: 10000 });
     expect(w.notMoved).toEqual([]);
     expect(w.carried.map((c) => c.result)).toEqual(["carried", "carried"]);
     expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited again\n");
     expect(w.leaves).toHaveLength(1);
-  }, 15000);
+  }, 40000);
 
   it("an edit that stays unsaved in the renamed file's own tab is not carried while another editor is unsaved either", async () => {
     const root = tempDir();
@@ -845,8 +845,12 @@ describe("vault events (G3, G4)", () => {
       const t = await w.openTab("a.py");
       fs.renameSync(path.join(root, "a.py"), path.join(root, "b.py"));
       w.sync.onRename("b.py", "a.py");
-      fs.writeFileSync(path.join(root, "a.py"), "new a\n");
+      // The tab's rename look reads the old path once, in the background (notePendingMove). A file written there before
+      // that read finishes is seen by it, which is a different case from the one under test: wait until the tab has
+      // settled onto the renamed file, and only then put another file at the old path.
       await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"));
+      fs.writeFileSync(path.join(root, "a.py"), "new a\n");
+      w.taken("a.py"); // what the plugin does when Obsidian reports the new file: the settled tab has nothing to say about it
       expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("old\n");
       expect(fs.readFileSync(path.join(root, "a.py"), "utf8")).toBe("new a\n");
       expect(w.carried).toEqual([]);

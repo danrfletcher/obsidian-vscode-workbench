@@ -14,6 +14,11 @@
 //   slow-download  a real, slow download: FAKE_CODE_DOWNLOAD_REQUESTS=n requests answer 202, "Downloading server" is logged once
 //   hang         never listen
 // FAKE_CODE_DOWNLOAD_REQUESTS=n makes the first n requests answer 202 (server still downloading).
+// FAKE_CODE_SHELL_PORT=p makes the server start a terminal the way the real one's pty host does: a shell in its own
+//   process group (the pty's session) with a child `python3 -m http.server p --bind 127.0.0.1`. The shell's pid is
+//   appended to FAKE_CODE_SHELL_PIDFILE. The shell is a descendant of the server and carries neither the server's
+//   token-file path nor "serve-web" on its command line, like a real shell under the pty host.
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 
@@ -27,6 +32,12 @@ const token = fs.readFileSync(tokenFile, "utf8").trim();
 const mode = process.env.FAKE_CODE_MODE;
 
 if (process.env.FAKE_CODE_PIDFILE) fs.appendFileSync(process.env.FAKE_CODE_PIDFILE, `${process.pid}\n`);
+if (process.env.FAKE_CODE_SHELL_PORT) {
+  // `; true` keeps the shell alive as the parent (without it, sh -c would exec the last command in place).
+  const shell = spawn("sh", ["-c", `python3 -m http.server ${process.env.FAKE_CODE_SHELL_PORT} --bind 127.0.0.1; true`], { detached: true, stdio: "ignore", env: { ...process.env, FAKE_CODE_SHELL_PORT: "", FAKE_CODE_PIDFILE: "" } });
+  shell.unref();
+  if (process.env.FAKE_CODE_SHELL_PIDFILE) fs.appendFileSync(process.env.FAKE_CODE_SHELL_PIDFILE, `${shell.pid}\n`);
+}
 if (process.env.FAKE_CODE_ARGSFILE) fs.writeFileSync(process.env.FAKE_CODE_ARGSFILE, JSON.stringify(args));
 
 if (mode === "exit-early") {

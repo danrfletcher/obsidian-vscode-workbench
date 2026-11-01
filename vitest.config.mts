@@ -27,6 +27,10 @@ export default defineConfig({
       WORKBENCH_SCAN_ROOTS: "/nonexistent-workbench-scan-root",
       WORKBENCH_APP_SUPPORT_ROOT: "/nonexistent-workbench-app-support",
     },
+    // Many tests start a real server, a child process or a Python helper. On a busy machine (a load average of 13 was seen) the 5 s and
+    // 10 s defaults ran out in unrelated files; a test that is stuck still fails, 30 s later.
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
     include: ["tests/**/*.test.ts"],
     coverage: {
       provider: "v8",
