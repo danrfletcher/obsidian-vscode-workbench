@@ -17,6 +17,9 @@ import type { SyncTab } from "./vault-sync";
 
 export const VIEW_TYPE_CODE = "vscode-workbench-code";
 
+/** The Code tabs' webview partition (their shared browser profile). The terminal host page uses a different one (F5). */
+export const CODE_TAB_PARTITION = "persist:vscode-workbench";
+
 /**
  * `serve-web` answers with `X-Frame-Options: SAMEORIGIN` and
  * `frame-ancestors 'self'`, so a plain <iframe> inside Obsidian (origin
@@ -700,7 +703,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
       const el = document.createElement(this.host.embedElement());
       const isWebview = this.host.embedElement() === "webview";
       if (isWebview) {
-        el.setAttribute("partition", "persist:vscode-workbench");
+        el.setAttribute("partition", CODE_TAB_PARTITION);
         el.setAttribute("allowpopups", "");
         el.addEventListener("dom-ready", () => {
           if (this.frame === el) this.domReady = true;

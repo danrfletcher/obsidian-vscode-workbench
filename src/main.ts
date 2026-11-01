@@ -49,6 +49,7 @@ import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab"
 import { workbenchOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
 import { DEVICE_ID_KEY } from "./terminal/drawer-state";
 import { TerminalFeature } from "./terminal/feature";
+import { TerminalHostPage } from "./terminal-host/host-page";
 import { TabRegistry } from "./tab-registry";
 import { decideFile, extensionOf, fileName, opensInCodeTab } from "./text-file-rules";
 import { isDarkBody, themeSwitchMessage, ThemeSync } from "./theme-map";
@@ -114,6 +115,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   /** The instance's settings and keybindings as copied at the last server start; the Code tab seeds its browser profile from it. */
   private copy: UserDataCopy | null = null;
   private terminal: TerminalFeature | null = null;
+  /** The terminal host page (VS Code's own terminal panel in a webview). Made at the first show, kept mounted until unload. */
+  private terminalHost: TerminalHostPage | null = null;
   /** The hotkey bridge: carries Ctrl+` and the quick switcher out of the embed (G8, G1). Null until onload; inactive when the spike decision is `no`. */
   private keyRelay: EmbedKeyRelay | null = null;
   private bridgeToggle: DrawerToggle | null = null;
@@ -224,6 +227,12 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
           resolveChords((id) => this.hotkeysOf(id), this.isMac()).chords.filter((c) => c.action === "toggle-terminal"),
       });
       this.bridgeToggle = new DrawerToggle(this.terminal);
+      // Temporary: opens and hides the terminal host page so it can be tried before the drawer's edge exists. PR-3 replaces it.
+      this.addCommand({
+        id: "toggle-terminal-host-test",
+        name: "Toggle terminal host (test)",
+        callback: () => this.toggleTerminalHost(),
+      });
       this.addCommand({
         id: "toggle-terminal-drawer",
         name: "Toggle terminal drawer",
@@ -258,6 +267,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       this.app.workspace.on("css-change", () => {
         void this.themeSync.set(this.isDark());
         this.terminal?.themeChanged();
+        void this.terminalHost?.themeChanged(this.isDark());
       }),
     );
     // A tab shown, hidden or closed changes what the idle clock sees; a tab left behind by an idle stop wakes the server.
@@ -346,6 +356,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.keyRelay?.dispose();
     this.keyRelay = null;
     this.bridgeToggle = null;
+    // The terminal host page goes with the plugin: no webview left behind (a start still running is dropped at its next step).
+    this.terminalHost?.dispose();
+    this.terminalHost = null;
     // The drawer's shell and its helper go too; the kill signals are sent before this returns.
     void this.terminal?.dispose();
     // shutdown() sends its kill signals synchronously; unload does not wait for the exit.
@@ -534,6 +547,46 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return path.join(this.vaultRoot(), manifestDir, ".server");
   }
 
+  // --- The terminal host page ---------------------------------------------
+
+  /** The host page, made on first use; null once the plugin has unloaded. Its start goes through `ensureServer` and the licence gate: one server, one modal. */
+  private terminalHostPage(): TerminalHostPage | null {
+    if (this.unloaded) return null;
+    this.terminalHost ??= new TerminalHostPage({
+      createElement: (tag) => document.createElement(tag),
+      parent: document.body,
+      vaultRoot: () => this.vaultRoot(),
+      licenceAccepted: () => this.gate.accepted,
+      requestLicence: () => this.gate.request(),
+      ensureServer: () => this.ensureServer(),
+      failureText: (e) => this.describeStartFailure(e).message,
+      notice: (message) => void new Notice(message, 10000),
+      isDark: () => this.isDark(),
+      workbenchOverlay: () => this.workbenchOverlay(),
+      userDataCopy: () => this.copy,
+      trustVaultFolder: () => this.trustVaultFolder(),
+      heldPorts: () => this.heldPorts(),
+      noteTrustOutcome: (outcome) => this.noteTrustOutcome(outcome),
+      mac: this.isMac(),
+    });
+    return this.terminalHost;
+  }
+
+  /** Open the terminal host (internal; PR-3's drawer calls this). Starts the server on the first show. */
+  showTerminalHost(): void {
+    this.terminalHostPage()?.show();
+  }
+
+  /** Hide the terminal host. The page stays mounted and alive. */
+  hideTerminalHost(): void {
+    this.terminalHost?.hide();
+  }
+
+  toggleTerminalHost(): void {
+    const host = this.terminalHostPage();
+    if (host) host.toggle();
+  }
+
   // --- Starting the server ------------------------------------------------
 
   /**
@@ -580,16 +633,22 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     }
   }
 
-  /** Show the Notice for a failed start (token-free) and clear any half-downloaded server. */
-  private reportFailure(e: unknown): StartFailure {
+  /** The token-free description of a failed start: what the Notice says, and what the terminal host shows beside Retry. */
+  private describeStartFailure(e: unknown): StartFailure {
     const cliDataDir = path.join(this.runtimeDir(), "cli-data");
     const last = this.data_.lastServer ?? null;
-    const failure = describeFailure(e, {
+    return describeFailure(e, {
       installedVersion: this.lastBuild?.versionText,
       installedCommit: this.lastBuild?.commit ?? null,
       lastServer: last,
       lastServerCached: last ? cachedServerCommits(cliDataDir).has(last.commit) : false,
     });
+  }
+
+  /** Show the Notice for a failed start (token-free) and clear any half-downloaded server. */
+  private reportFailure(e: unknown): StartFailure {
+    const cliDataDir = path.join(this.runtimeDir(), "cli-data");
+    const failure = this.describeStartFailure(e);
     if (failure.kind === "offline-first-run" || failure.kind === "offline-redownload" || failure.kind === "download") {
       removePartialDownloads(cliDataDir, this.cachedBefore);
     }

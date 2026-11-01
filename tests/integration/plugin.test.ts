@@ -74,11 +74,12 @@ afterEach(async () => {
 });
 
 describe("surface (F7)", () => {
-  it("adds one ribbon icon titled 'Open in VS Code' and two commands (open spike file, toggle terminal drawer), nothing else", async () => {
+  it("adds one ribbon icon titled 'Open in VS Code' and three commands (open spike file, toggle terminal drawer, the temporary terminal host test command PR-3 replaces), nothing else", async () => {
     await load();
     expect(Plugin.ribbon).toEqual([{ icon: "code-2", title: "Open in VS Code" }]);
     expect(Plugin.commands.map((c) => [c.id, c.name])).toEqual([
       ["open-spike-file", "Open spike file in Code tab"],
+      ["toggle-terminal-host-test", "Toggle terminal host (test)"],
       ["toggle-terminal-drawer", "Toggle terminal drawer"],
     ]);
     expect(Plugin.views).toEqual(["vscode-workbench-code"]);
