@@ -16,6 +16,7 @@ import { IDLE_MS } from "../../src/idle-timer";
 import * as profileModule from "../../src/profile/mirrored-profile";
 import { PROFILES, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
 import { FAKE_CODE, isAlive, listenersOn, tempDir } from "../helpers";
+import { FakeHostEl, FakeWorkbenchPage } from "../host-fakes";
 
 // The real profile lookup, wrapped so a test can count how often a start asks for it (and make it throw).
 vi.mock("../../src/profile/mirrored-profile", async (importOriginal) => {
@@ -31,6 +32,9 @@ let app: MockApp & { openedWithDefault: string[]; openWithDefaultApp: (p: string
 let windowListeners: Record<string, Array<(e?: unknown) => void>>;
 /** What the download-host reachability check answers: false = the network is down. */
 let networkUp = false;
+/** False: the workspace never reports its layout ready, so the drawer does not mount (a test that gives `document` a real-enough body for the host page only). */
+let layoutReady = true;
+let terminalPids: string;
 const strays: number[] = [];
 
 const DOWNLOADING = "VS Code Workbench: downloading the VS Code server. The first run needs internet and can take a minute.";
@@ -60,7 +64,7 @@ function makeApp(root: string): typeof app {
       copy: async (_f: unknown, p: string) => new TFile(p),
     },
     workspace: {
-      onLayoutReady: (cb: () => void) => cb(),
+      onLayoutReady: (cb: () => void) => (layoutReady ? cb() : undefined),
       activeFile: null as TFile | null,
       leaves: [] as WorkspaceLeaf[],
       getActiveFile: () => a.workspace.activeFile,
@@ -149,6 +153,8 @@ beforeEach(() => {
   handledModals = 0;
   windowListeners = {};
   networkUp = false;
+  layoutReady = true;
+  terminalPids = path.join(tempDir(), "terminal-pids");
   vi.stubGlobal("window", { addEventListener: (n: string, cb: (e?: unknown) => void) => (windowListeners[n] ??= []).push(cb) });
   vi.stubGlobal("document", { body: { classList: { contains: () => false } } });
 });
@@ -158,7 +164,7 @@ afterEach(async () => {
   plugin?.onunload();
   await new Promise((r) => setTimeout(r, 400));
   for (const pid of [...serverPids(), ...strays.splice(0)]) if (isAlive(pid)) process.kill(pid, "SIGKILL");
-  for (const k of ["FAKE_CODE_NODE", "FAKE_CODE_PIDFILE", "FAKE_CODE_ARGSFILE", "FAKE_CODE_MODE", "FAKE_CODE_HELP_DELAY", "FAKE_CODE_PARTIAL_DIR", "FAKE_CODE_OFFLINE_EXCEPT"]) delete process.env[k];
+  for (const k of ["FAKE_CODE_NODE", "FAKE_CODE_PIDFILE", "FAKE_CODE_ARGSFILE", "FAKE_CODE_MODE", "FAKE_CODE_HELP_DELAY", "FAKE_CODE_PARTIAL_DIR", "FAKE_CODE_OFFLINE_EXCEPT", "FAKE_CODE_TERMINAL_PIDFILE"]) delete process.env[k];
   vi.unstubAllGlobals();
 });
 
@@ -364,6 +370,8 @@ describe("idle stop (G13, E13)", () => {
     const wrapper = inner().manager.serverInstance as unknown as { pid: number; current: { port: number } };
     const pid = wrapper.pid;
     const port = wrapper.current.port;
+    // A fake clock cannot wait for a real `ps`: these tests are about the other two inputs, so the process table is empty (no shell).
+    (plugin as unknown as { processTable: () => Promise<string> }).processTable = async () => "";
     // restart the idle clock under fake timers, with the plugin's own wiring
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     inner().idle.stop();
@@ -1294,5 +1302,134 @@ describe("the mirrored profile is resolved at each server start and Restart serv
     await plugin.restartServer();
     expect(named()).toBe("FDE Practice");
     expect(snap()).toEqual(before);
+  });
+});
+
+describe("terminal keep-alive wiring (G10)", () => {
+  const terminalShells = () => (fs.existsSync(terminalPids) ? fs.readFileSync(terminalPids, "utf8").split("\n").filter(Boolean).map(Number) : []);
+  const killGroup = (pid: number) => {
+    try {
+      process.kill(-pid, "SIGKILL"); // the fake shell was spawned in its own process group, with its sleep
+    } catch {
+      /* already gone */
+    }
+  };
+  afterEach(() => {
+    for (const pid of terminalShells()) killGroup(pid);
+  });
+
+  it("load wires the dependency: with a shell under the server the idle clock does not count down, without one it does, and when the shell ends it does", async () => {
+    // control: a server with no terminal
+    await load({}, { serverLicenceAccepted: true });
+    await plugin.openSpikeFile();
+    inner().idle.stop();
+    inner().idle.start();
+    await inner().idle.evaluate();
+    expect(inner().idle.counting).toBe(true);
+    plugin.onunload();
+    await vi.waitFor(() => expect(serverPids().every((pid) => !isAlive(pid))).toBe(true), { timeout: 5000 });
+
+    // the same with a pty host and its shell under the server
+    fs.rmSync(pidFile, { force: true });
+    await load({ FAKE_CODE_TERMINAL_PIDFILE: terminalPids }, { serverLicenceAccepted: true });
+    await plugin.openSpikeFile();
+    await vi.waitFor(() => expect(terminalShells()).toHaveLength(1), { timeout: 5000 });
+    inner().idle.stop();
+    inner().idle.start();
+    await inner().idle.evaluate();
+    expect(inner().idle.counting).toBe(false); // a live shell: no countdown
+    expect(inner().manager.state).toBe("running");
+
+    killGroup(terminalShells()[0]);
+    await vi.waitFor(() => expect(isAlive(terminalShells()[0])).toBe(false), { timeout: 5000 });
+    await inner().idle.evaluate();
+    expect(inner().idle.counting).toBe(true); // the shell is gone: the clock starts
+  });
+
+  it("on a fake clock: a shell in the server's process tree keeps it running for 30 minutes; once it is gone the clock starts and the server stops 5 minutes later", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    await plugin.openSpikeFile();
+    const wrapper = (inner().manager.serverInstance as unknown as { pid: number }).pid;
+    const table = (...rows: string[]) => rows.join("\n") + "\n";
+    const server = [`${wrapper} 1 code serve-web`, `${wrapper + 1} ${wrapper} node server-main.js`, `${wrapper + 2} ${wrapper + 1} node bootstrap-fork --type=ptyHost`];
+    let rows = [...server, `${wrapper + 3} ${wrapper + 2} /bin/zsh -il`, `${wrapper + 4} ${wrapper + 3} sleep 600`];
+    (plugin as unknown as { processTable: () => Promise<string> }).processTable = async () => table(...rows);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    inner().idle.stop();
+    inner().idle.start();
+
+    await vi.advanceTimersByTimeAsync(30 * 60_000); // the drawer may be shown or hidden: nothing in this path reads it
+    expect(inner().manager.state).toBe("running");
+
+    rows = server; // the shell closed
+    await vi.advanceTimersByTimeAsync(5_000); // the poll sees it and the clock starts
+    await vi.advanceTimersByTimeAsync(IDLE_MS - 1000);
+    expect(inner().manager.state).toBe("running");
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(inner().manager.state).toBe("stopped-by-idle");
+  });
+
+  describe("the host page", () => {
+    let body: FakeHostEl;
+    beforeEach(() => {
+      layoutReady = false;
+      body = new FakeHostEl("body");
+      (body as unknown as { classList: object }).classList = { contains: () => false };
+      vi.stubGlobal("document", {
+        body,
+        createElement: (tag: string) => {
+          const e = new FakeHostEl(tag);
+          if (tag === "webview") e.page = new FakeWorkbenchPage();
+          return e;
+        },
+      });
+    });
+    const host = () => (plugin as unknown as { terminalHost: { settled(): Promise<void>; dispose(): void } | null }).terminalHost;
+
+    it("creating the host page, its page becoming ready and closing it each call idle.evaluate() (as a Code tab change does)", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      const evaluate = vi.spyOn(inner().idle, "evaluate");
+      expect(host()).toBeNull();
+
+      plugin.showTerminalHost();
+      expect(host()).not.toBeNull();
+      const afterCreate = evaluate.mock.calls.length;
+      expect(afterCreate).toBeGreaterThanOrEqual(1); // created (and the start began)
+
+      await host()!.settled();
+      expect(evaluate.mock.calls.length).toBeGreaterThan(afterCreate); // the page is ready
+      expect(inner().manager.state).toBe("running");
+
+      const beforeClose = evaluate.mock.calls.length;
+      host()!.dispose();
+      expect(evaluate.mock.calls.length).toBe(beforeClose + 1); // closed
+    });
+
+    it("hiding and showing the drawer does not re-read the idle inputs: drawer visibility makes no difference", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      plugin.showTerminalHost();
+      await host()!.settled();
+      const evaluate = vi.spyOn(inner().idle, "evaluate");
+      plugin.hideTerminalHost();
+      plugin.showTerminalHost();
+      plugin.hideTerminalHost();
+      expect(evaluate).not.toHaveBeenCalled();
+    });
+
+    it("unload stops the timer: no countdown and no poller is left, and a late evaluation starts nothing", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      plugin.showTerminalHost();
+      await host()!.settled();
+      inner().idle.stop();
+      inner().idle.start();
+      await inner().idle.evaluate();
+      expect(inner().idle.counting).toBe(true);
+
+      plugin.onunload();
+      expect(inner().idle.counting).toBe(false);
+      await inner().idle.evaluate();
+      expect(inner().idle.counting).toBe(false);
+      expect(host()).toBeNull();
+    });
   });
 });

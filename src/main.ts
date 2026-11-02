@@ -11,6 +11,8 @@ import { scanVault } from "./extension-scan";
 import { createClickInterceptor, readMode, type ClickLike, type ExtensionlessMode } from "./extensionless-intercept";
 import { describeFailure, type StartFailure } from "./failure-messages";
 import { IdleTimer } from "./idle-timer";
+import { hasLiveTerminalShell } from "./terminal-keepalive";
+import { readProcessTable } from "./process-utils";
 import { LicenceDeclinedError, LicenceGate } from "./licence";
 import { promptCloseDirty, promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard, type CloseDirtyRequest } from "./modals";
 import { OpenFiles } from "./open-file";
@@ -148,6 +150,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private mirrorCache = new MirrorStateCache();
   /** What the trust seed answered at the last Code tab load that ran it; shown in settings. In memory only: nothing about it is stored. */
   private lastTrustOutcome: string | null = null;
+  /** Tests only: replaces the process table reader that the live-shell check uses (a fake clock cannot wait for a real `ps`). */
+  private processTable: () => Promise<string> = readProcessTable;
   /** Tests only: replaces the reachability check that turns a failed download into "the network is unreachable". */
   private downloadHostReachable?: () => Promise<boolean>;
 
@@ -174,6 +178,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.idle = new IdleTimer({
       visibleCodeTab: () => [...this.views].some((v) => v.isVisible()),
       hasDirtyBuffer: async () => (await this.dirtyViews()).length > 0,
+      // A live terminal shell under the server keeps it up, drawer shown or hidden (G10). Read from the server's own process tree.
+      liveTerminalShell: () => hasLiveTerminalShell(this.manager.serverInstance?.pid, () => this.processTable()),
       onIdle: () => this.manager.stop("idle"),
     });
     this.manager.onChange((state) => {
@@ -574,7 +580,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   /** The host page, made on first use; null once the plugin has unloaded. Its start goes through `ensureServer` and the licence gate: one server, one modal. */
   private terminalHostPage(): TerminalHostPage | null {
     if (this.unloaded) return null;
-    this.terminalHost ??= new TerminalHostPage({
+    if (this.terminalHost) return this.terminalHost;
+    this.terminalHost = new TerminalHostPage({
       createElement: (tag) => document.createElement(tag),
       parent: document.body,
       vaultRoot: () => this.vaultRoot(),
@@ -591,7 +598,10 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       noteTrustOutcome: (outcome) => this.noteTrustOutcome(outcome),
       attachKeys: (frame) => this.keyRelay?.attach(frame as unknown as RelayFrame) ?? (() => undefined),
       closedByHost: () => this.drawer?.hostClosed(),
+      // The page was created, became ready or lost its page, failed or was closed: what the idle clock sees may have changed.
+      stateChanged: () => void this.idle?.evaluate(),
     });
+    void this.idle?.evaluate(); // the host page was just created
     return this.terminalHost;
   }
 

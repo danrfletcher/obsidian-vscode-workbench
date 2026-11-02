@@ -3,7 +3,7 @@
  * orphan sweep. Everything here is synchronous or tiny so that quit and unload
  * can signal children before the app goes away.
  */
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 
 /** Parse `ps -A -o pid=,ppid=` output into all descendant pids of `rootPid`. */
 export function descendantsFromPs(psOutput: string, rootPid: number): number[] {
@@ -37,6 +37,16 @@ export function listDescendants(rootPid: number): number[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * The whole process table as `ps -A -o pid=,ppid=,command=` text, read without blocking the app. Rejects when `ps` fails;
+ * the caller decides what a failed read means. `descendantsFromPs` reads the same text (it uses the first two columns).
+ */
+export function readProcessTable(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile("ps", ["-A", "-ww", "-o", "pid=,ppid=,command="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
+  });
 }
 
 /** The full command line of a live pid, or null when no such process exists. */

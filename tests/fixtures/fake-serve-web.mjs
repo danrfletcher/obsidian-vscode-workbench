@@ -18,9 +18,13 @@
 //   process group (the pty's session) with a child `python3 -m http.server p --bind 127.0.0.1`. The shell's pid is
 //   appended to FAKE_CODE_SHELL_PIDFILE. The shell is a descendant of the server and carries neither the server's
 //   token-file path nor "serve-web" on its command line, like a real shell under the pty host.
+// FAKE_CODE_TERMINAL_PIDFILE=f makes the server start a pty host the way the real one does (fake-pty-host.mjs: a node process
+//   with `--type=ptyHost` on its command line) whose one terminal is a long-lived `sh`. The shell's pid is appended to f.
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const args = process.argv.slice(2);
 const arg = (name) => {
@@ -37,6 +41,10 @@ if (process.env.FAKE_CODE_SHELL_PORT) {
   const shell = spawn("sh", ["-c", `python3 -m http.server ${process.env.FAKE_CODE_SHELL_PORT} --bind 127.0.0.1; true`], { detached: true, stdio: "ignore", env: { ...process.env, FAKE_CODE_SHELL_PORT: "", FAKE_CODE_PIDFILE: "" } });
   shell.unref();
   if (process.env.FAKE_CODE_SHELL_PIDFILE) fs.appendFileSync(process.env.FAKE_CODE_SHELL_PIDFILE, `${shell.pid}\n`);
+}
+if (process.env.FAKE_CODE_TERMINAL_PIDFILE) {
+  const ptyHost = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-pty-host.mjs");
+  spawn(process.execPath, [ptyHost, "--type=ptyHost"], { detached: true, stdio: "ignore", env: process.env }).unref();
 }
 if (process.env.FAKE_CODE_ARGSFILE) fs.writeFileSync(process.env.FAKE_CODE_ARGSFILE, JSON.stringify(args));
 

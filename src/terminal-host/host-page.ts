@@ -67,6 +67,8 @@ export interface TerminalHostDeps {
   attachKeys?(frame: HTMLElement): () => void;
   /** The host hid itself (the licence was declined), not because `hide` was called: the drawer closes. */
   closedByHost?(): void;
+  /** The host's phase changed (a start began, the page is ready or was lost, a start failed, the host was closed): the plugin re-reads the idle clock's inputs. */
+  stateChanged?(): void;
   /** Timings, overridable for tests. */
   pollMs?: number;
   loadMs?: number;
@@ -234,10 +236,12 @@ export class TerminalHostPage {
 
   private dispatch(event: HostEvent): void {
     const wasVisible = this.state.visible;
+    const before = this.state;
     const step = reduceHost(this.state, event);
     this.state = step.state;
     for (const effect of step.effects) this.carryOut(effect);
     this.render();
+    if (step.state.phase !== before.phase || step.state.disposed !== before.disposed) this.deps.stateChanged?.();
     // The host closed itself (a declined licence): the drawer that asked for it follows. A `hide` or the unload came from the caller.
     if (wasVisible && !step.state.visible && event.type !== "hide" && event.type !== "dispose") this.deps.closedByHost?.();
   }
