@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import {
   AUTO_SAVE_KEY,
@@ -11,6 +12,7 @@ import {
   type Choice,
   type GuardAction,
 } from "../../src/dirty-guard";
+import { DIRTY_SCRIPT, fileDirtyScript } from "../../src/dirty-script";
 
 describe("decide: the unsaved-buffer rule for close, idle and quit", () => {
   // caller, buffer state, auto-save -> what happens next
@@ -90,5 +92,53 @@ describe("auto-save from the instance's settings", () => {
     const none = {};
     withAutoSaveDefault(none);
     expect(none).toEqual({});
+  });
+});
+
+// Characterisation (chrome spike S5, docs/spike-chrome.md): with the tab strip hidden there is no `.tab` element, and both
+// scripts read `.tab.dirty` / `data-resource-name`. These cases pin what they answer today, so PR-5 changes them on purpose.
+describe("the dirty scripts on a workbench page with no tab strip (S5, the gap PR-5 closes)", () => {
+  /** The shape measured on VS Code 1.143.1 and 1.144.0 with `workbench.editor.showTabs: none`: an editor, no `.tab`. */
+  function page(title: string): Document {
+    const html = `<!doctype html><title>${title}</title>
+      <div class="monaco-workbench"><div class="part editor"><div class="editor-group-container">
+        <div class="monaco-editor" data-uri="vscode-remote://127.0.0.1:1/vault/a.js"><textarea class="inputarea"></textarea></div>
+      </div></div></div>`;
+    return new DOMParser().parseFromString(html, "text/html");
+  }
+  const dirtyOf = (doc: Document) => new Function("document", `return ${DIRTY_SCRIPT}`)(doc) as boolean;
+  const fileDirtyOf = (doc: Document, name: string) => new Function("document", `return ${fileDirtyScript(name)}`)(doc) as string;
+
+  it("has no `.tab` to read, whatever the editor holds", () => {
+    expect(page("a.js \u2014 vault \u2014 Visual Studio Code").querySelector(".monaco-workbench .tab")).toBeNull();
+  });
+
+  it("reads a dirty ACTIVE editor only through the window title mark; fileDirtyScript can say nothing about the file", () => {
+    const doc = page("\u25cf a.js \u2014 vault \u2014 Visual Studio Code");
+    expect(dirtyOf(doc)).toBe(true); // the title mark is the one signal left
+    expect(fileDirtyOf(doc, "a.js")).toBe("none"); // no tab carries the name: the caller keeps the page-wide answer
+  });
+
+  it("reads clean for a dirty editor that is not the active one: the title names the active editor only", () => {
+    // a.js holds unsaved edits but c.txt is active, so the title has no mark (measured: "c.txt \u2014 vault \u2014 Visual Studio Code")
+    const doc = page("c.txt \u2014 vault \u2014 Visual Studio Code");
+    expect(dirtyOf(doc)).toBe(false); // the gap: a dirty buffer reads clean
+    expect(fileDirtyOf(doc, "a.js")).toBe("none");
+  });
+
+  it("reads clean when a user `window.title` setting drops the dirty mark", () => {
+    const doc = page("a.js");
+    expect(dirtyOf(doc)).toBe(false);
+    expect(fileDirtyOf(doc, "a.js")).toBe("none");
+  });
+
+  it("still reads a dirty tab when the strip is shown (today's behaviour, unchanged)", () => {
+    const doc = new DOMParser().parseFromString(
+      `<!doctype html><title>a.js</title><div class="monaco-workbench"><div class="tab dirty" data-resource-name="a.js"></div><div class="tab" data-resource-name="b.js"></div></div>`,
+      "text/html",
+    );
+    expect(dirtyOf(doc)).toBe(true);
+    expect(fileDirtyOf(doc, "a.js")).toBe("dirty");
+    expect(fileDirtyOf(doc, "b.js")).toBe("clean");
   });
 });

@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { parseDecision, stopMessage } from "../decision";
+import { chromeStopMessage, parseDecision, stopMessage } from "../decision";
 import { REPO_ROOT } from "../helpers";
 
 const ok = "---\nembed: works\nchrome: hidden\nhotkey_bridge: yes\nextensionless: intercept\n---\nbody";
@@ -36,6 +36,25 @@ describe("stopMessage", () => {
   it("is silent for works or partial", () => {
     expect(stopMessage({ embed: "works", chrome: "hidden", hotkey_bridge: "yes", extensionless: "intercept" })).toBeNull();
     expect(stopMessage({ embed: "partial", chrome: "visible", hotkey_bridge: "no", extensionless: "system-app" })).toBeNull();
+  });
+});
+
+describe("chromeStopMessage: the side bar stop rule (E10)", () => {
+  // side bar hideable on 1.143.1, on 1.144.0 -> stops?
+  const table: Array<[boolean, boolean, boolean]> = [
+    [true, true, false],
+    [true, false, false], // one build hiding it is a pass; the other build's gap goes in the report
+    [false, true, false],
+    [false, false, true], // neither build: STOP
+  ];
+  it.each(table)("1.143.1 hideable %s, 1.144.0 hideable %s -> stop %s", (older, newer, stops) => {
+    const message = chromeStopMessage({ "1.143.1": older, "1.144.0": newer });
+    if (stops) expect(message).toMatch(/^STOP: ask Dan/);
+    else expect(message).toBeNull();
+  });
+
+  it("covers every combination of the two builds", () => {
+    expect(new Set(table.map(([a, b]) => `${a}/${b}`)).size).toBe(4);
   });
 });
 

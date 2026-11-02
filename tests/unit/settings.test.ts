@@ -203,6 +203,35 @@ describe("buildBrowserSeedScript with the copy of the instance's settings and ke
     expect(r.keybindings).toBeUndefined();
   });
 
+  // Characterisation (chrome spike S3): the seed treats keybindings.json as the instance's file, not as ours. Chord
+  // disables written into the profile's file (`-command` entries) are not in the instance's copy, so a seed with a new
+  // copy id wipes them. A later PR must append them to the copied file (or re-apply them on every load); nothing does today.
+  it("replaces a profile keybindings.json that holds `-command` chord disables with the copy, so the disables are lost and need a re-apply route (S3)", async () => {
+    const disables = [
+      { key: "cmd+b", command: "-workbench.action.toggleSidebarVisibility" },
+      { key: "cmd+j", command: "-workbench.action.togglePanel" },
+      { key: "cmd+k z", command: "-workbench.action.toggleZenMode" },
+      { key: "cmd+w", command: "-workbench.action.closeActiveEditor" },
+    ];
+    const withDisables = new TextEncoder().encode(JSON.stringify(disables));
+    const initial = { "/User/settings.json": new TextEncoder().encode("{}"), "/User/keybindings.json": withDisables };
+    const storage = fakeStorage();
+
+    // the same copy id (a tab reload): the profile's file is left alone, the disables are still there
+    storage.map.set(USER_DATA_MARKER_KEY, "start-1");
+    const reload = await runSeed(initial, copy, storage);
+    expect(reload.keybindings).toContain("-workbench.action.toggleSidebarVisibility");
+
+    // a new copy id (a server start): the copy replaces the file whole, and none of the four disables survive
+    const start = await runSeed(initial, { ...copy, id: "start-2" }, storage);
+    expect(start.keybindings).toBe(kb);
+    for (const d of disables) expect(start.keybindings).not.toContain(d.command);
+
+    // and a copy with no keybindings removes the file, the disables with it
+    const bare = await runSeed(initial, { ...copy, id: "start-3", keybindingsBase64: null }, fakeStorage());
+    expect(bare.keybindings).toBeUndefined();
+  });
+
   it("drops a key the instance removed since the last start, instead of keeping it in the profile (PR-3 R4)", async () => {
     const storage = fakeStorage();
     const first = await runSeed(undefined, { ...copy, settings: { "editor.fontSize": 23, "editor.rulers": [80] } }, storage);

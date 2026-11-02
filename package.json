@@ -15,7 +15,8 @@
     "check:trust": "node tests/render/trust-check.mjs",
     "check:workbench": "node tests/render/workbench-check.mjs",
     "check:extensions-spike": "node tests/render/extension-spike.mjs",
-    "check:terminal-spike": "node tests/render/terminal-spike-check.mjs"
+    "check:terminal-spike": "node tests/render/terminal-spike-check.mjs",
+    "check:chrome-spike": "node tests/render/chrome-spike-check.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
