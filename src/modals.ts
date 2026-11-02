@@ -187,29 +187,20 @@ export function promptCloseDirty(app: App, req: CloseDirtyRequest): Promise<"sav
   }).ask();
 }
 
-/** Restarting the server while Code tabs hold unsaved changes. Escape cancels. */
-export function promptRestartWithDirty(app: App, files: string[]): Promise<boolean> {
+/**
+ * Restarting a running server that holds unsaved Code buffers or live terminal shells (G12). One prompt with a line for each:
+ * the dirty line when `files` is not empty, and `terminalLine` ("N terminals will end.") when it is not null. Escape cancels.
+ */
+export function promptRestartWithDirty(app: App, files: string[], terminalLine: string | null = null): Promise<boolean> {
+  const lines: string[] = [];
+  if (files.length) lines.push(`${files.join(", ")} ${files.length === 1 ? "has" : "have"} unsaved changes. Restarting reloads every Code tab, and unsaved changes are lost.`);
+  if (terminalLine !== null) lines.push(terminalLine);
   return new ChoiceModal<boolean>(app, {
     title: "Restart the VS Code server?",
-    lines: [
-      `${files.join(", ")} ${files.length === 1 ? "has" : "have"} unsaved changes. Restarting reloads every Code tab, and unsaved changes are lost.`,
-    ],
+    lines,
     choices: [
       { label: "Cancel", value: false },
       { label: "Restart and discard changes", value: true, warning: true },
-    ],
-    dismiss: false,
-  }).ask();
-}
-
-/** Killing a running terminal shell (G10). true only for an explicit Kill; Cancel, Escape and clicking away keep the shell. */
-export function promptKillShell(app: App, title: string): Promise<boolean> {
-  return new ChoiceModal<boolean>(app, {
-    title: `Kill ${title}?`,
-    lines: [`${title} is still running. Killing it ends the shell and any program running in it, and its scrollback is lost.`],
-    choices: [
-      { label: "Cancel", value: false },
-      { label: "Kill shell", value: true, warning: true },
     ],
     dismiss: false,
   }).ask();

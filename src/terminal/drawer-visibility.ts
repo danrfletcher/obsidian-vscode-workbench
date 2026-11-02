@@ -1,10 +1,11 @@
 /**
- * When the strip, the drawer and the reveal hotkey are available (G11, GP6).
+ * When the bottom edge, the drawer and the reveal hotkey are available (G6).
  *
- * A Code tab always has them. Notes, canvas, graph, PDF and every other view are governed
- * by the one "non-code views" setting, identically: on shows them, off hides them. The
- * drawer's open state is not part of this and is never changed by it, so turning the
- * setting back on brings the same open drawer, with the same shells, back.
+ * A Code tab always has the edge. Notes, canvas, graph, PDF and every other view are governed by the one "drawer over
+ * non-code views" setting, identically: on shows the always-visible edge, off hides it. The setting only decides that edge.
+ * The reveal command and its hotkey are explicit actions and work over every view, and an open drawer stays open and shown
+ * when the view changes or the setting is turned off. The open state is an input and is never changed here, so turning the
+ * setting back on brings the edge back without closing an open drawer.
  */
 
 export type ViewKind = "code" | "markdown" | "canvas" | "graph" | "pdf" | "other";
@@ -25,22 +26,21 @@ export function viewKind(viewType: string | null | undefined, codeViewType: stri
 
 export interface VisibilityInput {
   kind: ViewKind;
-  /** The "terminal drawer over non-code views" setting. */
+  /** The "drawer over non-code views" setting. */
   nonCodeDrawer: boolean;
-  /** The drawer is open (what was last asked for, shown or not). */
+  /** The drawer is open (what was last asked for). */
   drawerOpen: boolean;
 }
 
 export interface Visibility {
-  /** The strip at the bottom edge is on the page. */
-  strip: boolean;
-  /** The drawer is on the page and showing its shells. */
+  /** The always-visible edge at the bottom of the main pane area is on the page. */
+  edge: boolean;
+  /** The drawer is on the page and showing the terminal. */
   drawer: boolean;
-  /** The reveal command and its hotkey work. */
+  /** The reveal command and its hotkey work. True over every view. */
   hotkey: boolean;
 }
 
 export function drawerVisibility(input: VisibilityInput): Visibility {
-  const available = input.kind === "code" || input.nonCodeDrawer;
-  return { strip: available, drawer: available && input.drawerOpen, hotkey: available };
+  return { edge: input.kind === "code" || input.nonCodeDrawer, drawer: input.drawerOpen, hotkey: true };
 }

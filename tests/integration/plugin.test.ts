@@ -83,6 +83,19 @@ describe("surface (F7)", () => {
     ]);
     expect(Plugin.views).toEqual(["vscode-workbench-code"]);
   });
+
+  it("adds no status bar item: not at load, not after a file is opened and a server runs, not after unload (G11)", async () => {
+    const spy = vi.spyOn(Plugin.prototype, "addStatusBarItem");
+    await load();
+    expect(spy).not.toHaveBeenCalled();
+    await plugin.openSpikeFile();
+    expect(serverPids().length).toBeGreaterThan(0);
+    expect(spy).not.toHaveBeenCalled();
+    plugin.onunload();
+    expect(spy).not.toHaveBeenCalled();
+    expect(Plugin.statusBarItems).toEqual([]);
+    spy.mockRestore();
+  });
 });
 
 describe("opening files", () => {
@@ -199,6 +212,35 @@ describe("unload", () => {
       expect(isAlive(serverPid)).toBe(false);
       expect(listenersOn(port)).toEqual([]);
     }, { timeout: 5000 });
+  });
+
+  it("leaves no interval or timeout of its own behind (the chord sync, the idle timer and the host page go with it)", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout"] });
+    try {
+      await load();
+      expect(vi.getTimerCount()).toBeGreaterThan(0); // the control: the plugin does start a timer, so zero below means it was stopped
+      plugin.onunload();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a pty_helper.py left in .server by 0.1.0 is neither read, run, rewritten nor removed, and nothing fails on it", async () => {
+    const serverDir = path.join(vault, ".obsidian/plugins/obsidian-vscode-workbench/.server");
+    fs.mkdirSync(serverDir, { recursive: true });
+    const helper = path.join(serverDir, "pty_helper.py");
+    fs.writeFileSync(helper, "raise SystemExit('must never run')\n", { mode: 0o444 });
+    const before = fs.statSync(helper);
+    await load();
+    await plugin.openSpikeFile();
+    expect(Notice.messages.filter((m) => /fail|error|helper|python/i.test(m))).toEqual([]); // the one first-run download notice is normal
+    expect(serverPids().length).toBeGreaterThan(0);
+    plugin.onunload();
+    const after = fs.statSync(helper);
+    expect(fs.readFileSync(helper, "utf8")).toBe("raise SystemExit('must never run')\n");
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect(after.mode).toBe(before.mode);
   });
 
   it("never writes the token anywhere in the vault except the token file itself", async () => {

@@ -519,15 +519,14 @@ describe("the real CodeView (PR-4 R7)", () => {
     expect(realLive()).toHaveLength(2);
   });
 
-  it("hiding the drawer from the terminal over a Code tab focuses the real CodeView's embed (GP5e, PR-8 R4)", async () => {
+  it("hiding the drawer over a Code tab hands keyboard focus to that leaf's real CodeView embed (G1)", async () => {
     const f = write("a.py");
     await loadReal();
     await plugin.openCodeFile(f);
     const tab = realLive()[0];
     const embed = (tab.view as unknown as { frame: FakeEmbed }).frame;
-    (app.workspace as unknown as { getActiveViewOfType: () => unknown }).getActiveViewOfType = () => tab.view; // the real CodeView, not a plain object
     const before = embed.focused;
-    (plugin as unknown as { focusActiveEditor(): void }).focusActiveEditor();
+    (plugin as unknown as { focusLeafView(leaf: unknown): void }).focusLeafView(tab); // what the drawer's focus-return calls on hide
     expect(embed.focused).toBe(before + 1);
   });
 

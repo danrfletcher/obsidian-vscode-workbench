@@ -13,7 +13,9 @@ import { ChildRegistry } from "../../src/child-registry";
 import { PidFile } from "../../src/pidfile";
 import { describeFailure } from "../../src/failure-messages";
 import { ServerStartError, WorkbenchServer, type CodeBuild } from "../../src/server";
+import { IdleTimer } from "../../src/idle-timer";
 import { ServerManager } from "../../src/server-manager";
+import { hasLiveTerminalShell } from "../../src/terminal-keepalive";
 import { FAKE_CODE, isAlive, listenersOn, tempDir } from "../helpers";
 
 const build: CodeBuild = { cli: FAKE_CODE, version: [1, 0, 0], versionText: "1.0.0", extensionsDir: null };
@@ -26,7 +28,7 @@ let pidfile: PidFile;
 let managers: ServerManager[] = [];
 const extraPids: number[] = [];
 
-function makeManager(over: { runtimeDir?: string; workspace?: string; healthIntervalMs?: number } = {}): ServerManager {
+function makeManager(over: { runtimeDir?: string; workspace?: string; healthIntervalMs?: number; env?: Record<string, string> } = {}): ServerManager {
   const m = new ServerManager({
     registry,
     healthIntervalMs: over.healthIntervalMs ?? 0,
@@ -38,7 +40,7 @@ function makeManager(over: { runtimeDir?: string; workspace?: string; healthInte
         pollIntervalMs: 25,
         registry,
         workspace: over.workspace,
-        env: { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: fakePids, FAKE_CODE_ARGSFILE: argsFile },
+        env: { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: fakePids, FAKE_CODE_ARGSFILE: argsFile, ...over.env },
       }),
   });
   managers.push(m);
@@ -46,12 +48,24 @@ function makeManager(over: { runtimeDir?: string; workspace?: string; healthInte
 }
 
 const serverPids = () => (fs.existsSync(fakePids) ? fs.readFileSync(fakePids, "utf8").split("\n").filter(Boolean).map(Number) : []);
+let terminalPids: string;
+const idles: IdleTimer[] = [];
+const terminalShells = () => (terminalPids && fs.existsSync(terminalPids) ? fs.readFileSync(terminalPids, "utf8").split("\n").filter(Boolean).map(Number) : []);
+/** End a terminal's shell and everything it started: it was spawned in its own process group. */
+const killGroup = (pid: number) => {
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    /* already gone */
+  }
+};
 const argsOf = (pid: number) => execFileSync("ps", ["-ww", "-o", "args=", "-p", String(pid)], { encoding: "utf8" });
 const until = (fn: () => void) => import("vitest").then(({ vi }) => vi.waitFor(fn, { timeout: 8000, interval: 50 }));
 
 beforeEach(() => {
   runtimeDir = path.join(tempDir(), ".server");
   fakePids = path.join(tempDir(), "fake-pids");
+  terminalPids = path.join(tempDir(), "terminal-pids");
   argsFile = path.join(tempDir(), "args.json");
   pidfile = new PidFile(path.join(runtimeDir, "pids.json"));
   registry = new ChildRegistry(pidfile);
@@ -59,7 +73,9 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  for (const i of idles.splice(0)) i.stop();
   await Promise.all(managers.map((m) => m.stop("quit")));
+  for (const pid of terminalShells()) if (isAlive(pid)) killGroup(pid);
   for (const pid of [...serverPids(), ...extraPids.splice(0)]) if (isAlive(pid)) process.kill(pid, "SIGKILL");
 });
 
@@ -167,6 +183,41 @@ describe("crash (kill -9)", () => {
     await new Promise((res) => setTimeout(res, 400));
     expect(serverPids()).toHaveLength(2);
     expect(m.state).toBe("crashed");
+  });
+
+  it("with live shells under the server (FAKE_CODE_SHELLS), kill -9 gives crashed, the crash cleanup ends the shells, a setsid child is left alone, nothing restarts, and Restart gives a new port and token (G13, E6)", async () => {
+    const m = makeManager({ env: { FAKE_CODE_SHELLS: "3", FAKE_CODE_SHELL_KINDS: "sleep,fg,ignore" } });
+    const first = await m.ensureStarted();
+    const listed = () => {
+      const lines = fs.readFileSync(fakePids, "utf8").split("\n").filter(Boolean).map((l) => l.split(" "));
+      return {
+        servers: lines.filter((l) => l.length === 1).map((l) => Number(l[0])),
+        shells: lines.filter((l) => l[0] === "shell").map((l) => Number(l[1])),
+        setsid: lines.filter((l) => l[0] === "setsid").map((l) => Number(l[1])),
+      };
+    };
+    await until(() => {
+      expect(listed().shells).toHaveLength(3);
+      expect(listed().setsid).toHaveLength(1);
+    });
+    const { servers, shells, setsid } = listed();
+    extraPids.push(...setsid, ...shells);
+    for (const pid of shells) expect(isAlive(pid)).toBe(true);
+
+    process.kill(servers[0], "SIGKILL");
+    await until(() => expect(m.state).toBe("crashed"));
+    // the crash cleanup, not the test, ends the shells (the one that ignores SIGTERM takes the stop's grace period)
+    await until(() => expect(shells.filter(isAlive)).toEqual([]));
+    expect(listenersOn(first.port)).toEqual([]);
+    expect(isAlive(setsid[0])).toBe(true); // out of the server's group and session: the documented exception
+    await new Promise((res) => setTimeout(res, 400));
+    expect(m.state).toBe("crashed");
+    expect(listed().servers).toHaveLength(1); // nothing restarted by itself
+
+    const second = await m.restart();
+    expect(m.state).toBe("running");
+    expect(second.port).not.toBe(first.port);
+    expect(second.token).not.toBe(first.token);
   });
 
   it("a server that stops answering while its process lingers is noticed by the health probe", async () => {
@@ -304,4 +355,81 @@ describe("start failures with real processes", () => {
   function managersState() {
     return managers[managers.length - 1].state;
   }
+});
+
+describe("G10 keep-alive with a real shell under the server", () => {
+  /** The plugin's wiring: an idle clock on the manager whose shell input reads the real process table under the server's pid. */
+  function idleOn(m: ServerManager, idleMs: number): IdleTimer {
+    const idle = new IdleTimer({
+      visibleCodeTab: () => false,
+      hasDirtyBuffer: () => false,
+      liveTerminalShell: () => hasLiveTerminalShell(m.serverInstance?.pid),
+      onIdle: () => m.stop("idle"),
+      idleMs,
+      // A process table read takes tens of ms. The poll must not tick inside the re-check at the moment the clock runs out
+      // (a newer evaluation supersedes it): 1000 ms + one read lands between two ticks of a 400 ms poll.
+      pollMs: 400,
+    });
+    idles.push(idle);
+    m.onChange((state) => (state === "running" ? idle.start() : idle.stop()));
+    return idle;
+  }
+  const waitForShell = async () => {
+    await until(() => expect(terminalShells()).toHaveLength(1));
+    const [shell] = terminalShells();
+    expect(isAlive(shell)).toBe(true);
+    return shell;
+  };
+
+  it("with no shell the server stops by idle after idleMs (the control for the test below)", async () => {
+    const m = makeManager();
+    idleOn(m, 1000);
+    await m.ensureStarted();
+    await until(() => expect(m.state).toBe("stopped-by-idle"));
+  });
+
+  it("with a live shell the state stays running well past idleMs; after the shell is killed it goes to stopped-by-idle", async () => {
+    const m = makeManager({ env: { FAKE_CODE_TERMINAL_PIDFILE: terminalPids } });
+    idleOn(m, 1000);
+    const r = await m.ensureStarted();
+    const shell = await waitForShell();
+    // the shell is a descendant of the server's wrapper, and the check sees it
+    expect(await hasLiveTerminalShell(m.serverInstance?.pid)).toBe(true);
+
+    await new Promise((res) => setTimeout(res, 3300)); // three times idleMs
+    expect(m.state).toBe("running");
+    expect(isAlive(shell)).toBe(true);
+    expect(listenersOn(r.port).length).toBeGreaterThan(0);
+
+    killGroup(shell);
+    await until(() => expect(isAlive(shell)).toBe(false));
+    expect(await hasLiveTerminalShell(m.serverInstance?.pid)).toBe(false); // the pty host is still there; its shell is gone
+    await until(() => expect(m.state).toBe("stopped-by-idle"));
+    expect(listenersOn(r.port)).toEqual([]);
+  });
+
+  it("a hung shell (stopped with SIGSTOP) still counts until it is closed", async () => {
+    const m = makeManager({ env: { FAKE_CODE_TERMINAL_PIDFILE: terminalPids } });
+    idleOn(m, 1000);
+    await m.ensureStarted();
+    const shell = await waitForShell();
+    process.kill(shell, "SIGSTOP");
+    await new Promise((res) => setTimeout(res, 3300));
+    expect(m.state).toBe("running");
+    expect(await hasLiveTerminalShell(m.serverInstance?.pid)).toBe(true);
+    process.kill(shell, "SIGCONT");
+    killGroup(shell);
+    await until(() => expect(m.state).toBe("stopped-by-idle"));
+  });
+
+  it("a manual stop with a shell alive stops the clock too: the server, the shell and the poller all end", async () => {
+    const m = makeManager({ env: { FAKE_CODE_TERMINAL_PIDFILE: terminalPids } });
+    const idle = idleOn(m, 1000);
+    await m.ensureStarted();
+    const shell = await waitForShell();
+    await m.stop("manual");
+    expect(m.state).toBe("stopped");
+    expect(idle.counting).toBe(false);
+    await until(() => expect(isAlive(shell)).toBe(false)); // stop() took the whole tree down
+  });
 });

@@ -6,8 +6,6 @@ import {
   DEFAULT_SETTINGS,
   addExtension,
   dataObject,
-  defaultShell,
-  effectiveShell,
   normaliseExtension,
   normaliseExtensionList,
   readSettings,
@@ -22,7 +20,6 @@ describe("defaults", () => {
       customCliPath: null,
       excludeExtensions: [],
       nonCodeDrawer: true,
-      shellPath: "",
       stablePort: null,
       trustVaultFolder: true,
     });
@@ -34,13 +31,23 @@ describe("defaults", () => {
     expect(readSettings({}).nonCodeDrawer).toBe(true);
   });
 
-  it("the shell defaults to $SHELL, else /bin/zsh", () => {
-    expect(defaultShell({ SHELL: "/opt/homebrew/bin/fish" })).toBe("/opt/homebrew/bin/fish");
-    expect(defaultShell({})).toBe("/bin/zsh");
-    expect(defaultShell({ SHELL: "" })).toBe("/bin/zsh");
-    expect(defaultShell({ SHELL: "zsh" })).toBe("/bin/zsh"); // not an absolute path
-    expect(effectiveShell({ shellPath: "" }, { SHELL: "/bin/bash" })).toBe("/bin/bash");
-    expect(effectiveShell({ shellPath: "  /usr/bin/fish " }, { SHELL: "/bin/bash" })).toBe("/usr/bin/fish");
+  it("has no shell entry in the defaults or in what readSettings returns (G15)", () => {
+    expect(Object.keys(DEFAULT_SETTINGS).sort()).toEqual(["customCliPath", "excludeExtensions", "instanceId", "nonCodeDrawer", "stablePort", "trustVaultFolder"]);
+    expect(Object.keys(readSettings({})).sort()).toEqual(Object.keys(DEFAULT_SETTINGS).sort());
+  });
+
+  it("readSettings of an object with shellPath returns no shellPath key, whatever its type", () => {
+    for (const shellPath of ["/bin/bash", "", "  /usr/bin/fish ", false, 7, null, ["/bin/zsh"], { path: "/bin/zsh" }]) {
+      const s = readSettings({ shellPath, nonCodeDrawer: false });
+      expect(s).not.toHaveProperty("shellPath");
+      expect(s).toEqual({ ...DEFAULT_SETTINGS, nonCodeDrawer: false });
+    }
+  });
+
+  it("dataObject keeps shellPath and the old drawer open state, so the next save writes them back", () => {
+    const raw = { shellPath: "/bin/bash", drawer: { "device-aaaa-0001": { height: 420, open: true } }, nonCodeDrawer: true };
+    const saved = { ...dataObject(raw), nonCodeDrawer: false };
+    expect(JSON.parse(JSON.stringify(saved))).toEqual({ ...raw, nonCodeDrawer: false });
   });
 });
 
@@ -67,7 +74,7 @@ describe("the stored stable port", () => {
   });
 
   it("an invalid stored port does not disturb the other fields", () => {
-    expect(readSettings({ stablePort: 99999, nonCodeDrawer: false, shellPath: "/bin/bash" })).toEqual({ ...DEFAULT_SETTINGS, nonCodeDrawer: false, shellPath: "/bin/bash" });
+    expect(readSettings({ stablePort: 99999, nonCodeDrawer: false, shellPath: "/bin/bash" })).toEqual({ ...DEFAULT_SETTINGS, nonCodeDrawer: false });
   });
 
   it("round-trips through the data object the plugin saves (the field name is stablePort)", () => {
@@ -130,7 +137,7 @@ describe("a corrupt, partial or odd data.json falls back field by field", () => 
       nonCodeDrawer: "yes",
       shellPath: ["/bin/zsh"],
     });
-    expect(s).toEqual({ instanceId: null, customCliPath: "/usr/local/bin/code", excludeExtensions: [], nonCodeDrawer: true, shellPath: "", stablePort: null, trustVaultFolder: true });
+    expect(s).toEqual({ instanceId: null, customCliPath: "/usr/local/bin/code", excludeExtensions: [], nonCodeDrawer: true, stablePort: null, trustVaultFolder: true });
   });
 
   it("keeps a false toggle and a saved instance id exactly as stored", () => {

@@ -4,3 +4,5 @@ coverage/
 data.json
 .server/
 /styles.css
+__pycache__/
+*.pyc

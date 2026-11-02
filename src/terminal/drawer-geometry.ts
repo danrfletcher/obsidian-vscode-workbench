@@ -1,11 +1,11 @@
 /**
- * The drawer's height rule (G9, E14), in one place so the drag, the restore from
+ * The drawer's height rule (G3, E9), in one place so the drag, the restore from
  * `data.json` and the window-resize handler all clamp the same way.
  */
 
 /** The least height the drawer can have, in px. */
 export const MIN_HEIGHT = 120;
-/** Window height kept free for the strip and the note area above the drawer, in px. */
+/** Window height kept free for the note area above the drawer, in px. */
 export const HEADROOM = 160;
 /** The height of a drawer that has never been resized, in px. */
 export const DEFAULT_HEIGHT = 300;
@@ -20,7 +20,7 @@ export function maxHeight(windowHeight: number): number {
  * `height` held between MIN_HEIGHT and maxHeight(windowHeight), as a whole number of px.
  * Zero, negative and too-small input gives the minimum; too-large input the maximum; NaN
  * (or anything that is not a number) gives the default height, itself clamped. In a window
- * so small that the maximum is under the minimum, the maximum wins: the strip and the note
+ * so small that the maximum is under the minimum, the maximum wins: the edge and the note
  * area must stay reachable.
  */
 export function clampHeight(height: unknown, windowHeight: number): number {

@@ -16,6 +16,7 @@ import { IDLE_MS } from "../../src/idle-timer";
 import * as profileModule from "../../src/profile/mirrored-profile";
 import { PROFILES, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
 import { FAKE_CODE, isAlive, listenersOn, tempDir } from "../helpers";
+import { FakeHostEl, FakeWorkbenchPage } from "../host-fakes";
 
 // The real profile lookup, wrapped so a test can count how often a start asks for it (and make it throw).
 vi.mock("../../src/profile/mirrored-profile", async (importOriginal) => {
@@ -31,6 +32,9 @@ let app: MockApp & { openedWithDefault: string[]; openWithDefaultApp: (p: string
 let windowListeners: Record<string, Array<(e?: unknown) => void>>;
 /** What the download-host reachability check answers: false = the network is down. */
 let networkUp = false;
+/** False: the workspace never reports its layout ready, so the drawer does not mount (a test that gives `document` a real-enough body for the host page only). */
+let layoutReady = true;
+let terminalPids: string;
 const strays: number[] = [];
 
 const DOWNLOADING = "VS Code Workbench: downloading the VS Code server. The first run needs internet and can take a minute.";
@@ -60,7 +64,7 @@ function makeApp(root: string): typeof app {
       copy: async (_f: unknown, p: string) => new TFile(p),
     },
     workspace: {
-      onLayoutReady: (cb: () => void) => cb(),
+      onLayoutReady: (cb: () => void) => (layoutReady ? cb() : undefined),
       activeFile: null as TFile | null,
       leaves: [] as WorkspaceLeaf[],
       getActiveFile: () => a.workspace.activeFile,
@@ -129,6 +133,25 @@ function fakeView(o: { file?: string; visible?: boolean; dirty?: boolean; saves?
   return v;
 }
 
+
+/**
+ * Make the plugin's process-table read answer with a server and `n` live terminal shells under its pty host (the shape of
+ * `tests/unit/terminal-keepalive.test.ts`), or fail with `fail`. Returns a counter of the reads.
+ */
+function shellsUnderServer(n: number, fail?: Error): { reads: () => number; set(n: number): void } {
+  const wrapper = (inner().manager.serverInstance as unknown as { pid: number }).pid;
+  let count = n;
+  let reads = 0;
+  (plugin as unknown as { processTable: () => Promise<string> }).processTable = async () => {
+    reads++;
+    if (fail) throw fail;
+    const rows = [`${wrapper} 1 code serve-web`, `${wrapper + 1} ${wrapper} node server-main.js`, `${wrapper + 2} ${wrapper + 1} node bootstrap-fork --type=ptyHost`];
+    for (let i = 0; i < count; i++) rows.push(`${wrapper + 10 + i} ${wrapper + 2} /bin/zsh -il`);
+    return rows.join("\n") + "\n";
+  };
+  return { reads: () => reads, set: (v) => void (count = v) };
+}
+
 /** Wait for the open modal, then run `then` (a button press). */
 let handledModals = 0;
 async function onModal(then: () => void): Promise<void> {
@@ -149,6 +172,8 @@ beforeEach(() => {
   handledModals = 0;
   windowListeners = {};
   networkUp = false;
+  layoutReady = true;
+  terminalPids = path.join(tempDir(), "terminal-pids");
   vi.stubGlobal("window", { addEventListener: (n: string, cb: (e?: unknown) => void) => (windowListeners[n] ??= []).push(cb) });
   vi.stubGlobal("document", { body: { classList: { contains: () => false } } });
 });
@@ -158,7 +183,7 @@ afterEach(async () => {
   plugin?.onunload();
   await new Promise((r) => setTimeout(r, 400));
   for (const pid of [...serverPids(), ...strays.splice(0)]) if (isAlive(pid)) process.kill(pid, "SIGKILL");
-  for (const k of ["FAKE_CODE_NODE", "FAKE_CODE_PIDFILE", "FAKE_CODE_ARGSFILE", "FAKE_CODE_MODE", "FAKE_CODE_HELP_DELAY", "FAKE_CODE_PARTIAL_DIR", "FAKE_CODE_OFFLINE_EXCEPT"]) delete process.env[k];
+  for (const k of ["FAKE_CODE_NODE", "FAKE_CODE_PIDFILE", "FAKE_CODE_ARGSFILE", "FAKE_CODE_MODE", "FAKE_CODE_HELP_DELAY", "FAKE_CODE_PARTIAL_DIR", "FAKE_CODE_OFFLINE_EXCEPT", "FAKE_CODE_TERMINAL_PIDFILE"]) delete process.env[k];
   vi.unstubAllGlobals();
 });
 
@@ -364,6 +389,8 @@ describe("idle stop (G13, E13)", () => {
     const wrapper = inner().manager.serverInstance as unknown as { pid: number; current: { port: number } };
     const pid = wrapper.pid;
     const port = wrapper.current.port;
+    // A fake clock cannot wait for a real `ps`: these tests are about the other two inputs, so the process table is empty (no shell).
+    (plugin as unknown as { processTable: () => Promise<string> }).processTable = async () => "";
     // restart the idle clock under fake timers, with the plugin's own wiring
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     inner().idle.stop();
@@ -538,6 +565,82 @@ describe("quit", () => {
     expect(v.saved).toBe(2);
     expect(inner().manager.state).toBe("stopped");
     expect(isAlive(w.pid)).toBe(false);
+  });
+
+  describe("with live terminal shells (G14)", () => {
+    it("quit with shells and nothing unsaved: no prompt, and the server is stopped", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      const table = shellsUnderServer(2);
+      await quit();
+      expect(Modal.opened).toHaveLength(0);
+      expect(table.reads()).toBe(0); // the shells are not even asked about
+      expect(inner().manager.state).toBe("stopped");
+    });
+
+    it("quit with unsaved buffers keeps the Save / Discard prompt, which does not mention terminals; shells add no second prompt", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(3);
+      const v = fakeView({ file: "estimate.py", dirty: true });
+      const quitting = quit();
+      await onModal(() => {
+        expect(lastModal().contentEl.textContent()).toContain("estimate.py");
+        expect(lastModal().contentEl.textContent().toLowerCase()).not.toContain("terminal");
+        press("Save");
+      });
+      await quitting;
+      expect(Modal.opened).toHaveLength(1);
+      expect(v.saved).toBe(1);
+      expect(inner().manager.state).toBe("stopped");
+    });
+
+    it("the pagehide fallback does the same without a prompt", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      const w = inner().manager.serverInstance as unknown as { pid: number };
+      shellsUnderServer(2);
+      for (const l of windowListeners.pagehide ?? []) l();
+      await vi.waitFor(() => expect(isAlive(w.pid)).toBe(false), { timeout: 5000 });
+      expect(Modal.opened).toHaveLength(0);
+      expect(inner().manager.state).toBe("stopped");
+    });
+
+    it("quit while the server is crashed, failed or stopped is harmless: no prompt, no notice, state stopped", async () => {
+      // crashed
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      process.kill(serverPids()[0], "SIGKILL");
+      await vi.waitFor(() => expect(inner().manager.state).toBe("crashed"), { timeout: 5000 });
+      Notice.reset();
+      await quit();
+      expect(inner().manager.state).toBe("stopped");
+      expect(Modal.opened).toHaveLength(0);
+      expect(Notice.messages).toEqual([]);
+      plugin.onunload();
+
+      // failed
+      fs.rmSync(pidFile, { force: true });
+      Plugin.reset();
+      await load({ FAKE_CODE_MODE: "exit-plain" }, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      expect(inner().manager.state).toBe("failed");
+      Notice.reset();
+      await quit();
+      expect(inner().manager.state).toBe("stopped");
+      expect(Notice.messages).toEqual([]);
+      plugin.onunload();
+      delete process.env.FAKE_CODE_MODE;
+
+      // never started
+      Plugin.reset();
+      await load({}, { serverLicenceAccepted: true });
+      Notice.reset();
+      await quit();
+      expect(inner().manager.state).toBe("stopped");
+      expect(Notice.messages).toEqual([]);
+      expect(Modal.opened).toHaveLength(0);
+    });
   });
 
   it("while a buffer stays unsaved the server keeps running and the prompt keeps coming back; Escape retries, never discards", async () => {
@@ -829,6 +932,160 @@ describe("restart", () => {
     await s!.button!.handler!();
     expect(inner().manager.state).toBe("running");
     expect(serverPids()).toHaveLength(1);
+  });
+
+  describe("the terminal line (G12)", () => {
+    const restartButton = "Restart and discard changes";
+
+    it("two live shells: the prompt says \"2 terminals will end.\"; Cancel keeps the server, the other shells and the page", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(2);
+      const before = inner().manager.current!;
+      const restarting = plugin.restartServer();
+      await onModal(() => {
+        expect(lastModal().contentEl.textContent()).toContain("Restart the VS Code server?");
+        expect(lastModal().contentEl.textContent()).toContain("2 terminals will end.");
+        expect(lastModal().contentEl.buttons().map((b) => b.text)).toEqual(["Cancel", restartButton]);
+        press("Cancel");
+      });
+      await restarting;
+      expect(inner().manager.current).toBe(before);
+      expect(inner().manager.state).toBe("running");
+      expect(serverPids()).toHaveLength(1);
+    });
+
+    it("one live shell: singular; Escape keeps the server", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(1);
+      const before = inner().manager.current!;
+      const restarting = plugin.restartServer();
+      await onModal(() => {
+        expect(lastModal().contentEl.textContent()).toContain("1 terminal will end.");
+        expect(lastModal().contentEl.textContent()).not.toContain("1 terminals");
+        lastModal().close();
+      });
+      await restarting;
+      expect(inner().manager.current).toBe(before);
+      expect(serverPids()).toHaveLength(1);
+    });
+
+    it("confirming restarts once: one new server, one prompt", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(3);
+      const before = inner().manager.current!;
+      const restarting = plugin.restartServer();
+      await onModal(() => press(restartButton));
+      await restarting;
+      expect(Modal.opened).toHaveLength(1);
+      expect(inner().manager.current!.token).not.toBe(before.token);
+      expect(serverPids()).toHaveLength(2);
+    });
+
+    it("unsaved buffers and live shells give ONE prompt with both lines", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      fakeView({ file: "Mock Exams/estimate.py", dirty: true });
+      shellsUnderServer(2);
+      const restarting = plugin.restartServer();
+      await onModal(() => {
+        const text = lastModal().contentEl.textContent();
+        expect(text).toContain("estimate.py has unsaved changes.");
+        expect(text).toContain("2 terminals will end.");
+        press("Cancel");
+      });
+      await restarting;
+      expect(Modal.opened).toHaveLength(1);
+      expect(serverPids()).toHaveLength(1);
+    });
+
+    it("shells that cannot be counted, with the page not loaded: no line and no prompt", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(0, new Error("ps failed"));
+      await plugin.restartServer();
+      expect(Modal.opened).toHaveLength(0);
+      expect(serverPids()).toHaveLength(2);
+    });
+
+    it("no live shell and nothing dirty: no prompt, as before", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(0);
+      await plugin.restartServer();
+      expect(Modal.opened).toHaveLength(0);
+    });
+
+    it("a server that crashed is restarted from the crash state with no prompt, shells or not", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(2);
+      process.kill(serverPids()[0], "SIGKILL");
+      await vi.waitFor(() => expect(inner().manager.state).toBe("crashed"), { timeout: 5000 });
+      await plugin.restartServer();
+      expect(Modal.opened).toHaveLength(0);
+      expect(inner().manager.state).toBe("running");
+    });
+
+    it("a server in the failed state is restarted with no prompt", async () => {
+      await load({ FAKE_CODE_MODE: "exit-plain" }, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      expect(inner().manager.state).toBe("failed");
+      delete process.env.FAKE_CODE_MODE;
+      await plugin.restartServer();
+      expect(Modal.opened).toHaveLength(0);
+      expect(inner().manager.state).toBe("running");
+    });
+
+    it("two quick presses (the settings button twice) share one restart and one new server", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      const restart = vi.spyOn(inner().manager, "restart");
+      const first = plugin.restartServer();
+      const second = plugin.restartServer();
+      expect(second).toBe(first);
+      await Promise.all([first, second]);
+      expect(restart).toHaveBeenCalledTimes(1);
+      expect(serverPids()).toHaveLength(2);
+    });
+
+    it("the server crashes while the prompt is open: confirming still restarts, with no exception, no second prompt and no second count", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      const counted = vi.spyOn(plugin as unknown as { liveShellAnswer(): Promise<unknown> }, "liveShellAnswer");
+      const table = shellsUnderServer(2);
+      const restarting = plugin.restartServer();
+      await onModal(async () => {
+        process.kill(serverPids()[0], "SIGKILL");
+        await vi.waitFor(() => expect(inner().manager.state).toBe("crashed"), { timeout: 5000 });
+        table.set(0); // and the shells went with it
+        press(restartButton);
+      });
+      await expect(restarting).resolves.toBeUndefined();
+      expect(Modal.opened).toHaveLength(1);
+      expect(counted).toHaveBeenCalledTimes(1); // the idle poll reads the table on its own; the restart asked once
+      expect(inner().manager.state).toBe("running");
+      expect(serverPids()).toHaveLength(2);
+    });
+
+    it("a shell exits while the prompt is open: the count is not recomputed, and confirming restarts", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      const counted = vi.spyOn(plugin as unknown as { liveShellAnswer(): Promise<unknown> }, "liveShellAnswer");
+      const table = shellsUnderServer(2);
+      const restarting = plugin.restartServer();
+      await onModal(() => {
+        table.set(0);
+        expect(lastModal().contentEl.textContent()).toContain("2 terminals will end.");
+        press(restartButton);
+      });
+      await restarting;
+      expect(counted).toHaveBeenCalledTimes(1); // the idle poll reads the table on its own; the restart asked once
+      expect(Modal.opened).toHaveLength(1);
+      expect(serverPids()).toHaveLength(2);
+    });
   });
 });
 
@@ -1294,5 +1551,134 @@ describe("the mirrored profile is resolved at each server start and Restart serv
     await plugin.restartServer();
     expect(named()).toBe("FDE Practice");
     expect(snap()).toEqual(before);
+  });
+});
+
+describe("terminal keep-alive wiring (G10)", () => {
+  const terminalShells = () => (fs.existsSync(terminalPids) ? fs.readFileSync(terminalPids, "utf8").split("\n").filter(Boolean).map(Number) : []);
+  const killGroup = (pid: number) => {
+    try {
+      process.kill(-pid, "SIGKILL"); // the fake shell was spawned in its own process group, with its sleep
+    } catch {
+      /* already gone */
+    }
+  };
+  afterEach(() => {
+    for (const pid of terminalShells()) killGroup(pid);
+  });
+
+  it("load wires the dependency: with a shell under the server the idle clock does not count down, without one it does, and when the shell ends it does", async () => {
+    // control: a server with no terminal
+    await load({}, { serverLicenceAccepted: true });
+    await plugin.openSpikeFile();
+    inner().idle.stop();
+    inner().idle.start();
+    await inner().idle.evaluate();
+    expect(inner().idle.counting).toBe(true);
+    plugin.onunload();
+    await vi.waitFor(() => expect(serverPids().every((pid) => !isAlive(pid))).toBe(true), { timeout: 5000 });
+
+    // the same with a pty host and its shell under the server
+    fs.rmSync(pidFile, { force: true });
+    await load({ FAKE_CODE_TERMINAL_PIDFILE: terminalPids }, { serverLicenceAccepted: true });
+    await plugin.openSpikeFile();
+    await vi.waitFor(() => expect(terminalShells()).toHaveLength(1), { timeout: 5000 });
+    inner().idle.stop();
+    inner().idle.start();
+    await inner().idle.evaluate();
+    expect(inner().idle.counting).toBe(false); // a live shell: no countdown
+    expect(inner().manager.state).toBe("running");
+
+    killGroup(terminalShells()[0]);
+    await vi.waitFor(() => expect(isAlive(terminalShells()[0])).toBe(false), { timeout: 5000 });
+    await inner().idle.evaluate();
+    expect(inner().idle.counting).toBe(true); // the shell is gone: the clock starts
+  });
+
+  it("on a fake clock: a shell in the server's process tree keeps it running for 30 minutes; once it is gone the clock starts and the server stops 5 minutes later", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    await plugin.openSpikeFile();
+    const wrapper = (inner().manager.serverInstance as unknown as { pid: number }).pid;
+    const table = (...rows: string[]) => rows.join("\n") + "\n";
+    const server = [`${wrapper} 1 code serve-web`, `${wrapper + 1} ${wrapper} node server-main.js`, `${wrapper + 2} ${wrapper + 1} node bootstrap-fork --type=ptyHost`];
+    let rows = [...server, `${wrapper + 3} ${wrapper + 2} /bin/zsh -il`, `${wrapper + 4} ${wrapper + 3} sleep 600`];
+    (plugin as unknown as { processTable: () => Promise<string> }).processTable = async () => table(...rows);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    inner().idle.stop();
+    inner().idle.start();
+
+    await vi.advanceTimersByTimeAsync(30 * 60_000); // the drawer may be shown or hidden: nothing in this path reads it
+    expect(inner().manager.state).toBe("running");
+
+    rows = server; // the shell closed
+    await vi.advanceTimersByTimeAsync(5_000); // the poll sees it and the clock starts
+    await vi.advanceTimersByTimeAsync(IDLE_MS - 1000);
+    expect(inner().manager.state).toBe("running");
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(inner().manager.state).toBe("stopped-by-idle");
+  });
+
+  describe("the host page", () => {
+    let body: FakeHostEl;
+    beforeEach(() => {
+      layoutReady = false;
+      body = new FakeHostEl("body");
+      (body as unknown as { classList: object }).classList = { contains: () => false };
+      vi.stubGlobal("document", {
+        body,
+        createElement: (tag: string) => {
+          const e = new FakeHostEl(tag);
+          if (tag === "webview") e.page = new FakeWorkbenchPage();
+          return e;
+        },
+      });
+    });
+    const host = () => (plugin as unknown as { terminalHost: { settled(): Promise<void>; dispose(): void } | null }).terminalHost;
+
+    it("creating the host page, its page becoming ready and closing it each call idle.evaluate() (as a Code tab change does)", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      const evaluate = vi.spyOn(inner().idle, "evaluate");
+      expect(host()).toBeNull();
+
+      plugin.showTerminalHost();
+      expect(host()).not.toBeNull();
+      const afterCreate = evaluate.mock.calls.length;
+      expect(afterCreate).toBeGreaterThanOrEqual(1); // created (and the start began)
+
+      await host()!.settled();
+      expect(evaluate.mock.calls.length).toBeGreaterThan(afterCreate); // the page is ready
+      expect(inner().manager.state).toBe("running");
+
+      const beforeClose = evaluate.mock.calls.length;
+      host()!.dispose();
+      expect(evaluate.mock.calls.length).toBe(beforeClose + 1); // closed
+    });
+
+    it("hiding and showing the drawer does not re-read the idle inputs: drawer visibility makes no difference", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      plugin.showTerminalHost();
+      await host()!.settled();
+      const evaluate = vi.spyOn(inner().idle, "evaluate");
+      plugin.hideTerminalHost();
+      plugin.showTerminalHost();
+      plugin.hideTerminalHost();
+      expect(evaluate).not.toHaveBeenCalled();
+    });
+
+    it("unload stops the timer: no countdown and no poller is left, and a late evaluation starts nothing", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      plugin.showTerminalHost();
+      await host()!.settled();
+      inner().idle.stop();
+      inner().idle.start();
+      await inner().idle.evaluate();
+      expect(inner().idle.counting).toBe(true);
+
+      plugin.onunload();
+      expect(inner().idle.counting).toBe(false);
+      await inner().idle.evaluate();
+      expect(inner().idle.counting).toBe(false);
+      expect(host()).toBeNull();
+    });
   });
 });

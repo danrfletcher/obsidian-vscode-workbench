@@ -58,4 +58,31 @@ describe("README", () => {
       expect(text, needle).toContain(needle);
     }
   });
+
+  describe("the terminal drawer is VS Code's own (PR-4)", () => {
+    it("has no python3, xterm or Python helper text anywhere", () => {
+      for (const needle of [/python3/i, /xterm/i, /Python helper/i, /pty_helper/i, /\bnode-pty\b/i]) expect(readme, String(needle)).not.toMatch(needle);
+    });
+
+    it("has no Status bar or Shell paragraph, and no shell count", () => {
+      const bullets = readme.split("\n").filter((l) => l.startsWith("- **"));
+      expect(bullets.filter((l) => /^- \*\*(Status bar|Shell|Tabs|How it works)\b/.test(l))).toEqual([]);
+      expect(readme).not.toMatch(/\b1 shell\b|N shells/);
+    });
+
+    it("documents the drawer section as VS Code's terminal, with the vault root, no plugin dialog, and the 0.1.0 change", () => {
+      const text = section("## Terminal drawer");
+      expect(text).not.toBeNull();
+      for (const needle of ["VS Code's own integrated terminal", "vault root", "never asks first", "What changed from 0.1.0", "`shellPath`", "ignored and left in the file"]) {
+        expect(text, needle).toContain(needle);
+      }
+    });
+
+    it("still documents the Settings section with the one drawer toggle and no Shell setting", () => {
+      const text = section("## Settings");
+      expect(text).not.toBeNull();
+      expect(text).toContain("**Excluded file extensions and the terminal drawer toggle.**");
+      expect(text).not.toMatch(/\*\*Shell|shell path|shellPath|\$SHELL|\/bin\/zsh/i);
+    });
+  });
 });

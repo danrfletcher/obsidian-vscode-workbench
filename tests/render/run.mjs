@@ -46,6 +46,7 @@ function readAsar(file, name) {
   return data;
 }
 
+const nodeStub = path.join(root, "tests/render/node-stub.cjs");
 // The plugin's own code: the modal runs in the page; the Notice text comes from describeFailure in node.
 await build({
   entryPoints: [path.join(root, "tests/render/entry.mjs")],
@@ -53,7 +54,11 @@ await build({
   format: "iife",
   globalName: "render",
   platform: "browser",
-  alias: { obsidian: path.join(root, "tests/render/obsidian-shim.mjs") },
+  // The drawer's host page imports modules that name Node's built-ins for work this page never runs: they get a stub.
+  alias: {
+    obsidian: path.join(root, "tests/render/obsidian-shim.mjs"),
+    ...Object.fromEntries(["fs", "path", "crypto", "child_process", "net", "dns", "http", "os"].flatMap((m) => [[m, nodeStub], [`node:${m}`, nodeStub]])),
+  },
   outfile: path.join(outDir, "entry.js"),
   logLevel: "error",
 });
@@ -92,6 +97,7 @@ const profileScenarios = [
 
 // The extension list of the Extensions section (PR-7: G11, G16, F2), one scenario per kind of view. Hand-written rows so
 // every state, a long id and long reasons are drawn; the unit tests build the same view from real trees.
+const TERMINAL_RESTART_FAILED_REASON = "VS Code server was not ready after 30 s: the port 51789 on 127.0.0.1 is in use by another program, and no other port could be found either.";
 const row = (state, stateLabel, reason, over = {}) => ({ id: "pub.name", name: "Name", version: "1.0.0", state, stateLabel, reason, ...over });
 const LONG = "Error: Cannot find module '/Users/x/.vscode-insiders/extensions/some.publisher-extension-with-a-long-name-1.2.3/dist/extension.js' from a long path that has to wrap and not run past the edge of the settings pane";
 const listScenarios = [
@@ -147,6 +153,15 @@ const scenarios = [
   { name: "quit-save-or-discard-modal", kind: "modal", prompt: "quit-save-or-discard", files: ["a.py", "b.ts", "Makefile", "scripts/estimate_time.py", "notes/ünï.ts", "seventh.rs"] },
   { name: "quit-save-failed-modal", kind: "modal", prompt: "quit-save-failed", files: ["Untitled-1", "scripts/estimate_time.py"] },
   { name: "restart-with-dirty-modal", kind: "modal", prompt: "restart-with-dirty", files: ["a.py", "scripts/estimate_time.py"] },
+  // The terminal line of the same prompt (PR-7: G12), alone, with the dirty line, and without a count.
+  { name: "restart-terminals-modal", kind: "modal", prompt: "restart-with-dirty", files: [], terminalLine: "2 terminals will end." },
+  { name: "restart-terminals-uncounted-modal", kind: "modal", prompt: "restart-with-dirty", files: [], terminalLine: "Terminals will end." },
+  { name: "restart-dirty-and-terminals-modal", kind: "modal", prompt: "restart-with-dirty", files: ["a.py", "scripts/a_very_long_directory_name/with/several/levels/and_a_rather_long_file_name_for_the_editor.py"], terminalLine: "12 terminals will end." },
+  // The drawer's crash banner (G13) with and without the reason of a failed restart, and the lost message after a restart.
+  { name: "terminal-crash-banner", kind: "terminal-host", phase: "crashed", lostCause: "restart" },
+  { name: "terminal-crash-banner-restart-failed", kind: "terminal-host", phase: "crashed", lostCause: "restart", error: TERMINAL_RESTART_FAILED_REASON },
+  { name: "terminal-lost-after-restart", kind: "terminal-host", phase: "lost", lostCause: "restart" },
+  { name: "terminal-lost-after-reload", kind: "terminal-host", phase: "lost", lostCause: "reload" },
   // The Profile row of the settings Extensions section (PR-3: G7, G8, E2, E10), drawn with the plugin's styles.css.
   ...profileScenarios,
   // The extension list under the same heading (PR-7).
@@ -192,7 +207,7 @@ for (const sc of scenarios) {
       }
       chrome([size, "--virtual-time-budget=2000", `--screenshot=${path.join(outDir, `${id}.png`)}`, pathToFileURL(page).href]);
       const lines = (r.results ?? []).map((x) => `${x.label} ${x.box} ${x.textLines} lines`).join("; ");
-      console.log(`${r.ok ? "ok  " : "FAIL"} ${id} (window ${r.window ?? "?"}) ${lines}${r.buttons ? ` buttons: ${r.buttons.join(" | ")}` : ""}${r.profileRow ? ` profile row: ${r.profileRow}` : ""}`);
+      console.log(`${r.ok ? "ok  " : "FAIL"} ${id} (window ${r.window ?? "?"}) ${lines}${r.buttons ? ` buttons: ${r.buttons.join(" | ")}` : ""}${r.profileRow ? ` profile row: ${r.profileRow}` : ""}${r.bannerText ? ` banner: ${r.bannerText}` : ""}`);
       for (const x of r.results ?? []) for (const p of x.problems) console.log(`       ${p}`);
       if (r.error) console.log(`       ${r.error}`);
       if (!r.ok) failed++;

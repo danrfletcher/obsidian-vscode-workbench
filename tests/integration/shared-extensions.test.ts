@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileSystemAdapter, Modal, Notice, Plugin, TFile, WorkspaceLeaf, type MockApp } from "../mocks/obsidian";
+import { EXTENSION_DIR_NAME } from "../../src/terminal-host/terminal-at-extension";
 import VSCodeWorkbenchPlugin from "../../src/main";
 import { PROFILES, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
 import { FAKE_CODE, isAlive, tempDir } from "../helpers";
@@ -88,9 +89,13 @@ const target = () => path.join(inner().manager.serverInstance!.serverDataDir, "e
 const links = () =>
   fs
     .readdirSync(target())
-    .filter((n) => n !== "extensions.json")
+    .filter((n) => n !== "extensions.json" && n !== EXTENSION_DIR_NAME) // the plugin's own terminal-at extension is not a shared one
     .sort();
-const listed = () => (JSON.parse(fs.readFileSync(path.join(target(), "extensions.json"), "utf8")) as Array<{ relativeLocation: string }>).map((e) => e.relativeLocation).sort();
+const listed = () =>
+  (JSON.parse(fs.readFileSync(path.join(target(), "extensions.json"), "utf8")) as Array<{ relativeLocation: string }>)
+    .map((e) => e.relativeLocation)
+    .filter((n) => n !== EXTENSION_DIR_NAME)
+    .sort();
 const disabledShown = () => plugin.disabledLists();
 
 beforeEach(() => {
@@ -164,7 +169,7 @@ describe("the server is given exactly the extensions that are enabled in the mir
     await plugin.ensureServer();
     expect(inner().manager.state).toBe("running");
     expect(links()).toEqual([]);
-    expect(fs.readFileSync(path.join(target(), "extensions.json"), "utf8")).toBe("[]");
+    expect(listed()).toEqual([]);
   });
 
   it("a disabled list that cannot be read and has no snapshot shares nothing; the start still runs", async () => {
