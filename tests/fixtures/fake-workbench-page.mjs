@@ -5,8 +5,11 @@
 //   - reads /User/settings.json from the browser profile's IndexedDB (the stores `buildBrowserSeedScript` writes) and hides the parts
 //     those settings hide: the activity bar, status bar, title bar, tab strip and breadcrumbs, and the secondary side bar and panel
 //     only on a profile with no saved layout;
-//   - reads /User/keybindings.json from the same place and runs the close commands bound to a chord (closeSidebar, closeAuxiliaryBar,
-//     closePanel, closeOtherEditors) when that chord is pressed (the last rule for a chord wins, like VS Code's);
+//   - reads /User/keybindings.json from the same place (JSON with comments and trailing commas, a byte-order mark allowed, like VS Code
+//     reads it) and runs the commands bound to a chord when that chord is pressed: the close commands (closeSidebar, closeAuxiliaryBar,
+//     closePanel, closeOtherEditors), the toggles of the activity bar, status bar, side bar and panel, and closeActiveEditor. Like VS Code's:
+//     the last rule for a chord wins, a rule with an empty command leaves the chord unbound, and a `-command` rule removes the DEFAULT rule
+//     (cmd+b, cmd+j, cmd+w) with that key and command, and nothing a user bound. `meta` is spelled `cmd`;
 //   - starts from the saved layout in `/layout` of that store when there is one (side bar and panel open, a previous editor open).
 // With `renamed`, every class name of the parts is different (`x-` prefixed), as after a VS Code update that renamed them: the hiding
 // has nothing to find. Sizes are CSS sizes in a browser; jsdom has no layout, so there `getBoundingClientRect` answers from the same
@@ -48,6 +51,24 @@ export function fakeWorkbenchHtml(options = {}) {
     } catch (e) { resolve(undefined); }
   });
   const json = (v) => { try { return JSON.parse(typeof v === "string" ? v : new TextDecoder().decode(v)); } catch (e) { return undefined; } };
+  const stripJsonc = (t) => {
+    let out = "", i = 0, inString = false;
+    while (i < t.length) {
+      const c = t[i], n = t[i + 1];
+      if (inString) { out += c; if (c === "\\\\") { out += n === undefined ? "" : n; i += 2; continue; } if (c === '"') inString = false; i++; }
+      else if (c === '"') { inString = true; out += c; i++; }
+      else if (c === "/" && n === "/") { while (i < t.length && t[i] !== "\\n") i++; }
+      else if (c === "/" && n === "*") { i += 2; while (i < t.length && !(t[i] === "*" && t[i + 1] === "/")) i++; i += 2; }
+      else { out += c; i++; }
+    }
+    return out.replace(/,(\s*[\]}])/g, "$1");
+  };
+  const jsonc = (v) => {
+    try {
+      const t = typeof v === "string" ? v : new TextDecoder("utf-8", { ignoreBOM: true }).decode(v);
+      return JSON.parse(stripJsonc(t.charCodeAt(0) === 0xfeff ? t.slice(1) : t));
+    } catch (e) { return undefined; }
+  };
   const open = () => new Promise((resolve) => {
     if (typeof indexedDB === "undefined") return resolve(null);
     const r = indexedDB.open("vscode-web-db", 3);
@@ -88,18 +109,31 @@ export function fakeWorkbenchHtml(options = {}) {
     else if (command === "workbench.action.closeAuxiliaryBar") state.open.secondarySideBar = false;
     else if (command === "workbench.action.closePanel") state.open.panel = false;
     else if (command === "workbench.action.closeOtherEditors") state.editors = state.editors.slice(-1);
+    else if (command === "workbench.action.toggleSidebarVisibility") state.open.sideBar = !state.open.sideBar;
+    else if (command === "workbench.action.togglePanel") state.open.panel = !state.open.panel;
+    else if (command === "workbench.action.toggleActivityBarVisibility") state.open.activityBar = !state.open.activityBar;
+    else if (command === "workbench.action.toggleStatusbarVisibility") state.open.statusBar = !state.open.statusBar;
+    else if (command === "workbench.action.closeActiveEditor") state.editors = state.editors.slice(0, -1);
     else return;
     render();
   };
-  const chordOf = (e) => ["ctrl", "alt", "shift", "meta"].filter((m) => e[m + "Key"]).concat([String(e.key).toLowerCase()]).join("+");
+  const chordOf = (e) => ["ctrl", "alt", "shift", "meta"].filter((m) => e[m + "Key"]).map((m) => (m === "meta" ? "cmd" : m)).concat([String(e.key).toLowerCase()]).join("+");
   (async () => {
     const db = await open();
     const settings = (db && json(await read(db, "/User/settings.json"))) || {};
     const layout = db ? json(await read(db, "/layout")) : undefined;
-    const rules = (db && json(await read(db, "/User/keybindings.json"))) || [];
+    const rules = (db && jsonc(await read(db, "/User/keybindings.json"))) || [];
     if (db) db.close();
+    // VS Code's own rules for the layout chords, then the profile's: a \`-command\` rule removes a default one, a later rule beats an earlier one
+    let defaults = [
+      { key: "cmd+b", command: "workbench.action.toggleSidebarVisibility" },
+      { key: "cmd+j", command: "workbench.action.togglePanel" },
+      { key: "cmd+w", command: "workbench.action.closeActiveEditor" },
+    ];
+    const valid = (Array.isArray(rules) ? rules : []).filter((r) => r && typeof r.key === "string" && typeof r.command === "string");
+    for (const r of valid) if (r.command.startsWith("-")) defaults = defaults.filter((d) => !(d.key === r.key && d.command === r.command.slice(1)));
     const bindings = new Map();
-    for (const r of Array.isArray(rules) ? rules : []) if (r && typeof r.key === "string" && typeof r.command === "string") bindings.set(r.key, r.command);
+    for (const r of [...defaults, ...valid.filter((r) => !r.command.startsWith("-"))]) bindings.set(r.key, r.command);
     document.addEventListener("keydown", (e) => {
       const command = bindings.get(chordOf(e));
       if (command) { e.preventDefault(); run(command); }

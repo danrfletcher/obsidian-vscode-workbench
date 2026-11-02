@@ -12,7 +12,8 @@ import * as path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceLeaf } from "../mocks/obsidian";
 import { CodeView, type CodeViewHost } from "../../src/code-view";
-import { chromeKeybindings } from "../../src/chrome-settings";
+import { overlayKeybindings, unbindCommands } from "../../src/chrome-settings";
+import { rulesOf } from "../overlay-runner";
 import { CHROME_SCRIPT_INSTALLED, buildChromeHideScript } from "../../src/chrome-script";
 import { BROWSER_APP_SETTINGS, workbenchOverlay } from "../../src/settings";
 import { fakeIndexedDB, fakeStorage } from "../fake-seed-page";
@@ -137,7 +138,7 @@ function makeTab(host: Partial<CodeViewHost> = {}) {
     releaseFile: () => undefined,
     openInSystemApp: () => undefined,
     workbenchOverlay: () => workbenchOverlay({ dark: false }),
-    chromeHiding: () => ({ keybindings: chromeKeybindings(), script: buildChromeHideScript() }),
+    chromeHiding: () => ({ keybindings: overlayKeybindings(), unbind: unbindCommands(), script: buildChromeHideScript() }),
     ...host,
   };
   const view = new CodeView(new WorkspaceLeaf() as never, full);
@@ -212,8 +213,8 @@ describe("E6: a saved layout (side bar, panel, secondary side bar and a previous
     expect(second.page.window.__fake.state.editors).toHaveLength(1);
     expect(second.page.window.__fake.state.editors[0]).toContain("other.js");
     // the second load's profile still holds our chords once each, and the first tab's pages do not share state with it
-    const rules = JSON.parse(new TextDecoder().decode(world.idb.stores.get("vscode-userdata-store")!.get("/User/keybindings.json") as Uint8Array)) as unknown[];
-    expect(rules).toEqual(chromeKeybindings());
+    const rules = rulesOf(new TextDecoder().decode(world.idb.stores.get("vscode-userdata-store")!.get("/User/keybindings.json") as Uint8Array));
+    expect(rules).toEqual(overlayKeybindings());
   });
 
   it("a profile whose layout state brings the parts back at a later reload: the same load puts the same result", async () => {

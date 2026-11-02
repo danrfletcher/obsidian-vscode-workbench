@@ -14,6 +14,7 @@ import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
 import { FAKE_CODE, isAlive, tempDir } from "../helpers";
 import { stateDb } from "../mirror-tree";
 import { fakeIndexedDB, fakeStorage } from "../fake-seed-page";
+import { removeOverlay, rulesOf } from "../overlay-runner";
 import { BROWSER_APP_SETTINGS, buildBrowserSeedScript } from "../../src/settings";
 import { HANG_SCRIPT, makeApp as makeBundle, makeReadOnly, makeWritable, treeDigest } from "../instance-helpers";
 
@@ -538,7 +539,7 @@ describe("the copy of the instance's settings (G16, G17)", () => {
     const fake = fakeIndexedDB();
     const storage = fakeStorage();
     const hiding = plugin.chromeHiding();
-    const script = buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...plugin.workbenchOverlay() }, plugin.userDataCopy(), hiding.keybindings);
+    const script = buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...plugin.workbenchOverlay() }, plugin.userDataCopy(), hiding.keybindings, hiding.unbind);
     const run = () => (new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${script}`) as (...a: unknown[]) => Promise<string>)(fake.indexedDB, storage, TextEncoder, TextDecoder);
     const file = (name: string) => new TextDecoder().decode(fake.stores.get("vscode-userdata-store")!.get(`/User/${name}`) as Uint8Array);
     let firstKeybindings = "";
@@ -551,11 +552,13 @@ describe("the copy of the instance's settings (G16, G17)", () => {
       expect(settings["workbench.editor.showTabs"], `load ${load}`).toBe("none");
       expect(settings["breadcrumbs.enabled"], `load ${load}`).toBe(false);
       expect(settings["editor.fontSize"], `load ${load}`).toBe(15); // theirs otherwise
-      // keybindings: the user's own kept, and ours last for our chords, once
-      const rules = JSON.parse(file("keybindings.json")) as Array<{ key: string; command: string }>;
-      expect(rules.filter((r) => r.key === "cmd+b")).toHaveLength(1);
-      expect(rules.slice(-hiding.keybindings.length), `load ${load}`).toEqual(hiding.keybindings);
-      expect(rules.filter((r) => r.key === "ctrl+alt+shift+1"), `load ${load}`).toEqual([{ key: "ctrl+alt+shift+1", command: "workbench.action.toggleSidebarVisibility" }, { key: "ctrl+alt+shift+1", command: "workbench.action.closeSidebar" }]);
+      // keybindings: the user's text kept byte for byte, ours after it, once, and the copied rules that bring a bar back unbound last
+      const text = file("keybindings.json");
+      expect(removeOverlay(text), `load ${load}`).toBe(theirs);
+      const rules = rulesOf(text);
+      expect(rules.filter((r) => r.key === "cmd+b").map((r) => r.command), `load ${load}`).toEqual(["workbench.action.toggleSidebarVisibility", "-workbench.action.toggleSidebarVisibility", ""]);
+      expect(rules.filter((r) => r.key === "ctrl+alt+shift+1").map((r) => r.command), `load ${load}`).toEqual(["workbench.action.toggleSidebarVisibility", "workbench.action.closeSidebar", ""]);
+      expect(rules.slice(2, 2 + hiding.keybindings.length), `load ${load}`).toEqual(hiding.keybindings);
       if (load === 1) firstKeybindings = file("keybindings.json");
       else expect(file("keybindings.json"), `load ${load}`).toBe(firstKeybindings);
     }

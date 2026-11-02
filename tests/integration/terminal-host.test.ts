@@ -185,12 +185,18 @@ describe("F2/GP1: the host page keeps its own overlay; the Code tab gets the chr
     expect(overlay["workbench.editor.showTabs"]).toBe("none");
     expect(overlay["breadcrumbs.enabled"]).toBe(false);
     const hiding = plugin.chromeHiding();
-    expect(hiding.keybindings.map((k) => k.command)).toEqual([
+    expect(hiding.keybindings.slice(0, 6).map((k) => k.command)).toEqual([
+      "workbench.action.toggleActivityBarVisibility",
+      "workbench.action.toggleStatusbarVisibility",
       "workbench.action.closeAuxiliaryBar",
       "workbench.action.closeSidebar",
       "workbench.action.closePanel",
       "workbench.action.closeOtherEditors",
     ]);
+    // then the `-command` removals of the layout chords (GP4): nothing but removals
+    expect(hiding.keybindings.slice(6).every((k) => k.command.startsWith("-workbench.action."))).toBe(true);
+    expect(hiding.keybindings.slice(6).map((k) => k.key)).toEqual(expect.arrayContaining(["cmd+b", "ctrl+b", "cmd+j", "ctrl+j", "cmd+k z", "cmd+w"]));
+    expect(hiding.unbind).toEqual(expect.arrayContaining(["workbench.action.toggleSidebarVisibility", "workbench.action.closeActiveEditor"]));
     expect(hiding.script).toContain("MutationObserver");
   });
 });

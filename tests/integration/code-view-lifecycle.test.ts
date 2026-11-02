@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeNode, WorkspaceLeaf as MockLeaf } from "../mocks/obsidian";
 import type { WorkspaceLeaf } from "obsidian";
 import { CodeView, DIRTY_SCRIPT, type CodeViewHost } from "../../src/code-view";
+import { overlayKeybindings, unbindCommands } from "../../src/chrome-settings";
+import { OVERLAY_BEGIN, OVERLAY_END } from "../../src/keybinding-overlay";
 import type { CloseDirtyRequest } from "../../src/modals";
 import { OpenFiles } from "../../src/open-file";
 import { carryEdits, readBaseline, statSignature, type CarryResult } from "../../src/rename-carry";
@@ -43,12 +45,17 @@ class Embed extends FakeNode {
   seeds: string[] = [];
   /** What the trust seed answers. */
   trustAnswer: () => Promise<unknown> = () => Promise.resolve("seeded");
+  /** What the settings seed (which carries the keybinding overlay step) answers. */
+  seedAnswer: () => Promise<unknown> = () => Promise.resolve("seeded");
   executeJavaScript(code: string) {
     if (code.includes("vscode-web-state-db-global-shared")) {
       this.seeds.push(code);
       return this.trustAnswer();
     }
-    if (code.includes("vscode-web-db")) this.seeds.push(code);
+    if (code.includes("vscode-web-db")) {
+      this.seeds.push(code);
+      return this.seedAnswer();
+    }
     if (code === DIRTY_SCRIPT) return this.dirtyAnswer ? this.dirtyAnswer() : Promise.resolve(this.dirty);
     if (code.includes("data-resource-name")) return Promise.resolve(this.fileTab); // fileDirtyScript
     return Promise.resolve("seeded");
@@ -88,6 +95,10 @@ function world(
     root?: string;
     afterCarry?: () => void;
     trust?: { enabled: () => boolean; held: () => number[]; outcomes: string[]; port?: number };
+    /** The host's chrome hiding (the keybinding overlay and its page script); unset: the host gives none. */
+    chromeHiding?: CodeViewHost["chromeHiding"];
+    /** Collects the listeners the tabs register for the server's state, so a test can announce a restart. */
+    serverListeners?: Array<(state: "running" | "stopped") => void>;
   } = {},
 ) {
   const leaves: Array<WorkspaceLeaf & { detached?: boolean }> = [];
@@ -109,9 +120,13 @@ function world(
     trackView: () => undefined,
     untrackView: () => undefined,
     serverState: () => "running",
-    onServerState: () => () => undefined,
+    onServerState: (cb) => {
+      opts.serverListeners?.push(cb as (state: "running" | "stopped") => void);
+      return () => undefined;
+    },
     restartServer: async () => undefined,
     userDataCopy: () => null,
+    ...(opts.chromeHiding ? { chromeHiding: opts.chromeHiding } : {}),
     ...(opts.trust
       ? {
           trustVaultFolder: () => opts.trust?.enabled() ?? false,
@@ -1202,5 +1217,71 @@ describe("no writes to any note", () => {
     for (const t of tabs.slice(0, 2)) t.leaf.detach();
     await vi.waitFor(() => expect(tabs.every((t) => t.leaf.detached)).toBe(true));
     expect(snapshot()).toEqual(before);
+  });
+});
+
+describe("the keybinding overlay step runs at every load of a Code tab (GP4, E9, F3)", () => {
+  const hiding = () => ({ keybindings: overlayKeybindings(), unbind: unbindCommands(), script: "/* page script */ 'installed'" });
+  const withOverlay = (seed: string) => seed.includes(OVERLAY_BEGIN) && seed.includes(OVERLAY_END) && seed.includes('"-workbench.action.toggleSidebarVisibility"');
+  /** The overlay step is part of the settings seed; the trust seed is the other script. Counts the settings seeds that carry the overlay. */
+  const overlaySeeds = (embed: Embed) => embed.seeds.filter(withOverlay).length;
+
+  it("tab open: the settings seed carries the overlay (the disabled chords and the unbinding of revealing commands)", async () => {
+    const w = world({ chromeHiding: hiding });
+    const tab = await w.openTab("a.js");
+    await vi.waitFor(() => expect(overlaySeeds(tab.embed())).toBe(1));
+    const seed = tab.embed().seeds.find(withOverlay) as string;
+    // written out literally: the removals of the four chords of GP4
+    for (const [key, command] of [
+      ["cmd+b", "-workbench.action.toggleSidebarVisibility"],
+      ["cmd+j", "-workbench.action.togglePanel"],
+      ["cmd+k z", "-workbench.action.toggleZenMode"],
+      ["cmd+w", "-workbench.action.closeActiveEditor"],
+    ]) expect(seed).toContain(JSON.stringify({ key, command }));
+    expect(seed).toContain(JSON.stringify(unbindCommands()));
+  });
+
+  it("reload (the same tab, a second load): the step runs again, not once per tab or per server start", async () => {
+    const w = world({ chromeHiding: hiding });
+    const tab = await w.openTab("a.js");
+    await vi.waitFor(() => expect(overlaySeeds(tab.embed())).toBe(1));
+    const first = tab.embed();
+    tab.view.reload(); // the fake embed has no reload(): the tab loads the workbench again, which is a fresh page
+    await vi.waitFor(() => expect(tab.embed()).not.toBe(first));
+    await vi.waitFor(() => expect(overlaySeeds(tab.embed())).toBe(1));
+    expect(w.leaves).toHaveLength(1); // the same tab, not a second one
+  });
+
+  it("server restart: the tab reloads onto the new server and runs the step again", async () => {
+    const serverListeners: Array<(state: "running" | "stopped") => void> = [];
+    const w = world({ chromeHiding: hiding, serverListeners });
+    const tab = await w.openTab("a.js");
+    await vi.waitFor(() => expect(overlaySeeds(tab.embed())).toBe(1));
+    const first = tab.embed();
+    for (const cb of serverListeners) cb("stopped");
+    for (const cb of serverListeners) cb("running");
+    await vi.waitFor(() => expect(tab.embed()).not.toBe(first));
+    await vi.waitFor(() => expect(overlaySeeds(tab.embed())).toBe(1));
+  });
+
+  it.each([
+    ["the host's chromeHiding throws", { chromeHiding: () => { throw new Error("no overlay"); } }, () => Promise.resolve("seeded")],
+    ["the seed script (which holds the overlay step) throws in the page", { chromeHiding: hiding }, () => Promise.reject(new Error("page refused"))],
+    ["the seed script answers an error outcome", { chromeHiding: hiding }, () => Promise.resolve("error:SyntaxError")],
+  ])("F3: %s: the tab still opens and navigates to its editor", async (_name, opts, answer) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // the answer is set on the embed before its page's dom-ready, which fires on the first src
+      vi.stubGlobal("document", { createElement: (t: string) => Object.assign(new Embed(t), { seedAnswer: answer }) });
+      const w = world(opts as never);
+      const tab = await w.openTab("a.js");
+      await vi.waitFor(() => expect(tab.embed().srcs).toHaveLength(2));
+      expect(tab.embed().srcs[1]).toContain("tkn=tok");
+      expect(tab.leaf.detached).toBe(false);
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
   });
 });

@@ -161,6 +161,20 @@ describe("seedUserData: writing", () => {
     expect(seedUserData({ userDataDir: userData, sourceUserDir: null }).keybindingsBase64).toBeNull();
   });
 
+  it("the copied keybindings are the user's bytes, with no overlay in the file or in the copy (the overlay is laid over them in the browser profile), and the source is only read", () => {
+    const keybindings = Buffer.from('\ufeff// mine\n[ { "key": "ctrl+alt+n", "command": "workbench.action.toggleSidebarVisibility" }, ]\n', "utf8");
+    const { source, userData } = setup({ "settings.json": "{}", "keybindings.json": keybindings });
+    const sourceFile = path.join(source, "keybindings.json");
+    const before = { bytes: fs.readFileSync(sourceFile), mtime: fs.statSync(sourceFile).mtimeMs, names: fs.readdirSync(source) };
+    const r = seedUserData({ userDataDir: userData, sourceUserDir: source });
+    expect(fs.readFileSync(r.keybindingsFile).equals(keybindings)).toBe(true);
+    expect(Buffer.from(r.keybindingsBase64 as string, "base64").equals(keybindings)).toBe(true);
+    expect(fs.readFileSync(r.keybindingsFile, "utf8")).not.toContain("obsidian-vscode-workbench");
+    expect(fs.readFileSync(sourceFile).equals(before.bytes)).toBe(true);
+    expect(fs.statSync(sourceFile).mtimeMs).toBe(before.mtime);
+    expect(fs.readdirSync(source)).toEqual(before.names);
+  });
+
   it("a missing source folder gives excludes only and no keybindings", () => {
     const { userData, settings } = setup();
     const r = seedUserData({ userDataDir: userData, sourceUserDir: path.join(tempDir(), "no", "User") });

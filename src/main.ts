@@ -50,7 +50,7 @@ import { buildExtensionList } from "./settings/extension-list";
 import type { ExtensionListView } from "./settings/extension-states";
 import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
 import { workbenchOverlay, terminalOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
-import { chromeKeybindings } from "./chrome-settings";
+import { overlayKeybindings, unbindCommands } from "./chrome-settings";
 import { buildChromeHideScript } from "./chrome-script";
 import { DEVICE_ID_KEY, deviceId } from "./terminal/drawer-state";
 import { viewKind } from "./terminal/drawer-visibility";
@@ -499,9 +499,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return terminalOverlay({ dark: this.isDark() });
   }
 
-  /** The chords and page script that close the side bar, secondary side bar and panel of a Code tab; read at every load (GP1). */
+  /** The keybinding overlay and page script that keep the bars of a Code tab closed and the layout chords dead; read at every load (GP1, GP4). */
   chromeHiding(): ChromeHiding {
-    return { keybindings: chromeKeybindings(), script: buildChromeHideScript() };
+    return { keybindings: overlayKeybindings(), unbind: unbindCommands(), script: buildChromeHideScript() };
   }
 
   /** Read at every tab load, so the toggle applies at the next load (G6). */

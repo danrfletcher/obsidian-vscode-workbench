@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { CHROME_SURFACES, GP1_PARTS, chromeKeybindings, chromeSettings, closeRoutes, legacyChromeSettings, visibleChrome } from "../../src/chrome-settings";
+import { CHROME_SURFACES, DISABLED_CHORDS, GP1_PARTS, REVEALING_COMMANDS, chromeKeybindings, chromeSettings, closeRoutes, legacyChromeSettings, visibleChrome } from "../../src/chrome-settings";
 import { buildChromeHideScript } from "../../src/chrome-script";
 import { buildMachineSettings, terminalOverlay, writeMachineSettings, workbenchOverlay } from "../../src/settings";
 import { tempDir } from "../helpers";
@@ -80,20 +80,57 @@ describe("chrome settings (G5, GP1)", () => {
     });
   });
 
-  it("closes the side bar, secondary side bar and panel with the workbench's own commands, on four distinct seeded chords", () => {
-    // literal: PR-1's chords (docs/spike-chrome.md R6a, S2)
+  it("closes the side bar, secondary side bar and panel with the workbench's own commands, and toggles the activity bar and status bar, on six distinct seeded chords", () => {
+    // literal: PR-1's chords (docs/spike-chrome.md R6a, S2) and PR-3's two toggles for the bars the settings hide (E8)
     expect(chromeKeybindings()).toEqual([
+      { key: "ctrl+alt+shift+7", command: "workbench.action.toggleActivityBarVisibility" },
+      { key: "ctrl+alt+shift+6", command: "workbench.action.toggleStatusbarVisibility" },
       { key: "ctrl+alt+shift+2", command: "workbench.action.closeAuxiliaryBar" },
       { key: "ctrl+alt+shift+1", command: "workbench.action.closeSidebar" },
       { key: "ctrl+alt+shift+3", command: "workbench.action.closePanel" },
       { key: "ctrl+alt+shift+4", command: "workbench.action.closeOtherEditors" },
     ]);
-    expect(closeRoutes().map((r) => r.surface)).toEqual(["secondarySideBar", "sideBar", "panel"]);
+    expect(closeRoutes().map((r) => r.surface)).toEqual(["activityBar", "statusBar", "secondarySideBar", "sideBar", "panel"]);
+    expect(new Set(chromeKeybindings().map((k) => k.key)).size).toBe(6);
+  });
+
+  it("gives only the panel a hide button for the time a modal dialog swallows the chord, and the button never reaches the seeded keybindings", () => {
+    expect(closeRoutes().filter((r) => r.button).map((r) => [r.surface, r.button])).toEqual([["panel", ".part.panel .action-label.codicon-panel-close"]]);
+    expect(JSON.stringify(chromeKeybindings())).not.toContain("codicon");
+  });
+
+  it("the disabled chords are an exported constant that names every GP4 chord in both spellings (a test fails if it is emptied)", () => {
+    // literal: the chords GP4 and E9 name, and the default rules the `-command` removals must match
+    expect(DISABLED_CHORDS).toEqual([
+      { command: "workbench.action.toggleSidebarVisibility", keys: ["cmd+b", "ctrl+b"] },
+      { command: "workbench.action.togglePanel", keys: ["cmd+j", "ctrl+j"] },
+      { command: "workbench.action.toggleZenMode", keys: ["cmd+k z", "ctrl+k z"] },
+      { command: "workbench.action.closeActiveEditor", keys: ["cmd+w", "ctrl+w", "ctrl+f4"] },
+      { command: "workbench.action.toggleAuxiliaryBar", keys: ["cmd+alt+b", "ctrl+alt+b"] },
+    ]);
+  });
+
+  it("the revealing commands are an exported constant that holds the commands E8 names (a test fails if it is emptied)", () => {
+    expect(REVEALING_COMMANDS.length).toBeGreaterThanOrEqual(25);
+    expect(new Set(REVEALING_COMMANDS).size).toBe(REVEALING_COMMANDS.length);
+    expect(REVEALING_COMMANDS).toEqual(
+      expect.arrayContaining([
+        "workbench.action.toggleSidebarVisibility",
+        "workbench.action.togglePanel",
+        "workbench.action.toggleAuxiliaryBar",
+        "workbench.action.toggleActivityBarVisibility",
+        "workbench.action.toggleStatusbarVisibility",
+        "workbench.action.toggleZenMode",
+        "workbench.view.explorer",
+        "workbench.action.terminal.new",
+      ]),
+    );
+    for (const c of REVEALING_COMMANDS) expect(c, c).toMatch(/^workbench\.(action|actions|view|debug)\./);
   });
 
   it("touches no extensions.* key and nothing that starts or stops the extension host (GP5)", () => {
     for (const k of Object.keys(chromeSettings())) expect(k, k).not.toMatch(/extension/i);
-    for (const c of chromeKeybindings()) expect(c.command, c.key).toMatch(/^workbench\.action\.close(Sidebar|AuxiliaryBar|Panel|OtherEditors)$/);
+    for (const c of chromeKeybindings()) expect(c.command, c.key).toMatch(/^workbench\.action\.(close(Sidebar|AuxiliaryBar|Panel|OtherEditors)|toggle(ActivityBarVisibility|StatusbarVisibility))$/);
   });
 
   it("changes no notification, trust or save-dialog setting (F8)", () => {

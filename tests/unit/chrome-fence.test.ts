@@ -44,13 +44,13 @@ describe("F6: nothing registers a way to see the full workbench", () => {
 });
 
 describe("F2: the terminal drawer and its host page do not import the Code tab's hiding", () => {
-  it.each([...files("terminal"), ...files("terminal-host")])("src/%s imports neither chrome-settings nor chrome-script", (rel) => {
-    expect(code(rel)).not.toMatch(/from\s+["'][^"']*chrome-(settings|script)["']/);
+  it.each([...files("terminal"), ...files("terminal-host")])("src/%s imports none of chrome-settings, chrome-script or keybinding-overlay", (rel) => {
+    expect(code(rel)).not.toMatch(/from\s+["'][^"']*(chrome-(settings|script)|keybinding-overlay)["']/);
   });
 });
 
 describe("F1: the hiding code makes no network request", () => {
-  it.each(["chrome-settings.ts", "chrome-script.ts"])("src/%s has no network API and no outside address", (rel) => {
+  it.each(["chrome-settings.ts", "chrome-script.ts", "keybinding-overlay.ts"])("src/%s has no network API and no outside address", (rel) => {
     expect(code(rel)).not.toMatch(/\bfetch\(|XMLHttpRequest|WebSocket|sendBeacon|node:https?|node:net|require\(["']https?["']\)/);
     expect(code(rel)).not.toMatch(/https?:\/\/(?!127\.0\.0\.1)/);
   });

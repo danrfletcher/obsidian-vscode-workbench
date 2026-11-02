@@ -15,11 +15,22 @@
 
 export type ChromeSurfaceName = "activityBar" | "statusBar" | "titleBar" | "tabStrip" | "breadcrumbs" | "secondarySideBar" | "sideBar" | "panel";
 
-/** The workbench's own command that closes a part, bound to a chord the plugin seeds into the browser profile's keybindings. */
+/**
+ * The workbench's own command that puts a part away, bound to a chord the plugin seeds into the browser profile's keybindings.
+ * For the side bar, secondary side bar and panel it is a close command; the status bar and the activity bar have no close
+ * command, only a toggle, which the page script presses when (and only when) the part is on screen.
+ */
 export interface CloseRoute {
   command: string;
   /** In VS Code's keybinding syntax. The page script presses exactly this chord (ctrl+alt+shift plus one digit). */
   key: string;
+  /**
+   * CSS selector of the part's own "hide" button, for the one time the chord cannot get through: a modal dialog (the Workspace Trust
+   * prompt that "Terminal: Create New Terminal" brings up) takes the focus and stops every key at itself, so with the panel open
+   * behind it the chord does nothing until the dialog is answered. A click on the button is not stopped. Best effort: if the
+   * selector stops matching, the panel stays until the dialog is answered, then the chord closes it.
+   */
+  button?: string;
 }
 
 export interface ChromeSurface {
@@ -34,15 +45,34 @@ export interface ChromeSurface {
   route: "setting" | "page-script";
   /** The settings that go with the route. Never empty. */
   setting: Readonly<Record<string, unknown>>;
-  /** The close command and chord of a "page-script" route. */
+  /**
+   * The close command and chord of a "page-script" route. A "setting" route may carry one too: the settings hide the part at
+   * every load, and the command puts it away again if a palette command (or a user rule) reveals it later in the tab (E8).
+   */
   close?: CloseRoute;
   /** What the spike measured for the route in the Obsidian embed. */
   measured: "hidden" | "visible" | "not-open-by-default";
 }
 
 export const CHROME_SURFACES: readonly ChromeSurface[] = [
-  { surface: "activityBar", selector: ".part.activitybar", route: "setting", setting: { "workbench.activityBar.location": "hidden" }, measured: "hidden" },
-  { surface: "statusBar", selector: ".part.statusbar", route: "setting", setting: { "workbench.statusBar.visible": false }, measured: "hidden" },
+  // "Toggle Activity Bar Visibility" and "Toggle Status Bar Visibility" change the setting in the profile's settings.json, which the
+  // overlay only re-applies at the next load, so the toggle is also the way back: pressed by the page script while the bar shows (E8).
+  {
+    surface: "activityBar",
+    selector: ".part.activitybar",
+    route: "setting",
+    setting: { "workbench.activityBar.location": "hidden" },
+    close: { command: "workbench.action.toggleActivityBarVisibility", key: "ctrl+alt+shift+7" },
+    measured: "hidden",
+  },
+  {
+    surface: "statusBar",
+    selector: ".part.statusbar",
+    route: "setting",
+    setting: { "workbench.statusBar.visible": false },
+    close: { command: "workbench.action.toggleStatusbarVisibility", key: "ctrl+alt+shift+6" },
+    measured: "hidden",
+  },
   // `showTabs: none` on its own brings the title bar back at full width (the editor actions move into it); hiding the editor
   // actions and the menu bar together with the command centre and layout controls keeps it at 0 px.
   {
@@ -85,7 +115,7 @@ export const CHROME_SURFACES: readonly ChromeSurface[] = [
     selector: ".part.panel",
     route: "page-script",
     setting: { "workbench.panel.defaultLocation": "bottom" },
-    close: { command: "workbench.action.closePanel", key: "ctrl+alt+shift+3" },
+    close: { command: "workbench.action.closePanel", key: "ctrl+alt+shift+3", button: ".part.panel .action-label.codicon-panel-close" },
     measured: "hidden",
   },
 ];
@@ -161,7 +191,95 @@ export interface KeybindingEntry {
  */
 export const CLOSE_OTHER_EDITORS: KeybindingEntry = { key: "ctrl+alt+shift+4", command: "workbench.action.closeOtherEditors" };
 
-/** The chords the page script presses: one close command per page-script part, then close-other-editors. */
+/** The chords the page script presses: one close command per part with a close route, then close-other-editors. */
 export function chromeKeybindings(): KeybindingEntry[] {
   return [...closeRoutes().map(({ key, command }) => ({ key, command })), CLOSE_OTHER_EDITORS];
+}
+
+/**
+ * The layout and Zen chords that stay dead in a Code tab (GP4, E9; docs/spike-chrome.md S3): Cmd/Ctrl+B, Cmd/Ctrl+J, Cmd+K Z, Cmd+W,
+ * and the side-bar chord of the secondary side bar. Each is listed in both spellings because a `-command` removal only matches the
+ * default rule written the same way (Mac `cmd`, Linux and Windows `ctrl`); Ctrl+F4 is the other default of close-editor. The
+ * bridged chords (Ctrl+` and the quick switcher, src/hotkey/hotkey-bridge.ts) are not here, and neither is `escape escape`: Zen Mode is
+ * not a hiding route of this plugin, so a Zen Mode entered from the palette must still be left the usual way.
+ */
+export const DISABLED_CHORDS: readonly { command: string; keys: readonly string[] }[] = [
+  { command: "workbench.action.toggleSidebarVisibility", keys: ["cmd+b", "ctrl+b"] },
+  { command: "workbench.action.togglePanel", keys: ["cmd+j", "ctrl+j"] },
+  { command: "workbench.action.toggleZenMode", keys: ["cmd+k z", "ctrl+k z"] },
+  { command: "workbench.action.closeActiveEditor", keys: ["cmd+w", "ctrl+w", "ctrl+f4"] },
+  { command: "workbench.action.toggleAuxiliaryBar", keys: ["cmd+alt+b", "ctrl+alt+b"] },
+];
+
+/**
+ * The commands that can bring a bar (or Zen Mode, or the panel through a terminal) back. Collected from the ids VS Code 1.145.0
+ * ships in its workbench bundle (every `workbench.action.toggle*` that shows or hides a part, the `workbench.view.*` view
+ * containers, the `workbench.action.focus*` commands that open a hidden part) plus PR-1's S4 findings (docs/spike-chrome.md: the
+ * palette toggles for the side bar, panel and secondary side bar; "Terminal: Create New Terminal" opens the panel). Used two ways:
+ * the tests run each one and check that every bar ends hidden, and the keybinding overlay unbinds any chord a copied
+ * keybindings.json gives them (`unbindCommands()`). View containers that extensions contribute (`workbench.view.extension.*`)
+ * cannot be listed; the page script covers them, since it watches the parts, not the commands.
+ */
+export const REVEALING_COMMANDS: readonly string[] = [
+  // parts
+  "workbench.action.toggleSidebarVisibility",
+  "workbench.action.toggleAuxiliaryBar",
+  "workbench.action.togglePanel",
+  "workbench.action.toggleActivityBarVisibility",
+  "workbench.action.toggleStatusbarVisibility",
+  "workbench.action.toggleMenuBar",
+  "workbench.action.toggleZenMode",
+  "workbench.action.toggleMaximizedPanel",
+  "workbench.action.toggleMaximizedAuxiliaryBar",
+  // focus commands that open a part that is hidden
+  "workbench.action.focusSideBar",
+  "workbench.action.focusAuxiliaryBar",
+  "workbench.action.focusPanel",
+  "workbench.action.focusActivityBar",
+  "workbench.action.focusStatusBar",
+  "workbench.action.focusCommentsPanel",
+  // view containers (the side bar)
+  "workbench.view.explorer",
+  "workbench.view.search",
+  "workbench.view.scm",
+  "workbench.view.debug",
+  "workbench.view.extensions",
+  "workbench.view.remote",
+  "workbench.view.sync",
+  "workbench.view.testing",
+  "workbench.view.testCoverage",
+  "workbench.view.editSessions",
+  "workbench.action.openView",
+  // views of the panel and the secondary side bar
+  "workbench.action.terminal.new",
+  "workbench.action.terminal.newInActiveWorkspace",
+  "workbench.action.terminal.newWithProfile",
+  "workbench.action.terminal.toggleTerminal",
+  "workbench.action.terminal.focus",
+  "workbench.action.output.toggleOutput",
+  "workbench.actions.view.problems",
+  "workbench.debug.action.toggleRepl",
+  "workbench.action.chat.open",
+];
+
+/**
+ * Every command a user's own keybinding must not bind to a chord in a Code tab: the revealing commands and the commands of the
+ * disabled chords (a copied `cmd+w` -> `closeActiveEditor` would close the editor inside VS Code). The overlay writes an
+ * unbound rule after each such copied rule.
+ */
+export function unbindCommands(): string[] {
+  return [...new Set([...REVEALING_COMMANDS, ...DISABLED_CHORDS.map((d) => d.command)])];
+}
+
+/** The `-command` entries that remove the default rule of every disabled chord. */
+export function chordRemovals(): KeybindingEntry[] {
+  return DISABLED_CHORDS.flatMap(({ command, keys }) => keys.map((key) => ({ key, command: `-${command}` })));
+}
+
+/**
+ * Everything the browser profile's keybindings.json gains at EVERY load (src/keybinding-overlay.ts lays it over the copied or
+ * stored file): the chords the page script presses, then the removals of the disabled chords.
+ */
+export function overlayKeybindings(): KeybindingEntry[] {
+  return [...chromeKeybindings(), ...chordRemovals()];
 }

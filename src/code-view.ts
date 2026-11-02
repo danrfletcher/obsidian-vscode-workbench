@@ -31,12 +31,15 @@ export const CODE_TAB_PARTITION = "persist:vscode-workbench";
 export type EmbedElement = "webview" | "iframe";
 
 /**
- * What hides the parts of the workbench that no setting hides (src/chrome-script.ts): the chords the browser profile's
- * keybindings gain at every load, and the page script that presses them. A host that gives none (or `null`) leaves the tab with
+ * What hides the parts of the workbench that no setting hides (src/chrome-script.ts) and keeps them hidden: the keybinding overlay
+ * the browser profile's keybindings gain at every load (src/keybinding-overlay.ts: the chords the page script presses and the
+ * disabled layout chords), and the page script that presses them and puts away a bar a command brings back. A host that gives none (or `null`) leaves the tab with
  * the chrome the settings overlay hides, as in 0.1.0 (F3).
  */
 export interface ChromeHiding {
   keybindings: readonly KeybindingEntry[];
+  /** The commands a copied keybinding must not bind to any chord (`unbindCommands()`); unset: none are unbound. */
+  unbind?: readonly string[];
   script: string;
 }
 
@@ -795,7 +798,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
         // One page, one dom-ready: both seeds run from it, the settings seed first, then the trust seed.
         const trust = this.trustSeedScript(server);
         const hiding = this.chromeHiding();
-        const settingsSeed = buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...this.overlay() }, this.host.userDataCopy(), hiding?.keybindings);
+        const settingsSeed = buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...this.overlay() }, this.host.userDataCopy(), hiding?.keybindings, hiding?.unbind);
         const outcomes = await runScriptsInWebview(el as WebviewLike, trust === null ? [settingsSeed] : [settingsSeed, trust]);
         logSeedOutcome(outcomes[0]);
         if (trust !== null) {

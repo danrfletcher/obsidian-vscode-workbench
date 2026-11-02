@@ -14,8 +14,8 @@ const { JSDOM } = createRequire(import.meta.url)("jsdom") as { JSDOM: new (html:
  * no layout), and the chords it presses are read off the keydown events. A chord "closes" its part the way the workbench's
  * own command does, when `obey` says so.
  */
-const PARTS = { sideBar: ".part.sidebar", secondarySideBar: ".part.auxiliarybar", panel: ".part.panel" } as const;
-const CHORD_OF: Record<string, keyof typeof PARTS> = { "1": "sideBar", "2": "secondarySideBar", "3": "panel" };
+const PARTS = { sideBar: ".part.sidebar", secondarySideBar: ".part.auxiliarybar", panel: ".part.panel", activityBar: ".part.activitybar", statusBar: ".part.statusbar" } as const;
+const CHORD_OF: Record<string, keyof typeof PARTS> = { "1": "sideBar", "2": "secondarySideBar", "3": "panel", "6": "statusBar", "7": "activityBar" };
 
 let dom: JSDOM;
 let document: Document;
@@ -72,6 +72,8 @@ describe("the chrome page script", () => {
     expect(byCommand["workbench.action.closeSidebar"]).toBe(`ctrl+alt+shift+${Object.keys(CHORD_OF).find((d) => CHORD_OF[d] === "sideBar")}`);
     expect(byCommand["workbench.action.closeAuxiliaryBar"]).toBe("ctrl+alt+shift+2");
     expect(byCommand["workbench.action.closePanel"]).toBe("ctrl+alt+shift+3");
+    expect(byCommand["workbench.action.toggleStatusbarVisibility"]).toBe("ctrl+alt+shift+6");
+    expect(byCommand["workbench.action.toggleActivityBarVisibility"]).toBe("ctrl+alt+shift+7");
     for (const k of chromeKeybindings()) {
       const e = chordEvent(k);
       expect(k.key).toBe(`ctrl+alt+shift+${e.key}`);
@@ -107,6 +109,86 @@ describe("the chrome page script", () => {
     addPart(PARTS.sideBar, 180);
     await settle();
     expect(presses).toEqual(["3", "1"]);
+  });
+
+  describe("a modal dialog is up (Workspace Trust, from \"Terminal: Create New Terminal\")", () => {
+    // VS Code's dialog takes the focus and stops every key event at itself: a chord never reaches the handlers behind it.
+    const openDialog = () => {
+      const block = document.createElement("div");
+      block.className = "monaco-dialog-modal-block dimmed";
+      const box = document.createElement("div");
+      box.className = "monaco-dialog-box";
+      block.appendChild(box);
+      document.body.appendChild(block);
+      document.defaultView!.addEventListener("keydown", (e) => { if (block.isConnected) e.stopImmediatePropagation(); }, true);
+      return block;
+    };
+    const addHideButton = (part: HTMLElement, selectorSize: string) => {
+      const b = document.createElement("a");
+      b.className = "action-label codicon codicon-panel-close";
+      b.addEventListener("click", () => { sizes[selectorSize] = 0; });
+      part.appendChild(b);
+      return b;
+    };
+
+    it("clicks the panel's own hide button, because the chord is swallowed, and leaves the dialog where it is (E8, F8)", async () => {
+      const dialog = openDialog();
+      run();
+      const panel = addPart(PARTS.panel, 300); // "Create New Terminal" opened the panel behind the dialog
+      addHideButton(panel, PARTS.panel);
+      await settle();
+      expect(sizes[PARTS.panel]).toBe(0);
+      expect(presses).toEqual([]); // nothing was pressed: the dialog would have eaten it
+      expect(document.body.contains(dialog)).toBe(true);
+    });
+
+    it("presses no chord for a part with no hide button while the dialog is up, and presses it once the dialog is gone", async () => {
+      const dialog = openDialog();
+      run();
+      addPart(PARTS.sideBar, 200);
+      await settle();
+      expect(presses).toEqual([]);
+      expect(sizes[PARTS.sideBar]).toBe(200);
+      dialog.remove(); // the user answered it: the page changes, the watcher sweeps
+      await settle();
+      expect(presses).toEqual(["1"]);
+      expect(sizes[PARTS.sideBar]).toBe(0);
+    });
+
+    it("does not click anything when the dialog is not up: the chord is the route", async () => {
+      const panel = addPart(PARTS.panel, 300);
+      let clicks = 0;
+      addHideButton(panel, PARTS.panel).addEventListener("click", () => clicks++);
+      run();
+      expect(presses).toEqual(["3"]);
+      expect(clicks).toBe(0);
+    });
+
+    it("does nothing and throws nothing when the panel has no hide button of the expected class (F3)", async () => {
+      openDialog();
+      run();
+      addPart(PARTS.panel, 300);
+      await settle();
+      expect(sizes[PARTS.panel]).toBe(300);
+      expect(presses).toEqual([]);
+    });
+  });
+
+  it("puts away the activity bar and the status bar when a command brings them back (E8), and leaves them alone while the settings keep them hidden", async () => {
+    addPart(PARTS.activityBar, 0);
+    addPart(PARTS.statusBar, 0);
+    run();
+    expect(presses).toEqual([]); // hidden by the settings at load: nothing to put away
+    sizes[PARTS.activityBar] = 48; // a palette "Toggle Activity Bar Visibility" brought it back
+    document.body.appendChild(document.createElement("span"));
+    await settle();
+    expect(presses).toEqual(["7"]);
+    expect(sizes[PARTS.activityBar]).toBe(0);
+    sizes[PARTS.statusBar] = 22;
+    document.body.appendChild(document.createElement("span"));
+    await settle();
+    expect(presses).toEqual(["7", "6"]);
+    expect(sizes[PARTS.statusBar]).toBe(0);
   });
 
   it("is installed once per page: a second run adds no second watcher", async () => {
