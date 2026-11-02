@@ -33,7 +33,7 @@ function makeApp(root: string): MockApp {
       on: (name: string, cb: (...args: any[]) => void) => ({ name, cb }),
     },
     workspace: {
-      // The old drawer mounts at layout-ready and needs a real DOM; these tests are about the new host only.
+      // The drawer mounts at layout-ready and needs a real DOM; these tests are about the host page only.
       onLayoutReady: () => undefined,
       activeFile: null as TFile | null,
       leaves: [] as WorkspaceLeaf[],
@@ -242,7 +242,7 @@ describe("E1: a failed start keeps the drawer open with the reason and Retry", (
     expect(drawerText()).toContain("could not be downloaded because the network is unreachable");
     expect(drawerText()).toContain("Retry");
     expect(inner().data_.serverLicenceAccepted).toBe(true);
-    expect((plugin as unknown as { terminal: unknown }).terminal).not.toBeNull(); // the old drawer is still the old drawer
+    expect(plugin).not.toHaveProperty("terminal"); // no old drawer is built to fall back to
     expect(webviews).toHaveLength(0);
   });
 

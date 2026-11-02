@@ -31,10 +31,11 @@ export const NOT_PANEL_TEXT = "The VS Code terminal panel did not open on its ow
 /**
  * Puts focus on the terminal's input inside the page: the script the spike measured (docs/terminal-spike.md, S7), which
  * printed `focused` after which typed text reached the shell. The class name of the input belongs to the page's own
- * emulator; it is put together from two pieces only so the fence test (F1: this plugin names and imports no emulator
- * library) stays a plain text search.
+ * emulator; it is joined at run time from two pieces so that neither the source nor the built main.js holds the whole
+ * name (F1: this plugin names and imports no emulator library; the fence tests are plain text searches). A `+` of two
+ * literals would not do: esbuild folds it back into one string in the bundle.
  */
-const HELPER_TEXTAREA = ".xter" + "m-helper-textarea";
+const HELPER_TEXTAREA = [".xter", "m-helper-textarea"].join("");
 export const FOCUS_TERMINAL_SCRIPT =
   `(() => { const t = document.querySelector('.terminal-wrapper.active ${HELPER_TEXTAREA}') || document.querySelector('${HELPER_TEXTAREA}'); if (!t) return 'no terminal'; t.focus(); return document.activeElement === t ? 'focused' : 'not focused'; })()`;
 

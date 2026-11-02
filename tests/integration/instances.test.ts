@@ -320,7 +320,8 @@ describe("the settings tab", () => {
     Setting.reset();
     tab.display();
     expect(tab.containerEl.textContent()).toContain("Scanning…");
-    expect(Setting.all.map((s) => s.name)).toEqual(expect.arrayContaining(["Excluded file extensions", "Terminal drawer over non-code views", "Shell", "Restart server"]));
+    expect(Setting.all.map((s) => s.name)).toEqual(expect.arrayContaining(["Excluded file extensions", "Terminal drawer over non-code views", "Restart server"]));
+    expect(Setting.all.map((s) => s.name)).not.toContain("Shell");
     await vi.waitFor(() => expect(tab.containerEl.textContent()).not.toContain("Scanning…"), { timeout: 5000, interval: 10 });
   });
 
@@ -382,7 +383,7 @@ describe("the settings tab", () => {
     });
   });
 
-  describe("exclude list, drawer toggle and shell", () => {
+  describe("exclude list and drawer toggle", () => {
     it("adds an extension normalised, de-duplicates it, rejects bad input and removes it again", async () => {
       await load();
       let t = await openTab();
@@ -407,23 +408,31 @@ describe("the settings tab", () => {
       expect(Setting.all.filter((s) => s.name === "md")).toHaveLength(1);
     });
 
-    it("the drawer toggle defaults on, saves false, and survives a reload; the shell saves and defaults to $SHELL", async () => {
+    it("the drawer toggle defaults on, saves false, and survives a reload; there is no Shell field", async () => {
       await load({});
       let t = await openTab();
       const toggle = t.one("Terminal drawer over non-code views").toggle!;
       expect(toggle.value).toBe(true);
       toggle.handler!(false);
-      const shell = t.one("Shell");
-      expect(shell.text!.placeholder).toBe(process.env.SHELL && path.isAbsolute(process.env.SHELL) ? process.env.SHELL : "/bin/zsh");
-      shell.text!.handler!(" /bin/bash ");
-      await vi.waitFor(() => expect(stored()).toMatchObject({ nonCodeDrawer: false, shellPath: "/bin/bash" }));
+      expect(Setting.all.some((s) => s.name === "Shell")).toBe(false);
+      await vi.waitFor(() => expect(stored()).toMatchObject({ nonCodeDrawer: false }));
+      expect(stored()).not.toHaveProperty("shellPath");
       const saved = { ...stored() };
       plugin.onunload();
       Plugin.reset();
       await load(saved);
       t = await openTab();
       expect(t.one("Terminal drawer over non-code views").toggle!.value).toBe(false);
-      expect(t.one("Shell").text!.value).toBe("/bin/bash");
+    });
+
+    it("a data.json from 0.1.0 (shellPath and the old drawer open state) loads, ignores both, and keeps both in the file after the next save", async () => {
+      const old = { serverLicenceAccepted: true, shellPath: "/bin/bash", drawer: { "device-aaaa-0001": { height: 420, open: true } } };
+      await load(old);
+      const t = await openTab();
+      expect(Setting.all.some((s) => s.name === "Shell")).toBe(false);
+      t.one("Terminal drawer over non-code views").toggle!.handler!(false);
+      await vi.waitFor(() => expect(stored().nonCodeDrawer).toBe(false));
+      expect(stored()).toMatchObject({ shellPath: "/bin/bash", drawer: old.drawer, serverLicenceAccepted: true });
     });
 
     it("saving a setting keeps the unknown fields already in data.json (the licence flag)", async () => {
@@ -445,7 +454,6 @@ describe("the settings tab", () => {
       await load(data as Record<string, unknown> | null);
       const t = await openTab();
       expect(t.one("Terminal drawer over non-code views").toggle!.value).toBe(true);
-      expect(t.one("Shell").text!.value).toBe("");
       expect(t.one("VS Code instance").dropdown!.value).toMatch(/^vscode-insiders:/);
     });
 

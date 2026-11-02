@@ -2,10 +2,10 @@
  * The settings this PR adds to `data.json` (G15), read field by field so a
  * corrupt, partial or missing file falls back to defaults and the settings tab
  * still opens. The exclude list is read by the extension scan (PR-4); the
- * non-code drawer toggle (read live by the drawer's visibility rule, G6) and
- * the shell path are stored here for the terminal drawer.
+ * non-code drawer toggle (read live by the drawer's visibility rule, G6) is
+ * stored here for the terminal drawer. A `shellPath` left in `data.json` by 0.1.0
+ * is not read; `dataObject` keeps it so the next save writes it back untouched.
  */
-import * as path from "node:path";
 
 export interface WorkbenchSettings {
   /** The instance Dan picked (an id from the scan, or "custom"); null = use the default. */
@@ -16,8 +16,6 @@ export interface WorkbenchSettings {
   excludeExtensions: string[];
   /** Show the terminal drawer over notes and other non-code views. Default on. */
   nonCodeDrawer: boolean;
-  /** The shell the drawer starts; "" = the default (`$SHELL`, else `/bin/zsh`). */
-  shellPath: string;
   /**
    * The loopback port this vault's VS Code server tries first, so the workbench's origin (and anything the
    * browser stores per origin) can stay the same across restarts. null = none stored yet: the first start
@@ -37,26 +35,12 @@ export const DEFAULT_SETTINGS: Readonly<WorkbenchSettings> = {
   customCliPath: null,
   excludeExtensions: [],
   nonCodeDrawer: true,
-  shellPath: "",
   stablePort: null,
   trustVaultFolder: true,
 };
 
 export const MIN_STABLE_PORT = 1024;
 export const MAX_STABLE_PORT = 65535;
-
-export const FALLBACK_SHELL = "/bin/zsh";
-
-/** The default shell: `$SHELL` when it is an absolute path, else `/bin/zsh`. */
-export function defaultShell(env: NodeJS.ProcessEnv = process.env): string {
-  const s = env.SHELL?.trim();
-  return s && path.isAbsolute(s) ? s : FALLBACK_SHELL;
-}
-
-/** The shell to use: the stored one, or the default. */
-export function effectiveShell(settings: Pick<WorkbenchSettings, "shellPath">, env: NodeJS.ProcessEnv = process.env): string {
-  return settings.shellPath.trim() || defaultShell(env);
-}
 
 export type ExtensionResult = { ok: true; value: string } | { ok: false; reason: string };
 
@@ -107,7 +91,6 @@ export function readSettings(raw: unknown): WorkbenchSettings {
     customCliPath: stringOrNull(o.customCliPath),
     excludeExtensions: normaliseExtensionList(o.excludeExtensions),
     nonCodeDrawer: typeof o.nonCodeDrawer === "boolean" ? o.nonCodeDrawer : DEFAULT_SETTINGS.nonCodeDrawer,
-    shellPath: typeof o.shellPath === "string" ? o.shellPath.trim() : DEFAULT_SETTINGS.shellPath,
     stablePort: portOrNull(o.stablePort),
     trustVaultFolder: typeof o.trustVaultFolder === "boolean" ? o.trustVaultFolder : DEFAULT_SETTINGS.trustVaultFolder,
   };

@@ -21,7 +21,7 @@ describe("the terminal host's fences", () => {
     }
   });
 
-  it("imports nothing from the old drawer, which PR-4 removes (src/terminal/)", () => {
+  it("imports nothing from the old drawer, which is gone (the files left in src/terminal/ are the new drawer's)", () => {
     for (const [file, text] of sources) expect(text, file).not.toMatch(/from\s+["'](?:\.\.\/)+terminal\/|from\s+["']\.\.\/terminal["']/);
   });
 

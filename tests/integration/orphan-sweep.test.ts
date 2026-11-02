@@ -80,6 +80,36 @@ describe("sweepOrphans with real processes", () => {
     expect(fs.existsSync(pf.file)).toBe(false);
   });
 
+  it("a pids.json from 0.1.0 that also lists PTY helpers: the server is taken down, a dead helper is dropped, a live pid that is not a helper is left alone", async () => {
+    const dir = tempDir();
+    const { port, wrapper, server } = await startOrphanServer(dir);
+    const done = spawn("true");
+    const deadHelper = done.pid as number;
+    await new Promise((r) => done.once("exit", r));
+    const other = spawn("sleep", ["301"], { stdio: "ignore", detached: true });
+    other.unref();
+    const otherPid = other.pid as number;
+    killed.push(otherPid);
+    const pf = new PidFile(path.join(dir, "pids.json"));
+    pf.add({ pid: wrapper, label: "vscode-server", match: "serve-web", startedAt: Date.now(), workspace: dir, group: true });
+    // the entries 0.1.0 wrote for a shell's helper: label "terminal-shell", marker "pty_helper.py"
+    pf.add({ pid: deadHelper, label: "terminal-shell", match: "pty_helper.py", startedAt: 1, group: true });
+    pf.add({ pid: otherPid, label: "terminal-shell", match: "pty_helper.py", startedAt: 1, group: true });
+
+    const result = await sweepOrphans(pf.file);
+
+    expect(result.killed.map((e) => e.pid)).toEqual([wrapper]);
+    expect(result.gone.map((e) => e.pid)).toEqual([deadHelper]);
+    expect(result.reused.map((e) => e.pid)).toEqual([otherPid]);
+    await vi.waitFor(() => {
+      expect(isAlive(wrapper)).toBe(false);
+      expect(isAlive(server)).toBe(false);
+      expect(listenersOn(port)).toEqual([]);
+    }, { timeout: 5000 });
+    expect(isAlive(otherPid)).toBe(true);
+    expect(fs.existsSync(pf.file)).toBe(false);
+  });
+
   it("a pidfile entry for a process that is already gone is dropped quietly", async () => {
     const dir = tempDir();
     const done = spawn("true");

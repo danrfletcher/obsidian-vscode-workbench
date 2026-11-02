@@ -1,20 +1,7 @@
 import { defineConfig } from "vitest/config";
 import { fileURLToPath } from "node:url";
-import * as fs from "node:fs";
 
 export default defineConfig({
-  plugins: [
-    {
-      // The PTY helper is imported as text, as esbuild's text loader does in the real build.
-      name: "py-as-text",
-      enforce: "pre",
-      load(id) {
-        const file = id.split("?")[0];
-        if (file.endsWith(".py")) return `export default ${JSON.stringify(fs.readFileSync(file, "utf8"))};`;
-        return null;
-      },
-    },
-  ],
   resolve: {
     alias: {
       obsidian: fileURLToPath(new URL("./tests/mocks/obsidian.ts", import.meta.url)),
@@ -27,7 +14,7 @@ export default defineConfig({
       WORKBENCH_SCAN_ROOTS: "/nonexistent-workbench-scan-root",
       WORKBENCH_APP_SUPPORT_ROOT: "/nonexistent-workbench-app-support",
     },
-    // Many tests start a real server, a child process or a Python helper. On a busy machine (a load average of 13 was seen) the 5 s and
+    // Many tests start a real server or a child process. On a busy machine (a load average of 13 was seen) the 5 s and
     // 10 s defaults ran out in unrelated files; a test that is stuck still fails, 30 s later.
     testTimeout: 30_000,
     hookTimeout: 30_000,

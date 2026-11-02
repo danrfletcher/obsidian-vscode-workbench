@@ -1,11 +1,10 @@
 /**
  * Ctrl+` carried in from the embed (G8, GP5): one press flips the drawer once, and keyboard focus follows.
  *
- * States: `hidden` (drawer closed), `revealing` (open, its shell not running yet: the first reveal is
- * creating it, or the shell is starting) and `shown` (open with a running shell, or showing an ended or failed
- * shell's message). A press never makes a second shell: the first reveal creates one in the session manager
- * synchronously, so ten presses in a second leave an open drawer after an odd count, a closed one after an even
- * count, and one shell either way.
+ * States: `hidden` (drawer closed), `revealing` (open, the terminal page not up yet: it is starting or waiting for
+ * the licence) and `shown` (open with the terminal page running, or showing its lost or error message). A press
+ * never makes a second host page: ten presses in a second leave an open drawer after an odd count, a closed one
+ * after an even count.
  *
  * Focus (G1): opening moves focus out of the embed so the next keystrokes reach the terminal; closing from
  * the embed hands focus back to it. Closing from the terminal host page (its bridged key, G16) passes no handle:
@@ -14,10 +13,10 @@
 
 export type ToggleState = "hidden" | "revealing" | "shown";
 
-/** The active shell, as far as the toggle cares. */
+/** How far the terminal page is, as far as the toggle cares. */
 export type ShellProgress = "none" | "starting" | "running" | "ended";
 
-/** The drawer, as the toggle drives it (the terminal feature in the plugin; a fake in the tests). */
+/** The drawer, as the toggle drives it (the terminal drawer in the plugin; a fake in the tests). */
 export interface ToggleTarget {
   /** The reveal command and its hotkey work over the current view. True over every view (G6): only the edge follows the non-code setting. */
   hotkeyEnabled(): boolean;

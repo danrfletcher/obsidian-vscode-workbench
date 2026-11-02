@@ -484,7 +484,8 @@ describe("the \"Trust the vault folder\" toggle in the settings tab (G6, E3)", (
   it("renders the toggle next to the other toggles, on by default, with a description that says what it does", () => {
     const { toggle } = openTab();
     const names = Setting.all.map((s) => s.name);
-    expect(names.indexOf("Trust the vault folder")).toBe(names.indexOf("Shell") + 1);
+    expect(names.indexOf("Trust the vault folder")).toBe(names.indexOf("Terminal drawer over non-code views") + 1);
+    expect(names).not.toContain("Shell");
     expect(toggle().toggle?.value).toBe(true);
     expect(toggle().desc).toContain("trusted");
     expect(toggle().desc).toContain("Only the vault folder is trusted");

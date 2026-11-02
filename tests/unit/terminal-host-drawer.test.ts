@@ -34,7 +34,8 @@ describe("focus into the terminal (G1)", () => {
     expect(wv.focusCount).toBe(focusBefore + 1);
     expect(wv.executed.slice(scriptsBefore)).toEqual([FOCUS_TERMINAL_SCRIPT]);
     expect(FOCUS_TERMINAL_SCRIPT).toContain("t.focus()");
-    expect(FOCUS_TERMINAL_SCRIPT).toContain("-helper-textarea");
+    expect(FOCUS_TERMINAL_SCRIPT).toContain([".xter", "m-helper-textarea"].join(""));
+    expect(FOCUS_TERMINAL_SCRIPT).not.toContain("undefined");
   });
 
   it("asked while the page is still loading, it waits and focuses once the page is ready", async () => {

@@ -14,7 +14,7 @@ import { FileSystemAdapter, Notice, Plugin, TFile, WorkspaceLeaf, type MockApp }
 import VSCodeWorkbenchPlugin from "../../src/main";
 import { DEFAULT_HEIGHT } from "../../src/terminal/drawer-geometry";
 import { DEVICE_ID_KEY, DRAWER_KEY } from "../../src/terminal/drawer-state";
-import { resetPage, tick } from "../feature-rig";
+import { resetPage, tick } from "../page-helpers";
 import { tempDir } from "../helpers";
 
 const DEVICE = "device-aaaa-0001";

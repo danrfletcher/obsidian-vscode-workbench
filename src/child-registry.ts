@@ -1,6 +1,6 @@
 /**
  * A generic registry of child processes the plugin owns. The VS Code server
- * registers itself here; the terminal PRs register their shells and PTY helpers.
+ * registers itself here. The terminal shells are VS Code's own and live under the server's process tree, so they are not registered.
  * `killAll()` is what quit calls, and every registration is mirrored into the
  * pidfile so a force-quit leaves a record for the next startup's sweep.
  */
