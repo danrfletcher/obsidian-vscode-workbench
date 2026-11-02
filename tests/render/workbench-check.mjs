@@ -7,9 +7,14 @@
  *      unsaved edits keeps them and the disk keeps the outside change; saving that buffer is refused with
  *      VS Code's own "newer" message and a Compare / Overwrite choice, and nothing is written.
  *   G5, G6 (checklist C36): with the plugin's own workbench settings (writeMachineSettings) for light and for
- *      dark, the chrome is hidden (all but the side bar, which has no switch: src/chrome-settings.ts) and the text in the editor is legible: the contrast ratio of every syntax
+ *      dark, the chrome is hidden (the settings hide the activity bar, status bar, title bar, tab strip and breadcrumbs;
+ *      the seeded chords and the page script close the side bar, secondary side bar and panel: src/chrome-settings.ts,
+ *      src/chrome-script.ts, the same code the Code tab runs) and the text in the editor is legible: the contrast ratio of every syntax
  *      colour on the editor's own background, measured from the page's computed styles (WCAG 2.x), has to be
- *      at least MIN_CONTRAST.
+ *      at least MIN_CONTRAST. The same block measures GP6 (line numbers in the gutter; at the four window sizes of
+ *      tests/render/run.mjs the editor is as wide and tall as the window, no frame, margin or centring gutter) and takes the
+ *      E6 flash frames (16 over the first seconds after navigation, saved with a frames.json; whether the full workbench is ever
+ *      painted is printed, not failed on, because PR-1 saw no flash).
  *
  * Not part of `npm test`: it needs a VS Code build with `serve-web`, a cached VS Code server for that build,
  * and Google Chrome. It starts `serve-web` on a free loopback port and headless Chrome on a free debugging
@@ -21,7 +26,7 @@
  * that build; it is cloned into the scratch dir, never written to), ALLOW_DOWNLOAD=1 (let `serve-web` download
  * the server for the installed build from Microsoft into the scratch dir when CLI_DATA_SRC is not set or does
  * not hold it; without it nothing is ever downloaded), CHROME, SERVER_TMPDIR (default /tmp, see the comment at
- * the spawn).
+ * the spawn), SKIP_G4=1 (run only the G5/G6 block).
  *
  * Exit codes: 0 all checks passed, 1 a check failed, 2 the check could not run (a missing tool, no server for
  * the installed build, a server that answers with an error, or a page that never painted).
@@ -114,12 +119,16 @@ function freePort() {
 
 // --- the plugin's own code ---------------------------------------------------------------------------
 await build({
-  entryPoints: { settings: path.join(root, "src/settings.ts"), "dirty-script": path.join(root, "src/dirty-script.ts") },
+  entryPoints: { settings: path.join(root, "src/settings.ts"), "dirty-script": path.join(root, "src/dirty-script.ts"), "chrome-settings": path.join(root, "src/chrome-settings.ts"), "chrome-script": path.join(root, "src/chrome-script.ts") },
   bundle: true, format: "esm", platform: "node", outdir: path.join(work, "plugin"), outExtension: { ".js": ".mjs" }, logLevel: "error",
 });
 const settings = await import(pathToFileURL(path.join(work, "plugin/settings.mjs")).href);
 // The plugin's own unsaved-buffer probe (what delete, rename, idle stop and quit ask), run against the real workbench below.
 const { DIRTY_SCRIPT, fileDirtyScript } = await import(pathToFileURL(path.join(work, "plugin/dirty-script.mjs")).href);
+
+// What the Code tab seeds and runs to hide the chrome (src/main.ts chromeHiding(), src/code-view.ts loadWorkbench), from the same code.
+const { chromeKeybindings } = await import(pathToFileURL(path.join(work, "plugin/chrome-settings.mjs")).href);
+const { buildChromeHideScript } = await import(pathToFileURL(path.join(work, "plugin/chrome-script.mjs")).href);
 
 // --- the fixtures ------------------------------------------------------------------------------------
 const vault = path.join(work, "vault");
@@ -184,8 +193,14 @@ async function startServer(name, dark, extraSettings = {}) {
   return { port, token, pid: server.pid };
 }
 
+// Which parts are painted right now, for the flash frames (the same selectors as CONTRAST below).
+const FLASH_PARTS = `(() => {
+  const shown = (sel) => { const e = document.querySelector(sel); return !!e && e.offsetWidth > 0 && e.offsetHeight > 0; };
+  return { titlebar: shown('.part.titlebar'), activitybar: shown('.part.activitybar'), statusbar: shown('.part.statusbar'), sidebar: shown('.part.sidebar'), secondarysidebar: shown('.part.auxiliarybar'), panel: shown('.part.panel'), tabstrip: shown('.tabs-and-actions-container'), breadcrumbs: shown('.breadcrumbs-control'), editor: shown('.part.editor') };
+})()`;
+
 // --- one browser -------------------------------------------------------------------------------------
-async function browser(name, srv) {
+async function browser(name, srv, { hide = false, dark = false } = {}) {
   const cdpPort = await freePort();
   const chrome = spawn(CHROME, ["--headless=new", `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${path.join(work, "chrome-" + name)}`, "--no-first-run", "--disable-background-networking", "about:blank"], { stdio: "ignore" });
   started.push(chrome.pid);
@@ -211,7 +226,37 @@ async function browser(name, srv) {
   await send("Page.enable");
   await send("Emulation.setFocusEmulationEnabled", { enabled: true });
   await send("Emulation.setDeviceMetricsOverride", { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
+  if (hide) {
+    // As the Code tab does: the seed runs on the server's own origin page (the browser profile's IndexedDB), then the workbench page loads.
+    await send("Page.navigate", { url: `http://127.0.0.1:${srv.port}/version` });
+    await sleep(2);
+    const seeded = await ev(settings.buildBrowserSeedScript({ ...settings.BROWSER_APP_SETTINGS, ...settings.workbenchOverlay({ dark }) }, null, chromeKeybindings()));
+    console.log(`[${name}] browser profile seed: ${seeded}`);
+  }
+  const navigatedAt = Date.now();
   await send("Page.navigate", { url: `http://127.0.0.1:${srv.port}/?tkn=${srv.token}&folder=${encodeURIComponent(vault)}` });
+  const flash = [];
+  if (hide) {
+    // The Code tab runs the script at the workbench page's own dom-ready: wait for that page's document (not the /version one) to be past loading, then run it.
+    for (let i = 0; i < 200; i++) {
+      if ((await ev("location.search.includes('tkn=') && document.readyState !== 'loading'")) === true) break;
+      await sleep(0.05);
+    }
+    console.log(`[${name}] chrome script: ${await ev(buildChromeHideScript())}`);
+    // E6 flash check (best effort): frames over the first seconds after navigation, and whether the full workbench is ever painted.
+    // PR-1 saw no flash (docs/spike-chrome.md S4), so the frames are kept as evidence and nothing here fails the run.
+    fs.mkdirSync(path.join(outDir, `flash-${name}`), { recursive: true });
+    for (let i = 0; i < 16; i++) {
+      const parts = await ev(FLASH_PARTS);
+      const t = Date.now() - navigatedAt;
+      flash.push({ ms: t, parts });
+      await shot(`flash-${name}/frame-${String(i).padStart(2, "0")}-${t}ms.png`);
+      await sleep(0.3);
+    }
+    const painted = flash.filter((f) => f.parts && Object.entries(f.parts).some(([k, v]) => k !== "editor" && v));
+    fs.writeFileSync(path.join(outDir, `flash-${name}`, "frames.json"), JSON.stringify(flash, null, 2));
+    console.log(`[${name}] E6 flash frames: ${flash.length} captured, the full workbench (a part besides the editor) painted in ${painted.length}${painted.length ? `, first at ${painted[0].ms} ms: ${JSON.stringify(painted[0].parts)}` : ""}; frames in ${path.join(outDir, `flash-${name}`)}`);
+  }
   await sleep(20);
   const META = 4;
   const openFile = async (file) => {
@@ -253,8 +298,13 @@ const notRendered = (what) => (neverPainted = true, check(false, `${what}: the p
 // G4: a file changes on disk behind an open editor
 // =====================================================================================================
 g4: {
+  if (process.env.SKIP_G4 === "1") break g4; // SKIP_G4=1: only the G5/G6 block (a faster rerun while working on the hiding)
   // The web workbench saves by itself after a second unless auto-save is off; the checklist runs with it off (GP7).
-  const srv = await startServer("g4", true, { "files.autoSave": "off" });
+  // The plugin's Machine file now hides the tab strip (GP1), and the unsaved-buffer probes below read `.tab.dirty` and
+  // `data-resource-name` from it, so this block puts the tab strip back for its own server only. The Code tab itself has no
+  // tab strip until PR-5 replaces that signal (docs/spike-chrome.md S5); with it hidden the page-wide probe sees only the active
+  // editor's title dot and the per-file probe answers "none". The G5/G6 block below runs with the hiding on.
+  const srv = await startServer("g4", true, { "files.autoSave": "off", "workbench.editor.showTabs": "multiple" });
   const b = await browser("g4", srv);
 
   // 1. clean buffer
@@ -401,14 +451,15 @@ const CONTRAST = `(() => {
     bg: getComputedStyle(ed).backgroundColor,
     bgLuminance: lum(bg),
     colours,
-    chrome: { titlebar: shown('.part.titlebar'), activitybar: shown('.part.activitybar'), statusbar: shown('.part.statusbar'), sidebar: shown('.part.sidebar'), panel: shown('.part.panel'), menubar: shown('.menubar') },
+    chrome: { titlebar: shown('.part.titlebar'), activitybar: shown('.part.activitybar'), statusbar: shown('.part.statusbar'), sidebar: shown('.part.sidebar'), secondarysidebar: shown('.part.auxiliarybar'), panel: shown('.part.panel'), menubar: shown('.menubar'), tabstrip: shown('.tabs-and-actions-container'), breadcrumbs: shown('.breadcrumbs-control'), explorer: shown('.explorer-viewlet'), openeditors: shown('.open-editors'), editor: shown('.part.editor') },
+    editors: document.querySelectorAll('.monaco-editor[data-uri]').length,
   };
 })()`;
 
 for (const dark of [false, true]) {
   const name = dark ? "dark" : "light";
   const srv = await startServer(name, dark);
-  const b = await browser(name, srv);
+  const b = await browser(name, srv, { hide: true, dark });
   await b.openFile("sample.py");
   await sleep(3);
   const r = await b.ev(CONTRAST);
@@ -424,9 +475,20 @@ for (const dark of [false, true]) {
   check(r.colours.length >= 4, `${name}: the sample shows several syntax colours (the grammar is loaded)`, `${r.colours.length} colours`);
   const worst = r.colours.reduce((a, c) => (c.ratio < a.ratio ? c : a), { ratio: 99 });
   check(worst.ratio >= MIN_CONTRAST, `${name}: every text colour has contrast ${MIN_CONTRAST} or more on the editor background (lowest ${worst.ratio} for "${worst.sample}")`);
-  // As documented (src/chrome-settings.ts, docs/spike-decision.md): the side bar has no settings switch and stays visible.
-  const expected = { titlebar: false, activitybar: false, statusbar: false, sidebar: true, panel: false, menubar: false };
-  check(JSON.stringify(r.chrome) === JSON.stringify(expected), `${name}: the chrome is hidden except the side bar, which has no settings switch (F11)`, JSON.stringify(r.chrome));
+  // GP1: nothing but the editor shows (docs/spike-decision.md); the side bar goes with the Explorer and Open Editors views inside it.
+  const expected = Object.fromEntries(Object.keys(r.chrome).map((k) => [k, k === "editor"]));
+  check(JSON.stringify(r.chrome) === JSON.stringify(expected), `${name}: every part is hidden (title, activity, status, tab strip, breadcrumbs, side bar with Explorer and Open Editors, secondary side bar, panel) and only the editor is shown`, JSON.stringify(r.chrome));
+  check(r.editors === 1, `${name}: the editor holds exactly the one file that was opened (E6)`, String(r.editors));
+  // GP6: the editor fills the pane at the window sizes tests/render/run.mjs uses (no frame, margin or centring gutter), and the gutter has line numbers.
+  check((await b.ev("document.querySelectorAll('.line-numbers').length")) > 0, `${name}: line numbers are in the gutter`);
+  for (const [w, h] of [[1280, 800], [900, 600], [600, 700], [500, 700]]) {
+    await b.send("Emulation.setDeviceMetricsOverride", { width: w, height: h, deviceScaleFactor: 1, mobile: false });
+    await sleep(1.5);
+    // A Workspace Trust banner (an untrusted folder, as this check's vault is) is a 26 px row above the editor and is not a frame; it is subtracted, and the Code tab's trusted vault has none.
+    const m = await b.ev("(() => { const q = (s) => { const e = document.querySelector(s); return e && e.offsetHeight > 0 ? e.getBoundingClientRect() : null; }; const banner = q('.part.banner'); const bh = banner ? Math.round(banner.height) : 0; const r = document.querySelector('.part.editor').getBoundingClientRect(); return { x: Math.round(r.left), y: Math.round(r.top) - bh, w: Math.round(r.width), h: Math.round(r.height), banner: bh, innerW: window.innerWidth, innerH: window.innerHeight - bh, centered: !!document.querySelector('.centered-layout, .monaco-workbench.centered') }; })()");
+    check(!!m && m.w === m.innerW && m.x === 0 && m.y === 0 && m.h === m.innerH && !m.centered, `${name}: at ${w}x${h} the editor is the whole window, with no frame, margin or centring gutter`, JSON.stringify(m));
+    if (w === 1280 || w === 500) await b.shot(`G6-${name}-${w === 1280 ? "wide" : "narrow"}-${w}x${h}.png`);
+  }
   b.close();
   stopPid(srv.pid);
 }

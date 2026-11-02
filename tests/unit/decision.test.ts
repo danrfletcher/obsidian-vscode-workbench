@@ -70,6 +70,19 @@ describe("docs/spike-decision.md", () => {
     expect(stop, stop ?? "").toBeNull();
   });
 
+  it("records chrome: hidden, and no longer says the chrome is visible or lists the side bar as shown (PR-2)", () => {
+    expect(parseDecision(text).chrome).toBe("hidden");
+    expect(text).not.toMatch(/chrome:\s*visible\b/);
+    expect(text).not.toMatch(/F11/);
+    expect(text).not.toMatch(/stays visible in the product|does not hide it until PR-2|side bar stays visible/i);
+    const row = text.split("\n").find((l) => l.startsWith("|") && l.toLowerCase().includes("chrome hiding"))!;
+    expect(row).toMatch(/\| WORKS \|/);
+    expect(row).toContain("src/chrome-script.ts");
+    // the conditional-checks table names the check that all eight parts are not visible, and has no row for shipping chrome visible
+    expect(text).toContain("`chrome: hidden` (now)");
+    expect(text).not.toMatch(/\|\s*`chrome: visible`\s*\|/);
+  });
+
   it("records every unknown with a result and lists the conditional checks", () => {
     const unknowns = [
       "iframe runs in Obsidian",

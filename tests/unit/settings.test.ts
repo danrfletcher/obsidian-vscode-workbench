@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { BROWSER_APP_SETTINGS, USER_DATA_MARKER_KEY, buildBrowserSeedScript, buildMachineSettings, writeMachineSettings, type UserDataCopy } from "../../src/settings";
+import { BROWSER_APP_SETTINGS, USER_DATA_MARKER_KEY, buildBrowserSeedScript, buildMachineSettings, workbenchOverlay, writeMachineSettings, type UserDataCopy } from "../../src/settings";
 import { excludeGlobs, profileSeedSource, seedUserData } from "../../src/server/user-data-seed";
 import { STOP_TEXT, describeAge, describeDisabledLists, describeExtensionsSection, describePort, describeProfile, renderExtensionsSection, type PortStatus, type SpikeResult } from "../../src/settings/extensions-section";
 import { SPIKE_RESULT } from "../../src/settings/spike-result";
@@ -13,6 +13,8 @@ import { findMirroredProfile, type MirroredProfile, type ProfileState } from "..
 import { PROFILES, TOGGLE_PANEL_KEY, TRUST_KEYS, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
 import type { MirrorResult } from "../../src/mirror/mirror";
 import { tempDir } from "../helpers";
+import { fakeIndexedDB, fakeStorage } from "../fake-seed-page";
+import { chromeKeybindings, type KeybindingEntry } from "../../src/chrome-settings";
 
 describe("writeMachineSettings", () => {
   it("writes the dark theme and chrome-hiding settings into the plugin's own server data dir", () => {
@@ -80,75 +82,131 @@ describe("application-scoped off switches (F5)", () => {
   });
 });
 
-/** The smallest IndexedDB the seed script touches: one database, named stores, get/put. */
-function fakeIndexedDB(initial: Record<string, unknown> = {}) {
-  const stores = new Map<string, Map<string, unknown>>();
-  const state = { version: 0, opened: [] as [string, number][], closed: 0 };
-  if (Object.keys(initial).length) {
-    stores.set("vscode-userdata-store", new Map(Object.entries(initial)));
-    state.version = 3;
-  }
-  const request = <T>(run: () => T) => {
-    const r: { result?: T; error?: unknown; onsuccess?: () => void; onerror?: () => void } = {};
-    queueMicrotask(() => {
-      r.result = run();
-      r.onsuccess?.();
-    });
-    return r;
-  };
-  const db = {
-    objectStoreNames: { contains: (n: string) => stores.has(n) },
-    createObjectStore: (n: string) => stores.set(n, new Map()),
-    close: () => void state.closed++,
-    transaction: (n: string) => {
-      const tx: { oncomplete?: () => void; onerror?: () => void; objectStore: (x: string) => unknown } = {
-        objectStore: () => ({
-          get: (k: string) => request(() => stores.get(n)?.get(k)),
-          put: (v: unknown, k: string) => {
-            stores.get(n)?.set(k, v);
-            queueMicrotask(() => tx.oncomplete?.());
-          },
-          delete: (k: string) => {
-            stores.get(n)?.delete(k);
-            queueMicrotask(() => tx.oncomplete?.());
-          },
-        }),
-      };
-      return tx;
-    },
-  };
-  const indexedDB = {
-    open: (name: string, version: number) => {
-      state.opened.push([name, version]);
-      const r: { result: typeof db; onupgradeneeded?: () => void; onsuccess?: () => void; error?: unknown; onerror?: () => void } = { result: db };
-      queueMicrotask(() => {
-        if (state.version < version) {
-          state.version = version;
-          r.onupgradeneeded?.();
-        }
-        r.onsuccess?.();
-      });
-      return r;
-    },
-  };
-  return { indexedDB, stores, state };
-}
-
-/** localStorage of the server's origin: survives across seed runs when the same object is passed. */
-function fakeStorage() {
-  const m = new Map<string, string>();
-  return { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v), map: m };
-}
-
-async function runSeed(initial?: Record<string, unknown>, copy?: UserDataCopy | null, storage = fakeStorage()) {
+async function runSeed(initial?: Record<string, unknown>, copy?: UserDataCopy | null, storage = fakeStorage(), chords?: readonly KeybindingEntry[]) {
   const fake = fakeIndexedDB(initial);
-  const run = new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${buildBrowserSeedScript(BROWSER_APP_SETTINGS, copy)}`) as (...a: unknown[]) => Promise<string>;
+  const run = new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${buildBrowserSeedScript(BROWSER_APP_SETTINGS, copy, chords)}`) as (...a: unknown[]) => Promise<string>;
   const outcome = await run(fake.indexedDB, storage, TextEncoder, TextDecoder);
   const raw = fake.stores.get("vscode-userdata-store")?.get("/User/settings.json") as Uint8Array | string | undefined;
   const text = raw === undefined ? undefined : typeof raw === "string" ? raw : new TextDecoder().decode(raw);
   const kb = fake.stores.get("vscode-userdata-store")?.get("/User/keybindings.json") as Uint8Array | undefined;
   return { outcome, text, keybindings: kb === undefined ? undefined : new TextDecoder().decode(kb), storage, ...fake };
 }
+
+describe("the overlay and the Machine settings carry the hiding set (GP1, G5)", () => {
+  const HIDING_KEYS = [
+    "workbench.activityBar.location",
+    "workbench.statusBar.visible",
+    "window.commandCenter",
+    "workbench.layoutControl.enabled",
+    "window.menuBarVisibility",
+    "workbench.editor.showTabs",
+    "workbench.editor.editorActionsLocation",
+    "workbench.editor.enablePreview",
+    "breadcrumbs.enabled",
+    "workbench.secondarySideBar.defaultVisibility",
+    "workbench.panel.defaultLocation",
+  ];
+  const ZEN = { "zenMode.fullScreen": false, "zenMode.silentNotifications": false, "zenMode.centerLayout": false, "zenMode.hideLineNumbers": false };
+
+  it.each([true, false])("dark=%s: every hiding setting and the four Zen overrides, in both the Machine settings and the overlay", (dark) => {
+    for (const settings of [buildMachineSettings({ dark }), workbenchOverlay({ dark })]) {
+      for (const k of HIDING_KEYS) expect(settings, k).toHaveProperty(k);
+      expect(settings).toMatchObject(ZEN);
+      expect(settings["workbench.editor.showTabs"]).toBe("none");
+      expect(settings["breadcrumbs.enabled"]).toBe(false);
+      expect(settings["workbench.colorTheme"]).toBe(dark ? "Dark Modern" : "Light Modern");
+    }
+  });
+
+  it("is byte-identical on repeated calls, and the written Machine file too", () => {
+    for (const dark of [true, false]) {
+      const once = JSON.stringify(buildMachineSettings({ dark }));
+      const overlay = JSON.stringify(workbenchOverlay({ dark }));
+      for (let i = 0; i < 5; i++) {
+        expect(JSON.stringify(buildMachineSettings({ dark }))).toBe(once);
+        expect(JSON.stringify(workbenchOverlay({ dark }))).toBe(overlay);
+      }
+    }
+    const dir = tempDir();
+    const file = writeMachineSettings(dir, { dark: false });
+    const first = fs.readFileSync(file, "utf8");
+    for (let i = 0; i < 3; i++) writeMachineSettings(dir, { dark: false });
+    expect(fs.readFileSync(file, "utf8")).toBe(first);
+  });
+
+  it.each([true, false])("dark=%s: the overlay (what the Code tab writes on every load) has no key that silences notifications, trust, close or save dialogs (F8)", (dark) => {
+    const overlay = workbenchOverlay({ dark });
+    // the one notification-related key is Zen Mode's, carried only to keep it false
+    expect(overlay["zenMode.silentNotifications"]).toBe(false);
+    const keys = Object.keys(overlay).filter((k) => k !== "zenMode.silentNotifications");
+    expect(keys.filter((k) => /notification|trust|confirm|tips|dialog|conflict|hotExit|autoSave|restoreWindows/i.test(k))).toEqual([]);
+    for (const k of ["workbench.tips.enabled", "window.confirmBeforeClose", "files.hotExit", "files.autoSave", "security.workspace.trust.enabled", "security.workspace.trust.startupPrompt", "security.workspace.trust.banner"]) {
+      expect(overlay, k).not.toHaveProperty(k);
+    }
+  });
+
+  it("the Machine file has no key that silences notifications, trust or save dialogs, and no extensions.* key (F8, GP5)", () => {
+    const all = Object.keys(buildMachineSettings({ dark: true }));
+    // the extensions.* keys are the update off switches from before this PR (BROWSER_APP_SETTINGS); hiding adds none
+    const extensionKeys = all.filter((k) => /^extensions\./.test(k));
+    for (const k of extensionKeys) expect(Object.keys(BROWSER_APP_SETTINGS), k).toContain(k);
+    expect(extensionKeys.sort()).toEqual(Object.keys(BROWSER_APP_SETTINGS).filter((k) => /^extensions\./.test(k)).sort());
+    for (const k of ["workbench.tips.enabled", "window.confirmBeforeClose", "files.hotExit"]) expect(all, k).not.toContain(k);
+    expect(all.filter((k) => /trust/i.test(k))).toEqual([]);
+  });
+
+  it("the overlay wins over copied settings that turn each part back on, on the first load and on every later one (same copy id)", async () => {
+    const hostile = {
+      "workbench.statusBar.visible": true,
+      "zenMode.centerLayout": true,
+      "workbench.editor.showTabs": "multiple",
+      "breadcrumbs.enabled": true,
+      "workbench.activityBar.location": "default",
+      "zenMode.hideLineNumbers": true,
+      "editor.fontSize": 21,
+    };
+    const copy: UserDataCopy = { id: "same", settings: hostile, keybindingsBase64: null };
+    const overlay = { ...BROWSER_APP_SETTINGS, ...workbenchOverlay({ dark: true }) };
+    const fake = fakeIndexedDB();
+    const storage = fakeStorage();
+    const seed = () =>
+      (new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${buildBrowserSeedScript(overlay, copy, chromeKeybindings())}`) as (...a: unknown[]) => Promise<string>)(fake.indexedDB, storage, TextEncoder, TextDecoder);
+    const stored = () => JSON.parse(new TextDecoder().decode(fake.stores.get("vscode-userdata-store")!.get("/User/settings.json") as Uint8Array)) as Record<string, unknown>;
+    for (let load = 1; load <= 3; load++) {
+      expect(await seed(), `load ${load}`).toBe("seeded");
+      expect(stored(), `load ${load}`).toMatchObject(workbenchOverlay({ dark: true }));
+      expect(stored()["editor.fontSize"], `load ${load}`).toBe(21); // what the user did not set against us is theirs
+    }
+    // the tab changes a hiding setting itself between loads: the next load puts ours back
+    const tampered = { ...stored(), "workbench.statusBar.visible": true, "breadcrumbs.enabled": true };
+    fake.stores.get("vscode-userdata-store")!.set("/User/settings.json", new TextEncoder().encode(JSON.stringify(tampered)));
+    expect(await seed()).toBe("seeded");
+    expect(stored()).toMatchObject({ "workbench.statusBar.visible": false, "breadcrumbs.enabled": false });
+  });
+
+  it("line numbers are the user's: the plugin sets no editor.lineNumbers, keeps Zen's hideLineNumbers false, and a copied editor.lineNumbers survives every load (GP6)", async () => {
+    for (const dark of [true, false]) {
+      for (const built of [buildMachineSettings({ dark }), workbenchOverlay({ dark })]) {
+        expect(built).not.toHaveProperty("editor.lineNumbers");
+        expect(built["zenMode.hideLineNumbers"]).toBe(false);
+      }
+    }
+    for (const value of ["off", "relative", "interval"]) {
+      const copy: UserDataCopy = { id: `ln-${value}`, settings: { "editor.lineNumbers": value, "zenMode.hideLineNumbers": true }, keybindingsBase64: null };
+      const overlay = { ...BROWSER_APP_SETTINGS, ...workbenchOverlay({ dark: false }) };
+      const fake = fakeIndexedDB();
+      const storage = fakeStorage();
+      const seed = () =>
+        (new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${buildBrowserSeedScript(overlay, copy, chromeKeybindings())}`) as (...a: unknown[]) => Promise<string>)(fake.indexedDB, storage, TextEncoder, TextDecoder);
+      for (let load = 1; load <= 2; load++) {
+        await seed();
+        const stored = JSON.parse(new TextDecoder().decode(fake.stores.get("vscode-userdata-store")!.get("/User/settings.json") as Uint8Array)) as Record<string, unknown>;
+        expect(stored["editor.lineNumbers"], `${value} load ${load}`).toBe(value);
+        expect(stored["zenMode.hideLineNumbers"], `${value} load ${load}`).toBe(false); // the one line-number key we own
+      }
+    }
+  });
+});
 
 describe("buildBrowserSeedScript (run against a fake IndexedDB)", () => {
   it("creates the workbench's database and writes the off switches into /User/settings.json", async () => {
@@ -314,6 +372,76 @@ describe("the seed script built from a stripped profile copy holds no trust key 
     expect(Object.keys(machine).filter((k) => k.startsWith("security.workspace.trust."))).toEqual([]);
     expect(BROWSER_APP_SETTINGS).toMatchObject({ "telemetry.telemetryLevel": "off" });
     expect(buildBrowserSeedScript(BROWSER_APP_SETTINGS, copyFor(PROFILES.custom.location))).toContain('"telemetry.telemetryLevel":"off"');
+  });
+});
+
+describe("buildBrowserSeedScript with the chrome-hiding chords (GP1; the chrome spike's S3 re-apply route)", () => {
+  const chords = chromeKeybindings();
+  const parse = (text: string | undefined) => JSON.parse(text as string) as Array<{ key: string; command: string }>;
+  const kb = '// mine\n[{ "key": "ctrl+alt+n", "command": "workbench.action.toggleSidebarVisibility" },]\n';
+  const copy: UserDataCopy = { id: "start-1", settings: {}, keybindingsBase64: Buffer.from(kb).toString("base64") };
+  const mine = { key: "ctrl+alt+n", command: "workbench.action.toggleSidebarVisibility" };
+  const enc = (s: string) => new TextEncoder().encode(s);
+
+  it("writes the four chords into a profile that has no keybindings.json", async () => {
+    const r = await runSeed(undefined, null, undefined, chords);
+    expect(r.outcome).toBe("seeded");
+    expect(parse(r.keybindings)).toEqual([
+      { key: "ctrl+alt+shift+2", command: "workbench.action.closeAuxiliaryBar" },
+      { key: "ctrl+alt+shift+1", command: "workbench.action.closeSidebar" },
+      { key: "ctrl+alt+shift+3", command: "workbench.action.closePanel" },
+      { key: "ctrl+alt+shift+4", command: "workbench.action.closeOtherEditors" },
+    ]);
+  });
+
+  it("puts them after the copied rules (comments and trailing commas read), the copy's own rule kept", async () => {
+    const r = await runSeed(undefined, copy, undefined, chords);
+    expect(r.outcome).toBe("seeded");
+    expect(parse(r.keybindings)).toEqual([mine, ...chords]);
+  });
+
+  it("is the same bytes on every load: a reload with the same copy id does not add them twice", async () => {
+    const first = await runSeed(undefined, copy, undefined, chords);
+    const again = await runSeed({ "/User/keybindings.json": enc(first.keybindings as string), "/User/settings.json": enc(first.text as string) }, copy, first.storage, chords);
+    expect(again.keybindings).toBe(first.keybindings);
+    const noCopy = await runSeed({ "/User/keybindings.json": enc(first.keybindings as string) }, null, undefined, chords);
+    expect(noCopy.keybindings).toBe(first.keybindings);
+  });
+
+  it("re-adds chords the profile lost, and keeps the rules a user added in the tab", async () => {
+    const stored = JSON.stringify([mine, { key: "ctrl+alt+shift+1", command: "workbench.action.closeSidebar" }, { key: "ctrl+k", command: "-x" }]);
+    const r = await runSeed({ "/User/keybindings.json": enc(stored) }, null, undefined, chords);
+    expect(parse(r.keybindings)).toEqual([mine, { key: "ctrl+k", command: "-x" }, ...chords]);
+  });
+
+  it("puts ours last for the same chord, after a copied rule on one of our chords", async () => {
+    const theirs = { key: "ctrl+alt+shift+1", command: "workbench.action.toggleSidebarVisibility" };
+    const withTheirs: UserDataCopy = { ...copy, keybindingsBase64: Buffer.from(JSON.stringify([theirs])).toString("base64") };
+    const r = await runSeed(undefined, withTheirs, undefined, chords);
+    expect(parse(r.keybindings)).toEqual([theirs, ...chords]);
+  });
+
+  it("leaves a stored keybindings.json that is not an array alone (the tab then shows that chrome, F3), and still seeds the settings", async () => {
+    const r = await runSeed({ "/User/keybindings.json": enc("not json at all") }, null, undefined, chords);
+    expect(r.outcome).toBe("seeded");
+    expect(r.keybindings).toBe("not json at all");
+    expect(JSON.parse(r.text as string)).toEqual(BROWSER_APP_SETTINGS);
+  });
+
+  it("replaces a copied keybindings.json that is not an array with the chords alone", async () => {
+    const bad: UserDataCopy = { ...copy, keybindingsBase64: Buffer.from("{").toString("base64") };
+    const r = await runSeed(undefined, bad, undefined, chords);
+    expect(parse(r.keybindings)).toEqual(chords);
+  });
+
+  it("with an instance that has no keybindings, a new copy leaves the chords alone in the profile", async () => {
+    const r = await runSeed({ "/User/keybindings.json": enc("[]") }, { ...copy, keybindingsBase64: null }, undefined, chords);
+    expect(parse(r.keybindings)).toEqual(chords);
+  });
+
+  it("without chords the keybindings handling is what it was", async () => {
+    const r = await runSeed(undefined, copy);
+    expect(r.keybindings).toBe(kb);
   });
 });
 

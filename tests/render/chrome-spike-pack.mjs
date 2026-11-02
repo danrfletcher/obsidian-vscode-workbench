@@ -32,7 +32,7 @@ const b64 = (text) => Buffer.from(text, "utf8").toString("base64");
 /** Builds the pack. `plugin` holds the bundled settings, paths, chrome-settings and trust-seed modules. */
 export function buildPack(plugin, vault = "/config/vault") {
   const { settings, paths, chromeSettings, trustSeed } = plugin;
-  const OVERLAY = { ...chromeSettings.chromeSettings() }; // what the plugin writes today
+  const OVERLAY = { ...chromeSettings.legacyChromeSettings() }; // what the plugin wrote in 0.1.0 (the spike's R0 baseline)
   const seedFor = (name, route) => {
     const machine = { ...OVERLAY, "workbench.colorTheme": "Light Modern", ...(route.settings ?? {}) };
     const kb = [...(route.userKeybindings ?? []), ...(route.keybindings ?? [])];

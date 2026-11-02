@@ -18,7 +18,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { chromeSettings } from "./chrome-settings";
+import { chromeSettings, legacyChromeSettings, type KeybindingEntry } from "./chrome-settings";
 import { excludeGlobs, EXCLUDE_SETTING_KEYS, writeAtomic } from "./server/user-data-seed";
 import { themeSettings } from "./theme-map";
 import { WORKBENCH_DB_NAME, WORKBENCH_DB_VERSION, WORKBENCH_SETTINGS_KEY, WORKBENCH_USERDATA_STORE } from "./workbench-db";
@@ -42,18 +42,27 @@ export const BROWSER_APP_SETTINGS: Readonly<Record<string, unknown>> = {
 };
 
 /**
- * The plugin's own theme and chrome settings (G5, G6). They are written to the Machine file at every server
- * start and also laid over the browser profile's user settings on every load (`buildBrowserSeedScript`), so
- * a `workbench.colorTheme` or layout setting copied from the chosen instance cannot override them.
+ * The plugin's own theme and chrome settings (G5, G6): the settings that hide every part but the editor, and the Zen Mode
+ * overrides (src/chrome-settings.ts). They are written to the Machine file at every server start and also laid over the browser
+ * profile's user settings on every load (`buildBrowserSeedScript`), so a `workbench.colorTheme`, tab or layout setting copied from the
+ * chosen instance cannot override them. Same bytes for the same `dark`, on every call.
  */
 export function workbenchOverlay(opts: { dark: boolean }): Record<string, unknown> {
   return { ...themeSettings(opts.dark), ...chromeSettings() };
 }
 
+/**
+ * The overlay of the terminal drawer's host page: its theme and the parts the Code tab hid before the editor-only tab. It does
+ * not carry the Code tab's hiding settings (tab strip, breadcrumbs, Zen overrides: F2), so the drawer is exactly what it was.
+ */
+export function terminalOverlay(opts: { dark: boolean }): Record<string, unknown> {
+  return { ...themeSettings(opts.dark), ...legacyChromeSettings() };
+}
+
 export function buildMachineSettings(opts: { dark: boolean }): Record<string, unknown> {
   return {
     // Theme follows Obsidian light/dark (applied at server start; a running tab is switched live), and the
-    // chrome-hiding settings (src/chrome-settings.ts: only the parts that have a settings switch).
+    // chrome-hiding settings (src/chrome-settings.ts: the settings of every route, and the Zen Mode overrides).
     ...workbenchOverlay(opts),
     // Quiet start: no welcome page. Workspace Trust is left on: the one-time "Trust" click
     // is stored in the Code tab's browser profile (see docs/spike-decision.md).
@@ -71,7 +80,7 @@ export function buildMachineSettings(opts: { dark: boolean }): Record<string, un
  * Write the Machine settings file, regenerating it whole every time: whatever was there before (missing,
  * corrupt, a folder where the file belongs) is replaced, so the output is the same bytes on every call. A
  * write that cannot be done is logged and skipped, never thrown: the tab still opens, with the workbench's
- * own defaults (F11). Only ever writes inside the plugin's own server data dir (F3).
+ * own defaults (F3). Only ever writes inside the plugin's own server data dir (F3).
  */
 export function writeMachineSettings(serverDataDir: string, opts: { dark: boolean }): string {
   const file = path.join(serverDataDir, "data", "Machine", "settings.json");
@@ -122,6 +131,42 @@ export const USER_DATA_MARKER_KEY = "obsidian-vscode-workbench.user-data";
 export type SeedOutcome = "seeded" | "kept" | "version-mismatch" | "no-store" | `error:${string}`;
 
 /**
+ * Page-side helper of the seed script: `withChords(text, fresh)` puts the plugin's `chords` at the END of a keybindings.json
+ * text (JSON with comments and trailing commas allowed, like VS Code reads it), after removing any earlier copy of the same
+ * chord and command, so the result is the same bytes however often it is applied and the plugin's rule is the last one for its
+ * chord. It answers the new text, or null when `text` is not a keybindings array and `fresh` is false (the stored file is the
+ * user's to fix, so it is left alone); with `fresh` (a new copy replaces the file whole anyway) a file that does not parse
+ * is replaced by the plugin's chords alone. Written as a raw string: it runs in the page.
+ */
+const KEYBINDINGS_MERGE_JS = String.raw`const stripJsonc = (t) => {
+    let out = "", i = 0, inString = false;
+    while (i < t.length) {
+      const c = t[i], n = t[i + 1];
+      if (inString) {
+        out += c;
+        if (c === "\\") { out += n === undefined ? "" : n; i += 2; continue; }
+        if (c === '"') inString = false;
+        i++;
+      } else if (c === '"') { inString = true; out += c; i++; }
+      else if (c === "/" && n === "/") { while (i < t.length && t[i] !== "\n") i++; }
+      else if (c === "/" && n === "*") { i += 2; while (i < t.length && !(t[i] === "*" && t[i + 1] === "/")) i++; i += 2; }
+      else { out += c; i++; }
+    }
+    return out.replace(/,(\s*[\]}])/g, "$1");
+  };
+  const withChords = (text, fresh) => {
+    let list = [];
+    if (text !== null && text.trim() !== "") {
+      let parsed;
+      try { parsed = JSON.parse(stripJsonc(text)); } catch (e) { parsed = undefined; }
+      if (Array.isArray(parsed)) list = parsed;
+      else if (!fresh) return null;
+    }
+    const ours = (e) => e !== null && typeof e === "object" && chords.some((c) => c.key === e.key && c.command === e.command);
+    return JSON.stringify(list.filter((e) => !ours(e)).concat(chords), null, 2);
+  };`;
+
+/**
  * A script for the workbench's origin (run through `webview.executeJavaScript`
  * before the workbench itself loads) that merges `settings` into the browser
  * profile's user settings.json. Resolves to a `SeedOutcome`.
@@ -134,15 +179,27 @@ export type SeedOutcome = "seeded" | "kept" | "version-mismatch" | "no-store" | 
  * instance's settings, a key set inside the tab, a file that no longer parses, is gone, as the README says.
  * `settings` (the off switches) win over the copy, and keybindings.json is replaced by the copy or removed
  * when the instance has none.
+ *
+ * With `keybindings` (the chords the chrome page script presses, src/chrome-settings.ts `chromeKeybindings()`), they are put at
+ * the end of keybindings.json at EVERY load, with or without a copy: after the copy's rules on a new copy, after the stored
+ * rules otherwise, so a copied rule for the same chord cannot win and a reload (same copy id) keeps them. A stored file that is
+ * not a keybindings array is left alone (the chords then do not apply and the chrome shows, F3); a copy that is not one is
+ * replaced by the chords alone. Without `keybindings`, keybindings.json is handled as described above.
  */
-export function buildBrowserSeedScript(settings: Readonly<Record<string, unknown>> = BROWSER_APP_SETTINGS, copy?: UserDataCopy | null): string {
+export function buildBrowserSeedScript(
+  settings: Readonly<Record<string, unknown>> = BROWSER_APP_SETTINGS,
+  copy?: UserDataCopy | null,
+  keybindings?: readonly KeybindingEntry[],
+): string {
   const db = WORKBENCH_DB;
   const keybindingsKey = "/User/keybindings.json";
   return `(async () => {
   const ours = ${JSON.stringify(settings)};
   const copy = ${JSON.stringify(copy ?? null)};
+  const chords = ${JSON.stringify(keybindings ?? [])};
   const markerKey = ${JSON.stringify(USER_DATA_MARKER_KEY)};
   const stores = ["vscode-userdata-store", "vscode-logs-store", "vscode-filehandles-store"];
+  ${KEYBINDINGS_MERGE_JS}
   let db;
   try {
     db = await new Promise((resolve, reject) => {
@@ -156,11 +213,12 @@ export function buildBrowserSeedScript(settings: Readonly<Record<string, unknown
   }
   try {
     if (!db.objectStoreNames.contains(${JSON.stringify(db.store)})) return "no-store";
-    const existing = await new Promise((resolve, reject) => {
-      const q = db.transaction(${JSON.stringify(db.store)}).objectStore(${JSON.stringify(db.store)}).get(${JSON.stringify(db.settingsKey)});
+    const read = (key) => new Promise((resolve, reject) => {
+      const q = db.transaction(${JSON.stringify(db.store)}).objectStore(${JSON.stringify(db.store)}).get(key);
       q.onsuccess = () => resolve(q.result);
       q.onerror = () => reject(q.error);
     });
+    const existing = await read(${JSON.stringify(db.settingsKey)});
     const applyCopy = copy !== null && (typeof localStorage === "undefined" || localStorage.getItem(markerKey) !== copy.id);
     let merged = Object.assign({}, applyCopy ? copy.settings : {}, ours);
     if (existing !== undefined && !applyCopy) {
@@ -172,11 +230,25 @@ export function buildBrowserSeedScript(settings: Readonly<Record<string, unknown
         merged = Object.assign({}, current, ours);
       }
     }
+    // The plugin's own chords go at the end of keybindings.json at every load (they are read by the page script, which presses
+    // them). null: nothing of ours to add, or the stored file is not a keybindings array and is left alone.
+    let chordText = null;
+    if (chords.length > 0) {
+      let text = null;
+      if (applyCopy) {
+        if (copy.keybindingsBase64 !== null) text = new TextDecoder().decode(Uint8Array.from(atob(copy.keybindingsBase64), (c) => c.charCodeAt(0)));
+      } else {
+        const stored = await read(${JSON.stringify(keybindingsKey)});
+        if (stored !== undefined) text = typeof stored === "string" ? stored : new TextDecoder().decode(stored);
+      }
+      chordText = withChords(text, applyCopy);
+    }
     await new Promise((resolve, reject) => {
       const tx = db.transaction(${JSON.stringify(db.store)}, "readwrite");
       const store = tx.objectStore(${JSON.stringify(db.store)});
       store.put(new TextEncoder().encode(JSON.stringify(merged, null, 2)), ${JSON.stringify(db.settingsKey)});
-      if (applyCopy) {
+      if (chordText !== null) store.put(new TextEncoder().encode(chordText), ${JSON.stringify(keybindingsKey)});
+      else if (applyCopy) {
         if (copy.keybindingsBase64 !== null) store.put(Uint8Array.from(atob(copy.keybindingsBase64), (c) => c.charCodeAt(0)), ${JSON.stringify(keybindingsKey)});
         else store.delete(${JSON.stringify(keybindingsKey)});
       }

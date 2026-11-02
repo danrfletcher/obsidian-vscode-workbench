@@ -1,5 +1,7 @@
 /** The Code tab: one Obsidian tab hosting the VS Code web workbench for one file. */
 import { ItemView, type ViewStateResult, type WorkspaceLeaf } from "obsidian";
+import type { KeybindingEntry } from "./chrome-settings";
+import { CHROME_SCRIPT_INSTALLED } from "./chrome-script";
 import { DIRTY_SCRIPT, fileDirtyScript } from "./dirty-script";
 import { decide, resolveChoice, SETTLE_MS, SETTLE_POLL_MS, type AutoSave, type BufferState } from "./dirty-guard";
 import { LicenceDeclinedError } from "./licence";
@@ -27,6 +29,16 @@ export const CODE_TAB_PARTITION = "persist:vscode-workbench";
  * not subject to those headers. Both are kept switchable for the spike.
  */
 export type EmbedElement = "webview" | "iframe";
+
+/**
+ * What hides the parts of the workbench that no setting hides (src/chrome-script.ts): the chords the browser profile's
+ * keybindings gain at every load, and the page script that presses them. A host that gives none (or `null`) leaves the tab with
+ * the chrome the settings overlay hides, as in 0.1.0 (F3).
+ */
+export interface ChromeHiding {
+  keybindings: readonly KeybindingEntry[];
+  script: string;
+}
 
 /** What the view needs from the plugin. */
 export interface CodeViewHost {
@@ -60,8 +72,16 @@ export interface CodeViewHost {
   confirmClose?(request: CloseDirtyRequest): Promise<"save" | "discard" | "cancel">;
   /** Bring a tab to the front and focus it (Cancel on the close prompt). */
   focusTab?(leaf: WorkspaceLeaf): void | Promise<void>;
+  /**
+   * True when `leaf` is the tab the user is on right now. Asked when the workbench page finishes loading: only the active
+   * tab takes keyboard focus then, so a background tab (restored with the layout, or opened behind the active one) does not
+   * steal it. Absent: no tab takes focus on load.
+   */
+  isActiveTab?(leaf: WorkspaceLeaf): boolean;
   /** The plugin's own theme and chrome settings for this load, laid over the browser profile's user settings (G5, G6). */
   workbenchOverlay?(): Record<string, unknown>;
+  /** The chords and the page script that close the side bar, secondary side bar and panel in this load (GP1). Read at every load. */
+  chromeHiding?(): ChromeHiding | null;
   /**
    * The `trustVaultFolder` setting, read at every tab load: true runs the trust seed (G5), false or absent runs
    * nothing and leaves whatever is stored alone (G6).
@@ -236,6 +256,15 @@ export async function runScriptsInWebview(el: WebviewLike, scripts: readonly str
 export function logSeedOutcome(outcome: unknown): void {
   if (outcome === "seeded") console.debug("VS Code Workbench: browser profile seeded");
   else console.warn(`VS Code Workbench: the browser profile seed did not apply (${String(outcome)}); the workbench opens with its own defaults, so extension update checks, experiments and telemetry may not be switched off for this tab.`);
+}
+
+/**
+ * Say in the console how the chrome-hiding script went. Anything but the install answer (the page never reported dom-ready, the
+ * script threw, the webview cannot run scripts) leaves the parts the settings cannot hide on screen, so it is said once per load.
+ */
+export function logChromeOutcome(outcome: unknown): void {
+  if (outcome === CHROME_SCRIPT_INSTALLED) console.debug("VS Code Workbench: chrome-hiding script installed");
+  else console.warn(`VS Code Workbench: the chrome-hiding script did not run (${String(outcome)}); this tab may show the side bar, secondary side bar or panel of VS Code.`);
 }
 
 /** Say in the console how the trust seed went, the way `logSeedOutcome` does for the settings seed. */
@@ -669,6 +698,47 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     }
   }
 
+  /** The host's overlay for this load; a host that fails to give one leaves the browser profile's own settings (logged), never a blank tab (F3). */
+  private overlay(): Record<string, unknown> {
+    try {
+      return this.host.workbenchOverlay?.() ?? {};
+    } catch (e) {
+      console.warn(`VS Code Workbench: the workbench settings were not built (${e instanceof Error ? e.message : String(e)}); this tab opens with VS Code's own layout settings.`);
+      return {};
+    }
+  }
+
+  private async runChromeScript(el: HTMLElement, hiding: ChromeHiding): Promise<void> {
+    const outcome = await runInWebview(el as WebviewLike, hiding.script);
+    if (this.frame === el) logChromeOutcome(outcome); // a reload since has its own script and its own outcome
+  }
+
+  /**
+   * The editor takes keyboard focus on open: when the workbench page's dom-ready fires, the webview is focused if it is still
+   * this tab's current frame (a reload since has replaced it) and this tab is the one the user is on. Obsidian's own
+   * setActiveLeaf({focus:true}) focuses nothing inside an ItemView, so without this typing would not reach the editor.
+   */
+  private focusWhenReady(el: HTMLElement): void {
+    el.addEventListener(
+      "dom-ready",
+      () => {
+        if (this.frame !== el || this.closed) return;
+        if (this.host.isActiveTab?.(this.leaf)) el.focus?.();
+      },
+      { once: true },
+    );
+  }
+
+  /** The chrome-hiding chords and script for this load, or null when the host gives none or fails to build them (logged; the tab opens with the chrome the settings leave). */
+  private chromeHiding(): ChromeHiding | null {
+    try {
+      return this.host.chromeHiding?.() ?? null;
+    } catch (e) {
+      console.warn(`VS Code Workbench: the chrome-hiding script was not built (${e instanceof Error ? e.message : String(e)}); this tab may show the side bar, secondary side bar or panel of VS Code.`);
+      return null;
+    }
+  }
+
   private async restartFromBanner(): Promise<void> {
     const loadsBefore = this.loadCount;
     try {
@@ -724,14 +794,22 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
       if (isWebview) {
         // One page, one dom-ready: both seeds run from it, the settings seed first, then the trust seed.
         const trust = this.trustSeedScript(server);
-        const settingsSeed = buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...this.host.workbenchOverlay?.() }, this.host.userDataCopy());
+        const hiding = this.chromeHiding();
+        const settingsSeed = buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...this.overlay() }, this.host.userDataCopy(), hiding?.keybindings);
         const outcomes = await runScriptsInWebview(el as WebviewLike, trust === null ? [settingsSeed] : [settingsSeed, trust]);
         logSeedOutcome(outcomes[0]);
         if (trust !== null) {
           logTrustOutcome(outcomes[1]);
           this.host.noteTrustOutcome?.(String(outcomes[1]));
         }
-        if (this.frame === el) el.setAttribute("src", url);
+        if (this.frame === el) {
+          el.setAttribute("src", url);
+          // The workbench page's own dom-ready (the second this element reports: the first was the server's origin page) runs
+          // the script that closes the parts. Not awaited: a script that fails or times out is logged and changes nothing
+          // else, and the load is finished (F3). The listener is added in the same tick as the navigation, before the event.
+          if (hiding) void this.runChromeScript(el, hiding);
+          this.focusWhenReady(el);
+        }
       }
     } catch (e) {
       // A declined licence opens the file in the system app, as the explicit open does (a tab Obsidian

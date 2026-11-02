@@ -5,7 +5,7 @@ import { checkFile, refusalMessage } from "./binary-guard";
 import { ChildRegistry } from "./child-registry";
 import { AUTO_SAVE_KEY, autoSaveMode, withAutoSaveDefault, type AutoSave } from "./dirty-guard";
 import { ownerOfExtension, type ViewRegistryLike } from "./coexistence";
-import { CodeView, VIEW_TYPE_CODE, baseName, type CodeViewHost, type EmbedElement } from "./code-view";
+import { CodeView, VIEW_TYPE_CODE, baseName, type ChromeHiding, type CodeViewHost, type EmbedElement } from "./code-view";
 import { ExtensionRegistry } from "./extension-registry";
 import { scanVault } from "./extension-scan";
 import { createClickInterceptor, readMode, type ClickLike, type ExtensionlessMode } from "./extensionless-intercept";
@@ -49,7 +49,9 @@ import { SPIKE_RESULT } from "./settings/spike-result";
 import { buildExtensionList } from "./settings/extension-list";
 import type { ExtensionListView } from "./settings/extension-states";
 import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
-import { workbenchOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
+import { workbenchOverlay, terminalOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
+import { chromeKeybindings } from "./chrome-settings";
+import { buildChromeHideScript } from "./chrome-script";
 import { DEVICE_ID_KEY, deviceId } from "./terminal/drawer-state";
 import { viewKind } from "./terminal/drawer-visibility";
 import { FocusReturn } from "./terminal/focus-return";
@@ -492,6 +494,16 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return workbenchOverlay({ dark: this.isDark() });
   }
 
+  /** The terminal drawer's host page has an overlay of its own: it never reads the Code tab's hiding settings (F2). */
+  terminalOverlay(): Record<string, unknown> {
+    return terminalOverlay({ dark: this.isDark() });
+  }
+
+  /** The chords and page script that close the side bar, secondary side bar and panel of a Code tab; read at every load (GP1). */
+  chromeHiding(): ChromeHiding {
+    return { keybindings: chromeKeybindings(), script: buildChromeHideScript() };
+  }
+
   /** Read at every tab load, so the toggle applies at the next load (G6). */
   trustVaultFolder(): boolean {
     return this.workbenchSettings().trustVaultFolder;
@@ -527,6 +539,10 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   focusTab(leaf: WorkspaceLeaf): Promise<void> {
     return this.focusLeaf(leaf);
+  }
+
+  isActiveTab(leaf: WorkspaceLeaf): boolean {
+    return this.activeLeaf() === leaf;
   }
 
   openInNewTab(file: string): void {
@@ -594,7 +610,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       failureText: (e) => this.describeStartFailure(e).message,
       notice: (message) => void new Notice(message, 10000),
       isDark: () => this.isDark(),
-      workbenchOverlay: () => this.workbenchOverlay(),
+      workbenchOverlay: () => this.terminalOverlay(),
       userDataCopy: () => this.copy,
       trustVaultFolder: () => this.trustVaultFolder(),
       heldPorts: () => this.heldPorts(),

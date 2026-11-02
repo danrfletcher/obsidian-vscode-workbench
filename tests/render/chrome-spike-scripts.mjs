@@ -1,7 +1,7 @@
 /**
  * The page-side scripts and the settings of each route of the chrome spike, shared by chrome-spike-check.mjs (headless Chrome on
  * the Mac) and chrome-spike-pack.mjs (the pack the Obsidian container run measures with). Nothing here starts a process.
- * `OVERLAY` (what the plugin writes today) is not here: it comes from the plugin's own `chromeSettings()`, bundled by the caller.
+ * `OVERLAY` (what the plugin wrote in 0.1.0, the R0 baseline) is not here: it comes from the plugin's own `legacyChromeSettings()`, bundled by the caller.
  */
 // --- page-side scripts -------------------------------------------------------------------------------
 export const PARTS = {

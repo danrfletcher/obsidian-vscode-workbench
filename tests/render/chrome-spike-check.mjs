@@ -156,7 +156,7 @@ const settings = await load("settings");
 const { DIRTY_SCRIPT, fileDirtyScript } = await load("dirty-script");
 const bridge = await load("hotkey-bridge");
 const paths = await load("paths");
-const { chromeSettings } = await load("chrome-settings");
+const { legacyChromeSettings } = await load("chrome-settings");
 const { buildTrustSeedScript } = await load("trust-seed");
 
 // --- F1: the real desktop VS Code files, before ------------------------------------------------------
@@ -363,7 +363,7 @@ async function browser(name, opts = {}) {
 }
 
 // --- settings of the routes --------------------------------------------------------------------------
-const OVERLAY = { ...chromeSettings() }; // what the plugin writes today
+const OVERLAY = { ...legacyChromeSettings() }; // what the plugin wrote in 0.1.0 (the spike's R0 baseline)
 
 let runNo = 0;
 const b64 = (text) => Buffer.from(text, "utf8").toString("base64");

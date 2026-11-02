@@ -85,4 +85,18 @@ describe("README", () => {
       expect(text).not.toMatch(/\*\*Shell|shell path|shellPath|\$SHELL|\/bin\/zsh/i);
     });
   });
+
+  it("the Hidden chrome bullet says the Code tab shows the editor only and that the full workbench is not available (GP1, F6)", () => {
+    const bullet = readme.split("\n").find((l) => l.startsWith("- **Hidden chrome.**"));
+    expect(bullet, "a Hidden chrome bullet").toBeDefined();
+    for (const needle of ["Explorer", "Open Editors", "tab strip", "breadcrumbs", "activity bar", "status bar", "title bar", "panel", "side bar", "secondary side bar", "The full workbench is not available", "best effort", "never stops a tab from opening"]) {
+      expect(bullet, needle).toContain(needle);
+    }
+  });
+
+  it("no longer says the chrome is visible or lists the side bar as shown", () => {
+    expect(readme).not.toMatch(/chrome:\s*visible/i);
+    expect(readme).not.toMatch(/side bar[^.\n]*(stays|remains|is|still)\s+(visible|shown)/i);
+    expect(readme).not.toMatch(/\bF11\b/);
+  });
 });

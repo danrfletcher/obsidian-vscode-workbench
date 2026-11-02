@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceLeaf } from "../mocks/obsidian";
-import { CodeView, VIEW_TYPE_CODE, baseName, logSeedOutcome, logTrustOutcome, runInWebview, runScriptsInWebview, type CodeViewHost } from "../../src/code-view";
+import { CodeView, VIEW_TYPE_CODE, baseName, logChromeOutcome, logSeedOutcome, logTrustOutcome, runInWebview, runScriptsInWebview, type CodeViewHost } from "../../src/code-view";
 import { LicenceDeclinedError } from "../../src/licence";
 import { BROWSER_APP_SETTINGS, buildBrowserSeedScript } from "../../src/settings";
 import { FakeWebview as FakeEl } from "../helpers";
 import { buildTrustSeedScript } from "../../src/trust/trust-seed";
+import { CHROME_SCRIPT_INSTALLED, buildChromeHideScript } from "../../src/chrome-script";
+import { chromeKeybindings } from "../../src/chrome-settings";
+import { workbenchOverlay as workbenchOverlayFor } from "../../src/settings";
 
 function makeView(host: Partial<CodeViewHost> = {}) {
   const full: CodeViewHost = {
@@ -562,6 +565,271 @@ describe("the trust seed in loadWorkbench (G5, G6, E3, GP3)", () => {
     expect(debug).toHaveBeenCalledTimes(1);
     logTrustOutcome("no-store");
     expect(warn.mock.calls.flat().join(" ")).toMatch(/no-store.*Workspaces: Manage Workspace Trust/);
+    debug.mockRestore();
+    warn.mockRestore();
+  });
+});
+
+describe("CodeView: the chrome-hiding script (GP1)", () => {
+  const hiding = () => ({ keybindings: chromeKeybindings(), script: buildChromeHideScript() });
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+
+  /** A webview that answers each script the way the page would: the chrome script with its install answer. */
+  function stubWebviews(answerChrome: () => Promise<unknown>) {
+    vi.stubGlobal("document", {
+      createElement: (t: string) => {
+        const e = new FakeEl(t);
+        const execute = e.executeJavaScript.bind(e);
+        e.executeJavaScript = (code: string) => {
+          if (code === buildChromeHideScript()) {
+            e.executed.push(code);
+            return answerChrome();
+          }
+          return execute(code);
+        };
+        return e;
+      },
+    });
+  }
+
+  it("seeds the chords with the settings, then runs the script on the workbench page's own dom-ready, after it has been pointed at the file", async () => {
+    stubWebviews(async () => CHROME_SCRIPT_INSTALLED);
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    const { view, el } = makeView({ chromeHiding: hiding });
+    await view.setState({ file: "a.py" }, {} as never);
+    const wv = el.children[0];
+    // the settings seed ran on the server origin page and carries the chords; the chrome script waits for the workbench page
+    expect(wv.executed).toEqual([buildBrowserSeedScript(BROWSER_APP_SETTINGS, null, chromeKeybindings())]);
+    expect(wv.executed[0]).toContain("workbench.action.closeSidebar");
+    expect(wv.srcs[1]).toContain("tkn=tok123");
+    wv.fire("dom-ready");
+    await settle();
+    expect(wv.executed).toEqual([buildBrowserSeedScript(BROWSER_APP_SETTINGS, null, chromeKeybindings()), buildChromeHideScript()]);
+    expect(wv.executed[1]).not.toContain("tok123");
+    expect(debug.mock.calls.flat().join(" ")).toContain("chrome-hiding script installed");
+    debug.mockRestore();
+  });
+
+  it("does not hold the load for the workbench page: setState has finished before that dom-ready", async () => {
+    stubWebviews(async () => CHROME_SCRIPT_INSTALLED);
+    const { view, el } = makeView({ chromeHiding: hiding });
+    await view.setState({ file: "a.py" }, {} as never); // resolves although the second dom-ready never fires here
+    expect(el.children[0].executed).toHaveLength(1);
+  });
+
+  it("a script that fails, or a page that never reports dom-ready, is logged and the tab is already open (F3)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    stubWebviews(async () => {
+      throw new Error("Blocked");
+    });
+    const { view, el } = makeView({ chromeHiding: hiding });
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].srcs[1]).toContain("tkn=tok123");
+    el.children[0].fire("dom-ready");
+    await settle();
+    expect(warn.mock.calls.flat().join(" ")).toContain("the chrome-hiding script did not run (error:Blocked)");
+    warn.mockRestore();
+  });
+
+  it.each([
+    ["throws", () => Promise.reject(new Error("Blocked")), "error:Blocked"],
+    ["times out", () => Promise.resolve("timeout"), "timeout"],
+    ["is unsupported", () => Promise.resolve("unsupported"), "unsupported"],
+  ])("E1: a hiding script that %s is logged once through the log pattern, and the URL navigation still happened", async (_name, answer, shown) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    stubWebviews(answer as () => Promise<unknown>);
+    const { view, el } = makeView({ chromeHiding: hiding });
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].srcs[1]).toContain("tkn=tok123"); // navigated before the script's outcome was known
+    el.children[0].fire("dom-ready");
+    await settle();
+    const lines = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("chrome-hiding"));
+    expect(lines).toEqual([`VS Code Workbench: the chrome-hiding script did not run (${shown}); this tab may show the side bar, secondary side bar or panel of VS Code.`]);
+    warn.mockRestore();
+  });
+
+  it("E1: a webview without executeJavaScript answers unsupported for the chrome script as well, and the tab opens", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("document", {
+      createElement: (t: string) => {
+        const e = new FakeEl(t);
+        (e as unknown as { executeJavaScript?: unknown }).executeJavaScript = undefined;
+        return e;
+      },
+    });
+    const { view, el } = makeView({ chromeHiding: hiding });
+    await view.setState({ file: "a.py" }, {} as never);
+    el.children[0].fire("dom-ready");
+    await settle();
+    expect(el.children[0].srcs[1]).toContain("tkn=tok123");
+    expect(warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("chrome-hiding script did not run (unsupported)"))).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it("GP1: the overlay and the chords are read from the host and seeded on every load: a second tab, and a reload after the theme changed", async () => {
+    let dark = false;
+    const workbenchOverlay = vi.fn(() => workbenchOverlayFor({ dark }));
+    const chromeHiding = vi.fn(hiding);
+    let notify: (s: "stopped-by-idle") => void = () => undefined;
+    const host = { workbenchOverlay, chromeHiding, onServerState: ((cb: (s: "stopped-by-idle") => void) => { notify = cb; return () => undefined; }) as never };
+    const seeded = (el: FakeEl[]) => el.flatMap((c) => c.executed).filter((c) => c.includes("workbench.colorTheme"));
+    const first = makeView(host);
+    await first.view.onOpen();
+    await first.view.setState({ file: "a.py" }, {} as never);
+    const second = makeView(host);
+    await second.view.setState({ file: "b.py" }, {} as never);
+    const want = (d: boolean) => buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...workbenchOverlayFor({ dark: d }) }, null, chromeKeybindings());
+    expect(seeded(first.el.children)).toEqual([want(false)]);
+    expect(seeded(second.el.children)).toEqual([want(false)]);
+    dark = true;
+    notify("stopped-by-idle");
+    await first.view.setState({ file: "a.py" }, {} as never); // stale: reloads with a fresh element and a fresh read of the host
+    expect(seeded(first.el.children).at(-1)).toBe(want(true));
+    expect(workbenchOverlay).toHaveBeenCalledTimes(3);
+    expect(chromeHiding).toHaveBeenCalledTimes(3);
+    expect(want(true)).toContain("Dark Modern");
+  });
+
+  it("F3: a host whose overlay cannot be built logs once and the tab still opens, the script still runs", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    stubWebviews(async () => CHROME_SCRIPT_INSTALLED);
+    const { view, el } = makeView({
+      chromeHiding: hiding,
+      workbenchOverlay: () => {
+        throw new Error("overlay broke");
+      },
+    });
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].srcs[1]).toContain("tkn=tok123");
+    expect(el.children[0].executed).toEqual([buildBrowserSeedScript(BROWSER_APP_SETTINGS, null, chromeKeybindings())]);
+    expect(warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("settings were not built (overlay broke)"))).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it("a host that fails to build the script opens the tab with the chrome the settings leave, and says so", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { view, el } = makeView({
+      chromeHiding: () => {
+        throw new Error("no script");
+      },
+    });
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].executed).toEqual([buildBrowserSeedScript()]);
+    expect(el.children[0].srcs[1]).toContain("tkn=tok123");
+    expect(warn.mock.calls.flat().join(" ")).toContain("was not built (no script)");
+    warn.mockRestore();
+  });
+
+  it("without the host method (an older host) or with an iframe tab, no chords and no script", async () => {
+    const older = makeView();
+    await older.view.setState({ file: "a.py" }, {} as never);
+    expect(older.el.children[0].executed).toEqual([buildBrowserSeedScript()]);
+    const frame = makeView({ embedElement: () => "iframe", chromeHiding: hiding });
+    await frame.view.setState({ file: "a.py" }, {} as never);
+    expect(frame.el.children[0].executed).toEqual([]);
+  });
+
+  it("a load that was replaced before its workbench page was ready logs nothing for the old element", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    stubWebviews(async () => "timeout");
+    const { view, el } = makeView({ chromeHiding: hiding });
+    await view.setState({ file: "a.py" }, {} as never);
+    const first = el.children[0];
+    await view.setState({ file: "b.py" }, {} as never);
+    first.fire("dom-ready");
+    await settle();
+    expect(warn.mock.calls.flat().join(" ")).not.toContain("chrome-hiding");
+    warn.mockRestore();
+  });
+
+  describe("the editor takes keyboard focus on open", () => {
+    /** Webviews that count focus() calls. */
+    function focusStub() {
+      const focused: FakeEl[] = [];
+      vi.stubGlobal("document", {
+        createElement: (t: string) => {
+          const e = new FakeEl(t);
+          (e as unknown as { focus: () => void }).focus = () => focused.push(e);
+          return e;
+        },
+      });
+      return focused;
+    }
+
+    it("focuses the active tab's webview when the workbench page's dom-ready fires, and not before", async () => {
+      const focused = focusStub();
+      const isActiveTab = vi.fn(() => true);
+      const { view, el } = makeView({ isActiveTab, chromeHiding: hiding });
+      await view.setState({ file: "a.py" }, {} as never);
+      expect(focused).toEqual([]); // the server's origin page has been ready; the workbench page has not
+      el.children[0].fire("dom-ready");
+      await settle();
+      expect(focused).toEqual([el.children[0]]);
+      expect(isActiveTab).toHaveBeenCalledWith((view as unknown as { leaf: unknown }).leaf);
+    });
+
+    it("focuses without the chrome-hiding script too (the host gives no chords)", async () => {
+      const focused = focusStub();
+      const { view, el } = makeView({ isActiveTab: () => true });
+      await view.setState({ file: "a.py" }, {} as never);
+      el.children[0].fire("dom-ready");
+      expect(focused).toEqual([el.children[0]]);
+    });
+
+    it("a background tab does not take focus", async () => {
+      const focused = focusStub();
+      const { view, el } = makeView({ isActiveTab: () => false, chromeHiding: hiding });
+      await view.setState({ file: "a.py" }, {} as never);
+      el.children[0].fire("dom-ready");
+      await settle();
+      expect(focused).toEqual([]);
+    });
+
+    it("a tab becomes active or not by the time the page is ready: the answer at that moment decides", async () => {
+      const focused = focusStub();
+      let active = false;
+      const { view, el } = makeView({ isActiveTab: () => active });
+      await view.setState({ file: "a.py" }, {} as never); // in the background while loading
+      active = true; // the user switched to it before the page was ready
+      el.children[0].fire("dom-ready");
+      expect(focused).toEqual([el.children[0]]);
+    });
+
+    it("a load that was replaced does not take focus; the replacing load does", async () => {
+      const focused = focusStub();
+      const { view, el } = makeView({ isActiveTab: () => true, chromeHiding: hiding });
+      await view.setState({ file: "a.py" }, {} as never);
+      const first = el.children[0];
+      await view.setState({ file: "b.py" }, {} as never);
+      const second = el.children[0];
+      expect(second).not.toBe(first);
+      first.fire("dom-ready");
+      await settle();
+      expect(focused).toEqual([]);
+      second.fire("dom-ready");
+      await settle();
+      expect(focused).toEqual([second]);
+    });
+
+    it("a tab with no host answer (no isActiveTab) takes no focus", async () => {
+      const focused = focusStub();
+      const { view, el } = makeView({ chromeHiding: hiding });
+      await view.setState({ file: "a.py" }, {} as never);
+      el.children[0].fire("dom-ready");
+      await settle();
+      expect(focused).toEqual([]);
+    });
+  });
+
+  it("logChromeOutcome: debug for the install answer, a warning naming the parts for anything else", () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    logChromeOutcome(CHROME_SCRIPT_INSTALLED);
+    expect(debug).toHaveBeenCalledTimes(1);
+    expect(warn).not.toHaveBeenCalled();
+    for (const outcome of ["timeout", "unsupported", "error:x"]) logChromeOutcome(outcome);
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(warn.mock.calls[0][0]).toContain("side bar, secondary side bar or panel");
     debug.mockRestore();
     warn.mockRestore();
   });
