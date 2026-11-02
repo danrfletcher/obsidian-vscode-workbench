@@ -2,7 +2,9 @@
  * A fake DOM element and a fake VS Code page for the terminal host tests. The element follows the `FakeWebview` pattern of
  * `helpers.ts` (attributes, every `src` set, scripts run, dom-ready fired after a navigation) and adds what the host needs:
  * a parent, children, text, removal and input events. `FakeWorkbenchPage` stands in for the page behind a webview: it answers
- * the layout script from a layout the key presses change, the way the real workbench does.
+ * the layout script from a layout that VS Code's commands change, the way the real workbench does: the plugin-owned extension
+ * running in the page closes the side bars and focuses the terminal (the page here does the same by itself, or a test runs
+ * the real extension against it and calls the page's command methods).
  */
 import type { TerminalHostDeps } from "../src/terminal-host/host-page";
 import { LAYOUT_SCRIPT, PART_NAMES, type PartName } from "../src/terminal-host/panel-only";
@@ -66,9 +68,9 @@ export class FakeHostEl {
     if (!this.page) return Promise.resolve("seeded");
     return this.page.run(code);
   }
+  /** The plugin sends the page no key and no click any more; whatever reaches here is recorded so a test can say it is empty. */
   sendInputEvent(ev: { type: string; keyCode?: string; modifiers?: string[] }): void {
     this.sent.push(ev);
-    this.page?.input(ev);
   }
   /** Every element below this one, depth first. */
   all(): FakeHostEl[] {
@@ -89,16 +91,45 @@ export class FakeHostEl {
 
 type Size = [number, number] | null;
 
+/** Width of the fake page's secondary side bar when it is open. */
+const AUX_WIDTH = 160;
+
 export interface PageOptions {
   /** The partition's profile already holds the panel-only layout (a later load). */
   panelOnlyAlready?: boolean;
-  /** Key presses do nothing (the layout never changes). */
-  deaf?: boolean;
+  /** The secondary side bar (Chat) is open, as on a fresh profile of a current VS Code. Absent: it is closed. */
+  auxiliaryBar?: boolean;
+  /**
+   * The plugin-owned extension in the page puts it in the panel-only layout (side bar closed, secondary side bar closed, the
+   * terminal focused) once the workbench has painted. Default true. False: the extension never does (it is not installed, or
+   * the page is not the terminal page), so a test can run the real extension against the page, or see the page never get there.
+   */
+  extension?: boolean;
+  /** With the extension: it acts this many ms after the first paint (a cold page starts its extension host late). Default 0. */
+  extensionDelayMs?: number;
   /** The workbench never paints. */
   neverPaints?: boolean;
   win?: [number, number];
   seedResult?: string;
   trustResult?: string;
+  /**
+   * Models VS Code's own behaviour of opening a first terminal, in the folder the page was opened on, whenever the terminal
+   * panel comes up with no terminal in it (the terminal focus command, or a layout that already has the panel). Absent: no
+   * terminal is modelled.
+   */
+  defaultCwd?: string;
+  /**
+   * With `defaultCwd`: VS Code's first terminal is listed in the extension host only this many ms after the panel came up
+   * (the panel decides at once, the extension host hears of it later). Absent: it is listed at once.
+   */
+  terminalDelayMs?: number;
+}
+
+/** A terminal of the fake page: the folder it started in, and the two parts of VS Code's terminal object the plugin's extension uses. */
+export interface FakeTerminal {
+  cwd: string;
+  exitStatus: undefined;
+  dispose(): void;
 }
 
 /** The workbench page behind a webview, seen only through the scripts and input events the host sends. */
@@ -116,21 +147,65 @@ export class FakeWorkbenchPage {
       titlebar: null,
       activitybar: null,
       sidebar: only ? [0, 0] : [250, win[1]],
-      auxiliarybar: null,
+      auxiliarybar: opts.auxiliaryBar === true && !only ? [AUX_WIDTH, win[1]] : null,
       editor: only ? [0, 0] : [win[0] - 250, win[1]],
       panel: only ? [win[0], win[1]] : [0, 0],
       statusbar: null,
     };
+    if (only) this.panelUp();
   }
   win: [number, number];
+  private extensionScheduled = false;
+  /** The terminals in the page, in the order they were made: the page's own first one and any the extension asks for. */
+  terminals: FakeTerminal[] = [];
+  private firstTerminalPending = false;
+  private openListeners = new Set<(t: FakeTerminal) => void>();
+
+  /** `vscode.window.onDidOpenTerminal`: called after the terminal is in the list. */
+  onDidOpenTerminal(cb: (t: FakeTerminal) => void): { dispose(): void } {
+    this.openListeners.add(cb);
+    return { dispose: () => void this.openListeners.delete(cb) };
+  }
+
+  /** A terminal is made in `cwd`. */
+  addTerminal(cwd: string): FakeTerminal {
+    const t: FakeTerminal = { cwd, exitStatus: undefined, dispose: () => void this.terminals.splice(this.terminals.indexOf(t), 1) };
+    this.terminals.push(t);
+    for (const cb of [...this.openListeners]) cb(t);
+    return t;
+  }
+
+  /** The panel is up: VS Code makes its own first terminal when there is none. */
+  private panelUp(): void {
+    const cwd = this.opts.defaultCwd;
+    if (cwd === undefined || this.terminals.length > 0 || this.firstTerminalPending) return;
+    if (this.opts.terminalDelayMs === undefined) {
+      this.addTerminal(cwd);
+      return;
+    }
+    this.firstTerminalPending = true;
+    setTimeout(() => {
+      this.firstTerminalPending = false;
+      this.addTerminal(cwd);
+    }, this.opts.terminalDelayMs);
+  }
 
   navigated(n: number): void {
     this.loads = n;
   }
 
+  /** The first paint of a loaded page starts the extension, once. */
+  private scheduleExtension(): void {
+    if (this.extensionScheduled || this.opts.extension === false) return;
+    this.extensionScheduled = true;
+    if ((this.opts.extensionDelayMs ?? 0) === 0) this.runExtension();
+    else setTimeout(() => this.runExtension(), this.opts.extensionDelayMs);
+  }
+
   async run(code: string): Promise<unknown> {
     if (code === LAYOUT_SCRIPT) {
       if (this.loads < 2 || this.opts.neverPaints) return "";
+      this.scheduleExtension();
       return JSON.stringify({ win: this.win, parts: this.parts });
     }
     if (code.includes("BroadcastChannel")) {
@@ -142,19 +217,39 @@ export class FakeWorkbenchPage {
     return this.opts.seedResult ?? "seeded";
   }
 
-  input(ev: { type: string; keyCode?: string; modifiers?: string[] }): void {
-    if (this.opts.deaf || ev.type !== "keyDown") return;
-    const sidebarKey = ev.keyCode === "B" && (ev.modifiers?.includes("meta") || ev.modifiers?.includes("control"));
-    if (sidebarKey) {
-      const shown = this.parts.sidebar !== null && this.parts.sidebar[0] > 0;
-      this.parts.sidebar = shown ? [0, 0] : [250, this.win[1]];
-      this.parts.editor = [this.win[0] - (shown ? 0 : 250), this.win[1]];
-    } else if (ev.keyCode === "`" && ev.modifiers?.includes("control")) {
-      const shown = this.parts.panel !== null && this.parts.panel[0] > 0;
-      // opensMaximized: always: an open panel hides the editor
-      this.parts.panel = shown ? [0, 0] : [this.win[0] - (this.parts.sidebar && this.parts.sidebar[0] > 0 ? 250 : 0), this.win[1]];
-      this.parts.editor = shown ? [this.win[0], this.win[1]] : [0, 0];
-    }
+  // VS Code's own commands, as the extension runs them. Each sets a state, none toggles: running one twice changes nothing more.
+
+  /** `workbench.action.closeSidebar` */
+  closeSideBar(): void {
+    this.parts.sidebar = [0, 0];
+    this.fillEditor();
+  }
+
+  /** `workbench.action.closeAuxiliaryBar` */
+  closeAuxiliaryBar(): void {
+    this.parts.auxiliarybar = [0, 0];
+    this.fillEditor();
+  }
+
+  /** `workbench.action.terminal.focus`: opens the panel (maximized: the editor goes) and starts the first terminal when there is none. */
+  focusTerminal(): void {
+    const sideBar = this.parts.sidebar !== null && this.parts.sidebar[0] > 0 ? this.parts.sidebar[0] : 0;
+    this.parts.panel = [this.win[0] - sideBar, this.win[1]];
+    this.parts.editor = [0, 0];
+    this.panelUp();
+  }
+
+  private fillEditor(): void {
+    const taken = (n: PartName) => (this.parts[n] !== null && this.parts[n]![0] > 0 ? this.parts[n]![0] : 0);
+    const panelUp = this.parts.panel !== null && this.parts.panel[0] > 0;
+    this.parts.editor = panelUp ? [0, 0] : [this.win[0] - taken("sidebar") - taken("auxiliarybar"), this.win[1]];
+  }
+
+  /** The extension's three commands, in its order. */
+  private runExtension(): void {
+    this.closeSideBar();
+    this.closeAuxiliaryBar();
+    this.focusTerminal();
   }
 
   /** The parts that are drawn, by name. */
@@ -187,7 +282,7 @@ export interface World {
   text(): string;
 }
 
-export function makeWorld(opts: { page?: PageOptions; accepted?: boolean; trust?: boolean; mac?: boolean } = {}): World {
+export function makeWorld(opts: { page?: PageOptions; accepted?: boolean; trust?: boolean } = {}): World {
   const parent = new FakeHostEl("body");
   const created: FakeHostEl[] = [];
   const notices: string[] = [];
@@ -224,7 +319,6 @@ export function makeWorld(opts: { page?: PageOptions; accepted?: boolean; trust?
     userDataCopy: () => null,
     trustVaultFolder: () => opts.trust ?? true,
     heldPorts: () => [5555],
-    mac: opts.mac ?? true,
     pollMs: 1,
     loadMs: 400,
     panelMs: 200,

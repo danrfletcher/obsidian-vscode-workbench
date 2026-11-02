@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LAYOUT_SCRIPT, PART_NAMES, isPainted, isPanelOnly, missingSteps, parseLayout, partShown, type PageLayout, type PartName } from "../../src/terminal-host/panel-only";
+import { LAYOUT_SCRIPT, PART_NAMES, isPainted, isPanelOnly, parseLayout, partShown, type PageLayout, type PartName } from "../../src/terminal-host/panel-only";
 
 const WIN: [number, number] = [1000, 400];
 function layout(shown: Partial<Record<PartName, [number, number] | null>>): PageLayout {
@@ -60,27 +60,5 @@ describe("the layout decisions", () => {
     expect(partShown(FRESH, "sidebar")).toBe(true);
     expect(partShown(FRESH, "panel")).toBe(false);
     expect(partShown(FRESH, "titlebar")).toBe(false);
-  });
-});
-
-describe("missingSteps: the key presses a page still needs (S1)", () => {
-  it("a fresh page needs the side bar toggled first, then the panel opened", () => {
-    expect(missingSteps(FRESH, true)).toEqual([
-      { name: "side-bar", keyCode: "B", modifiers: ["meta"] },
-      { name: "panel", keyCode: "`", modifiers: ["control"] },
-    ]);
-  });
-
-  it("uses Ctrl+B for the side bar off a Mac", () => {
-    expect(missingSteps(FRESH, false)[0]).toEqual({ name: "side-bar", keyCode: "B", modifiers: ["control"] });
-  });
-
-  it("a page that is panel-only already gets no key: Ctrl+backtick on an open panel would close it", () => {
-    expect(missingSteps(PANEL_ONLY, true)).toEqual([]);
-  });
-
-  it("only the missing half is pressed", () => {
-    expect(missingSteps(layout({ sidebar: [0, 0], editor: [1000, 400], panel: [0, 0] }), true).map((s) => s.name)).toEqual(["panel"]);
-    expect(missingSteps(layout({ sidebar: [250, 400], editor: [0, 0], panel: [750, 400] }), true).map((s) => s.name)).toEqual(["side-bar"]);
   });
 });

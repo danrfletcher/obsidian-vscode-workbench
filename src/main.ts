@@ -1,4 +1,4 @@
-import { FileSystemAdapter, ItemView, Notice, Platform, Plugin, TFile, type TAbstractFile, type Tasks, type WorkspaceLeaf } from "obsidian";
+import { FileSystemAdapter, ItemView, Notice, Platform, Plugin, TFile, type Menu, type TAbstractFile, type Tasks, type WorkspaceLeaf } from "obsidian";
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import { checkFile, refusalMessage } from "./binary-guard";
@@ -51,8 +51,10 @@ import { DEVICE_ID_KEY, deviceId } from "./terminal/drawer-state";
 import { viewKind } from "./terminal/drawer-visibility";
 import { FocusReturn } from "./terminal/focus-return";
 import { HeightStore } from "./terminal/height-store";
+import { addNewTerminalItem, type MenuLike, type MenuTarget } from "./terminal/new-terminal-menu";
 import { TerminalDrawer } from "./terminal/terminal-drawer";
 import { TerminalHostPage } from "./terminal-host/host-page";
+import { newTerminalAtFolder } from "./terminal-host/new-terminal";
 import { TabRegistry } from "./tab-registry";
 import { decideFile, extensionOf, fileName, opensInCodeTab } from "./text-file-rules";
 import { isDarkBody, themeSwitchMessage, ThemeSync } from "./theme-map";
@@ -240,6 +242,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
         hotkeys: [{ modifiers: ["Ctrl"], key: "`" }],
         callback: () => this.drawer?.toggle(),
       });
+      // "New terminal at folder" in the file explorer's right-click menu (G8). The single-item `file-menu` only: a multi-selection
+      // fires `files-menu`, which is not listened to, so one choice is never several terminals.
+      this.registerEvent(this.app.workspace.on("file-menu", (menu: Menu, file: TAbstractFile, source: string) => this.onFileMenu(menu, file, source)));
     }
 
     // The hotkey bridge (E12): installed only when the recorded spike decision allows it. It follows the hotkeys
@@ -584,11 +589,39 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       trustVaultFolder: () => this.trustVaultFolder(),
       heldPorts: () => this.heldPorts(),
       noteTrustOutcome: (outcome) => this.noteTrustOutcome(outcome),
-      mac: this.isMac(),
       attachKeys: (frame) => this.keyRelay?.attach(frame as unknown as RelayFrame) ?? (() => undefined),
       closedByHost: () => this.drawer?.hostClosed(),
     });
     return this.terminalHost;
+  }
+
+  /** The file explorer's menu is being built: add the item that opens a terminal in the folder (or the file's folder). */
+  private onFileMenu(menu: Menu, file: TAbstractFile, source: string): void {
+    if (this.unloaded) return;
+    addNewTerminalItem(menu as unknown as MenuLike, file as unknown as MenuTarget, source, (folder) => this.openTerminalAtFolder(folder));
+  }
+
+  /**
+   * Open a new terminal in `folder` (a vault path, "" for the vault root): the drawer is opened or revealed through its own
+   * reveal path, then VS Code's own terminal is asked for a new one at that folder. The drawer, the host page and the server
+   * start are the ones the edge and the hotkey use.
+   */
+  private openTerminalAtFolder(folder: string): Promise<unknown> {
+    return newTerminalAtFolder(
+      {
+        vaultRoot: () => this.vaultRoot(),
+        reveal: () => this.drawer?.openDrawer(),
+        settled: () => this.terminalHost?.settled() ?? Promise.resolve(),
+        ready: () => this.terminalHost?.ready() ?? false,
+        starting: () => this.terminalHost?.starting() ?? false,
+        focusTerminal: () => this.terminalHost?.focusTerminal(),
+        // Only a server that is running has a page to answer: a crashed one gets no request that a later start could replay.
+        serverDataDir: () => (this.manager.current ? (this.manager.serverInstance?.serverDataDir ?? null) : null),
+        unloaded: () => this.unloaded,
+        notice: (message) => void new Notice(message, 10000),
+      },
+      folder,
+    );
   }
 
   /** Show the terminal host directly, without the drawer's edge and layout. Starts the server on the first show. */
@@ -715,6 +748,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       disableTelemetry: support.disableTelemetry,
       registry: this.registry,
       workspace: this.vaultRoot(),
+      installTerminalAt: true,
       downloadHostReachable: this.downloadHostReachable,
       storedPort: this.workbenchSettings().stablePort,
       onPortPick: (pick) => this.notePort(pick),

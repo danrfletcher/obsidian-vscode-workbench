@@ -2,7 +2,8 @@
  * What the terminal host page loads, from PR-1's recipe (docs/terminal-spike.md, S1): the ordinary workbench page of the
  * same `code serve-web` server (F3), on the vault folder, in a webview partition of its own (F5), with the plugin's Code
  * tab browser settings plus `workbench.panel.opensMaximized: always` and the setting the terminal-at extension reads.
- * The panel-only layout itself comes from two key presses (see panel-only.ts); no URL parameter does it.
+ * The panel-only layout itself comes from VS Code commands the plugin-owned extension runs in the page (see
+ * terminal-at-extension.ts); no URL parameter does it.
  */
 import { BROWSER_APP_SETTINGS } from "../settings";
 import { buildFolderUrl } from "../paths";

@@ -65,6 +65,18 @@ page's settings, did not change that). With two terminals the list had two entri
 
 Evidence: `shot-1-panel-only.png`, `shot-1b-panel-only-two-terminals.png`, `shot-4b-code-tab-beside.png`.
 
+How the product makes the page panel-only (PR-5, replaces the key presses above). The plugin's first versions sent the keys with the `<webview>`'s
+`sendInputEvent`; on a truly fresh profile in the container (Obsidian 1.14.5, new `--user-data-dir`, vault without `.server`, licence accepted) the
+side bar went away but the panel never opened, four Ctrl+backtick presses included, and the drawer ended on "The VS Code terminal panel did not open
+on its own." The earlier panel-only results came from a partition that already held the layout. A read of the page's parts before any action
+showed what a fresh profile starts in: side bar 166x291, editor 502x291, panel 0, activity bar, secondary side bar, title bar and
+status bar 0, in a 680x299 window (the secondary side bar was 0 there, not open). With the keys switched off, the panel still came up (side bar
+166, panel 502, editor 0) once a terminal request ran `newWithCwd`, so it was not panel-only. The plugin-owned extension, which already runs in this page, now runs VS Code's commands
+`workbench.action.closeSidebar`, `workbench.action.closeAuxiliaryBar` and `workbench.action.terminal.focus` once per page load, before it takes
+any request; the host page only waits for the layout. With that, the same fresh profile reached panel 672x291, every other part 0, within about
+two seconds of the first paint, with one shell (in the folder asked for, or the vault root when the drawer was opened by hand). Run with
+`evidence/PR-5/coder-7/` (scripts and layout logs).
+
 ## S2 Open a terminal at a chosen folder (`cwd_open: extension`)
 
 The command is VS Code's own `workbench.action.terminal.newWithCwd` with `{ "cwd": "<folder>" }`. Typing `cd` is not used.

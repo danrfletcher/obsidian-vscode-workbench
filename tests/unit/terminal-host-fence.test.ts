@@ -54,8 +54,47 @@ describe("the terminal host's fences", () => {
     expect([...page.matchAll(/server\.token/g)]).toHaveLength(1);
   });
 
+  it("sends the page no key press and no click: the layout is made by the extension's commands, not by input events", () => {
+    for (const [file, text] of sources) expect(code(text), file).not.toMatch(/sendInputEvent|\bkeyDown\b|\bkeyUp\b|mouseDown|mouseUp|missingSteps/);
+  });
+
   it("the layout probe the page is asked reads sizes only", () => {
     const text = code(fs.readFileSync(path.join(DIR, "panel-only.ts"), "utf8"));
     expect(text).not.toMatch(/localStorage|indexedDB|document\.cookie|\.click\(|dispatchEvent|\.value\s*=/);
+  });
+
+  // "New terminal at folder" (PR-5): the new files in src/terminal-host/ are already covered by the checks above; these add its own.
+  const NEW_FILES = ["new-terminal.ts", "terminal-at-extension.ts", "terminal-folder-target.ts"].map((f) => path.join("src/terminal-host", f)).concat("src/terminal/new-terminal-menu.ts");
+  const newCode = NEW_FILES.map((f) => [f, code(fs.readFileSync(path.join(REPO_ROOT, f), "utf8"))] as const);
+
+  it("PR-5: the new files exist and are all checked", () => {
+    expect(newCode).toHaveLength(4);
+    for (const [, text] of newCode) expect(text.length).toBeGreaterThan(0);
+  });
+
+  it("PR-5 F1/F4: the new files bring in no xterm, make no network call, open no socket and spawn nothing", () => {
+    for (const [file, text] of newCode) {
+      expect(text, file).not.toMatch(/xterm|python3|\bfetch\(|XMLHttpRequest|WebSocket|createServer|\.listen\(|child_process|\bspawn\(|\bexec\(/);
+      expect(text, file).not.toMatch(/from\s+[\"'](?:node:)?(?:net|dgram|http2?|https|tls|ws)[\"']/);
+    }
+  });
+
+  it("PR-5 G8: no `cd` and no text is sent to a shell: the folder goes as the command's cwd argument", () => {
+    for (const [file, text] of newCode) expect(text, file).not.toMatch(/\bcd\s|sendText|sendSequence|\bpwd\b/);
+    const ext = newCode.find(([f]) => f.endsWith("terminal-at-extension.ts"))![1];
+    expect(ext).toMatch(/executeCommand\(\$\{JSON\.stringify\(NEW_WITH_CWD_COMMAND\)\}, \{ cwd: req\.cwd \}\)/);
+  });
+
+  it("PR-5 F9: no retry or backoff loop and no logging in the new files", () => {
+    for (const [file, text] of newCode) expect(text, file).not.toMatch(/console\.|setInterval|setTimeout\(\w+,\s*\w*[Rr]etry|backoff|retry|\bwhile\s*\(|\bfor\s*\(let i\b/i);
+    const ext = newCode.find(([f]) => f.endsWith("terminal-at-extension.ts"))![1];
+    // each panel-only command is asked once: it is in a try/catch, not in a loop
+    expect(ext).toMatch(/const runCommand = async \(command\) => \{\s*try \{ await vscode\.commands\.executeCommand\(command\); \} catch/);
+  });
+
+  it("PR-5 F6: the only place the request code writes to is under the server data dir it is given", () => {
+    for (const [file, text] of newCode) {
+      expect(text, file).not.toMatch(/Library\/Application Support|\.vscode|homedir\(\)|os\.homedir|process\.env\.HOME/);
+    }
   });
 });

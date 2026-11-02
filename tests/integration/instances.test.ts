@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileSystemAdapter, Notice, Plugin, Setting, TFile, WorkspaceLeaf, type FakeNode, type MockApp } from "../mocks/obsidian";
+import { EXTENSION_DIR_NAME } from "../../src/terminal-host/terminal-at-extension";
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
 import { FAKE_CODE, isAlive, tempDir } from "../helpers";
 import { stateDb } from "../mirror-tree";
@@ -632,7 +633,7 @@ describe("extensions of other instances are never combined (F3)", () => {
     const digestA = treeDigest(path.join(home, ".ext-a"));
     const digestB = treeDigest(path.join(home, ".ext-b"));
     await load();
-    const shared = () => fs.readdirSync(path.join(inner().manager.serverInstance!.serverDataDir, "extensions")).filter((n) => n !== "extensions.json").sort();
+    const shared = () => fs.readdirSync(path.join(inner().manager.serverInstance!.serverDataDir, "extensions")).filter((n) => n !== "extensions.json" && n !== EXTENSION_DIR_NAME).sort();
 
     await plugin.openSpikeFile(); // default: Insiders, so .ext-b
     expect(shared()).toEqual(["beta.two-2.0.0"]);

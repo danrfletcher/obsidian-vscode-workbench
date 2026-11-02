@@ -137,7 +137,7 @@ describe("imports", () => {
       }
     }
     const terminalFiles = srcFiles.filter((f) => f.startsWith(path.join(SRC, "terminal") + path.sep));
-    expect(terminalFiles.map((f) => path.basename(f)).sort()).toEqual(["bottom-edge.ts", "drawer-geometry.ts", "drawer-state.ts", "drawer-visibility.ts", "focus-return.ts", "height-store.ts", "layout.ts", "terminal-drawer.ts"]);
+    expect(terminalFiles.map((f) => path.basename(f)).sort()).toEqual(["bottom-edge.ts", "drawer-geometry.ts", "drawer-state.ts", "drawer-visibility.ts", "focus-return.ts", "height-store.ts", "layout.ts", "new-terminal-menu.ts", "terminal-drawer.ts"]);
     expect(terminalFiles.filter((f) => !seen.has(f)).map((f) => path.basename(f))).toEqual([]);
   });
 });

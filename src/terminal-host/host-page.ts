@@ -18,7 +18,7 @@ import { buildTrustSeedScript } from "../trust/trust-seed";
 import { buildFileUri } from "../paths";
 import { INITIAL_HOST_STATE, hostView, reduceHost, type HostEffect, type HostEvent, type HostState, type HostView } from "./host-state";
 import { buildTerminalHostUrl, hostOriginUrl, hostSettings, TERMINAL_PARTITION } from "./host-url";
-import { LAYOUT_SCRIPT, isPainted, isPanelOnly, missingSteps, parseLayout, partShown, type PageLayout } from "./panel-only";
+import { LAYOUT_SCRIPT, isPainted, isPanelOnly, parseLayout, type PageLayout } from "./panel-only";
 
 export const STARTING_TEXT = "Starting VS Code server...";
 export const LICENCE_TEXT = "Waiting for the VS Code server licence...";
@@ -42,7 +42,6 @@ export const FOCUS_TERMINAL_SCRIPT =
 /** The part of Electron's <webview> element this uses. */
 interface HostWebview extends HTMLElement {
   executeJavaScript?: (code: string) => Promise<unknown>;
-  sendInputEvent?: (event: { type: string; keyCode?: string; modifiers?: string[]; x?: number; y?: number; button?: string; clickCount?: number }) => unknown;
 }
 
 export interface TerminalHostDeps {
@@ -64,7 +63,6 @@ export interface TerminalHostDeps {
   trustVaultFolder(): boolean;
   heldPorts(): readonly number[];
   noteTrustOutcome?(outcome: string): void;
-  mac: boolean;
   /** Start watching the page's keys for the bridged chords (the plugin's key relay); returns the function that stops. Absent: no bridge. */
   attachKeys?(frame: HTMLElement): () => void;
   /** The host hid itself (the licence was declined), not because `hide` was called: the drawer closes. */
@@ -78,7 +76,11 @@ export interface TerminalHostDeps {
 const POLL_MS = 200;
 /** The first load of a workbench page can be slow (it is also the first start of the server's extension host). */
 const LOAD_MS = 90_000;
-const PANEL_MS = 10_000;
+/**
+ * How long a loaded page has to become panel-only. The extension that does it starts with the page's extension host, which on a
+ * fresh profile is slow, so this is generous.
+ */
+const PANEL_MS = 30_000;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -201,6 +203,16 @@ export class TerminalHostPage {
     return hostView(this.state);
   }
 
+  /** The page is mounted and showing the terminal (shown or hidden), the "terminals lost" notice included. */
+  ready(): boolean {
+    return this.state.phase === "running" || this.state.phase === "lost";
+  }
+
+  /** A start of the page is in flight (the licence, the server or the page loading). */
+  starting(): boolean {
+    return this.flow !== null;
+  }
+
   /** Resolves when the start in flight (if any) has finished, either way. */
   settled(): Promise<void> {
     return this.flow ?? Promise.resolve();
@@ -310,7 +322,7 @@ export class TerminalHostPage {
     this.stillWanted(el);
     const layout = await this.until(() => this.readLayout(el), (l) => isPainted(l), this.deps.loadMs ?? LOAD_MS);
     if (!layout) throw new PageError(NOT_LOADED_TEXT);
-    await this.makePanelOnly(el, layout);
+    await this.waitPanelOnly(el, layout);
     this.stillWanted(el);
     // Ready: from now on a dom-ready is a reload, and a theme change that came in while loading is applied.
     this.pageReady = true;
@@ -375,26 +387,14 @@ export class TerminalHostPage {
   }
 
   /**
-   * S1: a page that is not panel-only yet gets the key presses it lacks, once (the layout then lives in the partition's
-   * profile). The page is clicked first because a script click does not focus the workbench and its keys would be dropped.
-   * A page that still is not panel-only afterwards is an error with Retry, never a half-drawn drawer (E3).
+   * S1: the page is put in its panel-only layout by the plugin-owned extension running inside it (VS Code's own commands:
+   * close the side bars, focus the terminal; see terminal-at-extension.ts). The plugin sends the page no key and no click: a
+   * key sent into a fresh profile's page was dropped, and a script cannot tell a key that worked from a bar that was already
+   * hidden. This only waits for the layout to be panel-only. A page that is not by then is an error with Retry, never a
+   * half-drawn drawer (E3).
    */
-  private async makePanelOnly(el: HostWebview, layout: PageLayout): Promise<void> {
+  private async waitPanelOnly(el: HostWebview, layout: PageLayout): Promise<void> {
     if (isPanelOnly(layout)) return;
-    const send = el.sendInputEvent;
-    if (typeof send !== "function") throw new PageError(NOT_PANEL_TEXT);
-    const steps = missingSteps(layout, this.deps.mac);
-    el.focus?.();
-    send.call(el, { type: "mouseDown", x: Math.round(layout.win[0] / 2), y: Math.round(layout.win[1] / 2), button: "left", clickCount: 1 });
-    send.call(el, { type: "mouseUp", x: Math.round(layout.win[0] / 2), y: Math.round(layout.win[1] / 2), button: "left", clickCount: 1 });
-    for (const step of steps) {
-      send.call(el, { type: "keyDown", keyCode: step.keyCode, modifiers: step.modifiers });
-      send.call(el, { type: "keyUp", keyCode: step.keyCode, modifiers: step.modifiers });
-      // Wait for this press to take effect before the next one: the side bar goes away, the panel appears.
-      const part = step.name === "side-bar" ? "sidebar" : "panel";
-      const wantShown = step.name === "panel";
-      await this.until(() => this.readLayout(el), (l) => partShown(l, part) === wantShown, this.deps.panelMs ?? PANEL_MS);
-    }
     if (!(await this.until(() => this.readLayout(el), (l) => isPanelOnly(l), this.deps.panelMs ?? PANEL_MS))) throw new PageError(NOT_PANEL_TEXT);
   }
 

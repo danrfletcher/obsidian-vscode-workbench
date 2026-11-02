@@ -82,21 +82,58 @@ describe("starting and running (G2)", () => {
     expect(world.webviews()[0].executed.filter((c) => c.includes("vscode-web-state-db-global-shared"))).toEqual([]);
   });
 
-  it("a fresh page gets a click, then the side bar key, then Ctrl+backtick, and ends panel-only", async () => {
-    const world = makeWorld({ accepted: true, mac: true });
+  it("a fresh page is left to the extension in it: no key and no click is sent, and it ends panel-only", async () => {
+    const world = makeWorld({ accepted: true });
     const h = open(world);
     h.show();
     await h.settled();
     const wv = world.webviews()[0];
-    const kinds = wv.sent.map((e) => (e.type === "keyDown" ? `${e.modifiers?.join("+")}+${e.keyCode}` : e.type));
-    expect(kinds).toEqual(["mouseDown", "mouseUp", "meta+B", "keyUp", "control+`", "keyUp"]);
-    expect(wv.focusCount).toBeGreaterThan(0);
+    expect(wv.sent).toEqual([]);
     expect(wv.page!.shown()).toEqual(["panel"]);
     expect(h.view()).toBe("running");
   });
 
-  it("a page whose profile already is panel-only gets no key at all", async () => {
-    const world = makeWorld({ accepted: true, page: { panelOnlyAlready: true } });
+  it("a fresh page with the secondary side bar open (Chat) also ends panel-only, still with no key", async () => {
+    const world = makeWorld({ accepted: true, page: { auxiliaryBar: true } });
+    const h = open(world);
+    h.show();
+    await h.settled();
+    const wv = world.webviews()[0];
+    expect(wv.sent).toEqual([]);
+    expect(wv.page!.shown()).toEqual(["panel"]);
+    expect(h.view()).toBe("running");
+  });
+
+  it("waits for a cold page whose extension acts late, within the time given", async () => {
+    const world = makeWorld({ accepted: true, page: { extensionDelayMs: 120 } });
+    world.deps.panelMs = 2000;
+    const h = open(world);
+    h.show();
+    await vi.waitFor(() => expect(world.webviews()).toHaveLength(1));
+    await flush();
+    // the page has painted but the extension has not acted: not ready, no half-drawn drawer
+    expect(world.webviews()[0].page!.shown()).not.toEqual(["panel"]);
+    expect(h.view()).toBe("starting");
+    await h.settled();
+    expect(h.view()).toBe("running");
+    expect(world.webviews()[0].page!.shown()).toEqual(["panel"]);
+    expect(world.webviews()[0].sent).toEqual([]);
+  });
+
+  it("a page whose extension acts after the time given is an error with Retry (E3)", async () => {
+    const world = makeWorld({ accepted: true, page: { extensionDelayMs: 600 } });
+    world.deps.panelMs = 60;
+    const h = open(world);
+    h.show();
+    await h.settled();
+    expect(h.view()).toBe("error");
+    expect(world.text()).toContain(NOT_PANEL_TEXT);
+    expect(world.text()).toContain("Retry");
+    expect(world.webviews()[0].sent).toEqual([]);
+  });
+
+  it("a page whose profile already is panel-only is ready at once, with no key", async () => {
+    const world = makeWorld({ accepted: true, page: { panelOnlyAlready: true, extension: false } });
     const h = open(world);
     h.show();
     await h.settled();
@@ -104,8 +141,8 @@ describe("starting and running (G2)", () => {
     expect(h.view()).toBe("running");
   });
 
-  it("a page that ignores the keys is an error with Retry, not a half-drawn drawer (E3)", async () => {
-    const world = makeWorld({ accepted: true, page: { deaf: true } });
+  it("a page that never becomes panel-only (no extension acts) is an error with Retry, not a half-drawn drawer (E3), and no key is tried", async () => {
+    const world = makeWorld({ accepted: true, page: { extension: false } });
     const h = open(world);
     h.show();
     await h.settled();
@@ -113,6 +150,7 @@ describe("starting and running (G2)", () => {
     expect(world.text()).toContain(NOT_PANEL_TEXT);
     expect(world.text()).toContain("Retry");
     expect(world.webviews().every((w) => w.removed)).toBe(true);
+    expect(world.webviews().every((w) => w.sent.length === 0)).toBe(true);
   });
 
   it("a page that never paints is an error with Retry after the load time", async () => {
@@ -264,7 +302,7 @@ describe("failures (E1)", () => {
   });
 
   it("a failed Retry leaves no webview behind and the old one is gone", async () => {
-    const world = makeWorld({ accepted: true, page: { deaf: true } });
+    const world = makeWorld({ accepted: true, page: { extension: false } });
     const h = open(world);
     h.show();
     await h.settled();

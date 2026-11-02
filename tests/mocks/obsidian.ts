@@ -12,10 +12,55 @@ export class Notice {
 /** Obsidian's `Platform`: tests flip `isDesktopApp` to prove a feature registers on desktop only. */
 export const Platform = { isDesktopApp: true };
 
+export class TFolder {
+  children: Array<TFile | TFolder> = [];
+  parent: TFolder | null = null;
+  constructor(public path: string) {}
+  /** Obsidian's root folder has the path "/". */
+  isRoot(): boolean {
+    return this.path === "/";
+  }
+}
+
 export class TFile {
   extension: string;
+  /** The folder the file is in (the root folder for a top-level file). Tests set it where the parent matters. */
+  parent: TFolder | null = null;
   constructor(public path: string) {
     this.extension = path.split(".").pop() ?? "";
+  }
+}
+
+/** One entry of a fake context menu: what `addItem` was given, and the click a test makes. */
+export class MenuItem {
+  title = "";
+  icon = "";
+  private handler: (() => unknown) | null = null;
+  setTitle(title: string): this {
+    this.title = title;
+    return this;
+  }
+  setIcon(icon: string): this {
+    this.icon = icon;
+    return this;
+  }
+  onClick(callback: () => unknown): this {
+    this.handler = callback;
+    return this;
+  }
+  click(): unknown {
+    return this.handler?.();
+  }
+}
+
+/** Obsidian's context menu, as far as the plugin adds items to it. */
+export class Menu {
+  items: MenuItem[] = [];
+  addItem(callback: (item: MenuItem) => unknown): this {
+    const item = new MenuItem();
+    callback(item);
+    this.items.push(item);
+    return this;
   }
 }
 

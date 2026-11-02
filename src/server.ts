@@ -27,6 +27,7 @@ import {
   type MirrorState,
   type ProfileExtension,
 } from "./server/shared-extensions";
+import { installTerminalAtExtension } from "./terminal-host/terminal-at-extension";
 import { isAlive, listDescendants, pidsWithCommandContaining, signal, signalGroup } from "./process-utils";
 
 export { descendantsFromPs, listDescendants } from "./process-utils";
@@ -618,6 +619,11 @@ export interface ServerOptions {
   reuseMirror?: MirrorState | null;
   /** Called with everything a read produced (the disabled lists and the profile's list), for the plugin to keep. */
   onMirrorState?: (state: MirrorState) => void;
+  /**
+   * Put the plugin-owned terminal-at extension in the server's own extension dir at each start ("New terminal at folder",
+   * src/terminal-host/terminal-at-extension.ts). Only the plugin asks for it; a server made without it shares extensions only.
+   */
+  installTerminalAt?: boolean;
   /** Tests only: the file system and `sqlite3` runner the read uses. */
   mirrorDeps?: MirrorOptions["deps"];
 }
@@ -725,6 +731,7 @@ export class WorkbenchServer {
     const token = createTokenFile(tokenFile);
     // Only now, with the previous server already stopped (restart awaits stop before it creates the next one), are the links rebuilt.
     shareExtensions(build.extensionsDir, this.serverDataDir, enabledExtensions(this.mirrorState));
+    if (this.opts.installTerminalAt) installTerminalAtExtension(this.serverDataDir); // after the share: it keeps the entries just written
     const picked = await pickPort(this.opts.findPort, this.opts.storedPort ?? null);
     const port = picked.port;
     if (this.stopRequested) throw new StartCancelledError(); // stop() came in before the spawn: nothing to kill

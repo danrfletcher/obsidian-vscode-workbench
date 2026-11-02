@@ -1,9 +1,8 @@
 /**
- * Making the host page panel-only (docs/terminal-spike.md, S1). With the plugin's chrome settings and
- * `workbench.panel.opensMaximized: always` in the page's profile, two key presses do the rest, once per profile:
- * the side bar toggle (Cmd+B / Ctrl+B) and Ctrl+backtick (opens the terminal panel and starts the first shell). Both are
- * VS Code's own key bindings, sent into its page; the layout then lives in the partition's profile and holds across
- * reloads, so a page that already is panel-only gets no key.
+ * Reading the host page's layout (docs/terminal-spike.md, S1). The page is made panel-only by the plugin-owned extension running
+ * inside it, with VS Code's own commands (src/terminal-host/terminal-at-extension.ts); with the plugin's chrome settings and
+ * `workbench.panel.opensMaximized: always` in the page's profile, the terminal panel then fills the window. The plugin sends the
+ * page no key. The layout lives in the partition's profile and holds across reloads.
  *
  * Everything here is pure: a script that reads the layout, and decisions about the layout it returns.
  */
@@ -67,23 +66,4 @@ export function isPanelOnly(l: PageLayout): boolean {
   const panel = l.parts.panel;
   if (!panel || panel[0] < l.win[0] - FILL_SLACK || panel[1] < l.win[1] - FILL_SLACK) return false;
   return PART_NAMES.filter((n) => n !== "panel").every((n) => !shown(l.parts[n]));
-}
-
-/** A key press for Electron's `webContents.sendInputEvent`. */
-export interface KeyStep {
-  name: "side-bar" | "panel";
-  keyCode: string;
-  modifiers: string[];
-}
-
-/**
- * The key presses a page still needs, in the order to send them: the side bar first (focus is still in the editor, where
- * its key works; once the panel is open, focus sits in the terminal and the shell would get it), then the panel.
- * A part that is already the way it should be gets no press: Ctrl+backtick on an open panel would close it.
- */
-export function missingSteps(l: PageLayout, mac: boolean): KeyStep[] {
-  const steps: KeyStep[] = [];
-  if (shown(l.parts.sidebar)) steps.push({ name: "side-bar", keyCode: "B", modifiers: [mac ? "meta" : "control"] });
-  if (!shown(l.parts.panel)) steps.push({ name: "panel", keyCode: "`", modifiers: ["control"] });
-  return steps;
 }
