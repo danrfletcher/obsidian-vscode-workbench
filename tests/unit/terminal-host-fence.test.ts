@@ -25,14 +25,14 @@ describe("the terminal host's fences", () => {
     for (const [file, text] of sources) expect(text, file).not.toMatch(/from\s+["'](?:\.\.\/)+terminal\/|from\s+["']\.\.\/terminal["']/);
   });
 
-  it("draws no terminal tab, list or kill control (F1): the only controls are Retry and Dismiss", () => {
+  it("draws no terminal tab, list or kill control (F1): the only controls are Retry, Dismiss and the crash banner's Restart", () => {
     for (const [file, text] of sources) {
       const c = code(text);
       expect(c, file).not.toMatch(/vscw-|\btabs?\b|tablist|terminal-list|kill|trash|New terminal|Close terminal/i);
     }
     const page = code(fs.readFileSync(path.join(DIR, "host-page.ts"), "utf8"));
     const buttons = [...page.matchAll(/createElement\("button"\)[\s\S]{0,80}?textContent = "([^"]+)"/g)].map((m) => m[1]).sort();
-    expect(buttons).toEqual(["Dismiss", "Retry"]);
+    expect(buttons).toEqual(["Dismiss", "Restart", "Retry"]);
   });
 
   it("makes no network call and opens no socket of its own (the page loads from the server the plugin already owns)", () => {

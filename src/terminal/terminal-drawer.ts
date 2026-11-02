@@ -84,6 +84,7 @@ export class TerminalDrawer implements ToggleTarget {
       case "starting":
         return "starting";
       case "error":
+      case "crashed":
         return "ended";
       default:
         return "running";

@@ -11,7 +11,8 @@ import { scanVault } from "./extension-scan";
 import { createClickInterceptor, readMode, type ClickLike, type ExtensionlessMode } from "./extensionless-intercept";
 import { describeFailure, type StartFailure } from "./failure-messages";
 import { IdleTimer } from "./idle-timer";
-import { hasLiveTerminalShell } from "./terminal-keepalive";
+import { hasLiveTerminalShell, liveShellPids } from "./terminal-keepalive";
+import { restartPrompt, type ShellAnswer } from "./restart-prompt";
 import { readProcessTable } from "./process-utils";
 import { LicenceDeclinedError, LicenceGate } from "./licence";
 import { promptCloseDirty, promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard, type CloseDirtyRequest } from "./modals";
@@ -185,6 +186,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.manager.onChange((state) => {
       if (state === "running") this.idle.start();
       else this.idle.stop();
+      this.terminalFollowsServer(state);
     });
 
     // A server left over from a crash or force-quit is swept before anything new starts (E11).
@@ -299,7 +301,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     // `beforeunload` that gets cancelled or is still waiting on the quit tasks; after a finished quit the
     // server is already stopped, so this finds nothing to do.
     this.registerDomEvent(window, "pagehide", () => {
-      void this.manager.shutdown();
+      void this.shutdownAll();
     });
 
     // Every extension found in the vault is registered against the Code tab, now and as new files appear (GP1).
@@ -361,8 +363,8 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.keyRelay = null;
     this.bridgeToggle = null;
     // The terminal host page goes with the plugin: no webview left behind (a start still running is dropped at its next step).
-    this.terminalHost?.dispose();
-    this.terminalHost = null;
+    // It goes before the server stops, so the page never reloads onto a dying server and no banner or lost message shows.
+    this.endTerminalPage();
     // The edge and the layout variables go off the page, and the drawer height still waiting to be written is written.
     this.drawer?.dispose();
     this.drawer = null;
@@ -579,7 +581,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   /** The host page, made on first use; null once the plugin has unloaded. Its start goes through `ensureServer` and the licence gate: one server, one modal. */
   private terminalHostPage(): TerminalHostPage | null {
-    if (this.unloaded) return null;
+    if (this.unloaded || this.quitting) return null;
     if (this.terminalHost) return this.terminalHost;
     this.terminalHost = new TerminalHostPage({
       createElement: (tag) => document.createElement(tag),
@@ -588,6 +590,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       licenceAccepted: () => this.gate.accepted,
       requestLicence: () => this.gate.request(),
       ensureServer: () => this.ensureServer(),
+      restartServer: () => this.restartServer(),
       failureText: (e) => this.describeStartFailure(e).message,
       notice: (message) => void new Notice(message, 10000),
       isDark: () => this.isDark(),
@@ -603,6 +606,41 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     });
     void this.idle?.evaluate(); // the host page was just created
     return this.terminalHost;
+  }
+
+  /**
+   * The server changed state: the terminal page follows it (G13). A crash shows the banner in the drawer; a restart's stop drops
+   * the page, which comes back at the new address when a server runs; an idle stop drops it with nothing announced. Quit and
+   * unload never get here: they end the page first (`endTerminalPage`), so a stop that is theirs raises no banner and no reload.
+   */
+  private terminalFollowsServer(state: ServerState): void {
+    const host = this.terminalHost;
+    if (!host || this.quitting || this.unloaded) return;
+    switch (state) {
+      case "crashed":
+        host.serverCrashed();
+        break;
+      case "stopped":
+        host.serverStopped();
+        break;
+      case "stopped-by-idle":
+        host.serverIdle();
+        break;
+      case "running":
+        host.serverRunning();
+        break;
+      case "failed":
+        host.serverFailed(this.describeStartFailure(this.manager.lastError).message);
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** End the terminal page: its webview and container are removed and later events are ignored. Idempotent. */
+  private endTerminalPage(): void {
+    this.terminalHost?.dispose();
+    this.terminalHost = null;
   }
 
   /** The file explorer's menu is being built: add the item that opens a terminal in the folder (or the file's folder). */
@@ -928,15 +966,20 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   /**
    * Stop the server and start a fresh one (new token; the stable port when it is free, else a new port); open Code tabs
-   * reload. Works from every state, the failed one included. Asks first when a
-   * running server holds unsaved buffers. Resolves once running; rejects if it cannot start.
+   * reload, and the terminal page reloads and says its terminals were lost. Works from every state, the failed and crashed ones
+   * included (they never prompt). Asks first when a running server holds unsaved buffers or live terminal shells (`restartPrompt`).
+   * Resolves once running; rejects if it cannot start. Two calls share one restart.
    */
   restartServer(): Promise<void> {
     if (this.restarting) return this.restarting;
     const p = (async () => {
       if (this.manager.state === "running") {
+        // Both questions are asked once, before the prompt: a server that crashes or a shell that exits while it is open changes
+        // nothing about what it says, and confirming still restarts.
         const dirty = (await this.dirtyViews()).map((v) => baseName(v.filePath));
-        if (dirty.length && !(await promptRestartWithDirty(this.app, dirty))) return;
+        const shells = await this.liveShellAnswer();
+        const prompt = restartPrompt({ state: "running", dirtyFiles: dirty, shells, pageLoaded: this.terminalHost?.ready() ?? false });
+        if (prompt && !(await promptRestartWithDirty(this.app, prompt.files, prompt.terminalLine))) return;
       }
       this.profileStale = true; // the user chose to re-read desktop VS Code's state
       try {
@@ -950,6 +993,17 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     });
     this.restarting = p;
     return p;
+  }
+
+  /** How many terminal shells live under the server, read from its process tree; "unknown" when the process table cannot be read. */
+  private async liveShellAnswer(): Promise<ShellAnswer> {
+    const pid = this.manager.serverInstance?.pid;
+    if (pid === undefined) return 0;
+    try {
+      return liveShellPids(await this.processTable(), pid).length;
+    } catch {
+      return "unknown";
+    }
   }
 
   // --- Unsaved buffers and quit -------------------------------------------
@@ -980,7 +1034,17 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     }
     // A rename of a file with edits saved from its tab (Cmd+S, auto-save, the Save above) left them in the old path.
     await Promise.all([...this.views].map((v) => v.settleRename()));
+    await this.shutdownAll();
+  }
+
+  /**
+   * Quit (after its prompts) and the `pagehide` fallback: the terminal page, the server and every shell go, with no prompt. Only
+   * Code buffers are ever asked about; shells add nothing. The page is ended first and the manager is told to stop for good
+   * (`stopped`, never `crashed`), so nothing shows a banner, reloads onto the dying server or raises an error notice.
+   */
+  private async shutdownAll(): Promise<void> {
     this.quitting = true;
+    this.endTerminalPage();
     await this.manager.shutdown();
   }
 

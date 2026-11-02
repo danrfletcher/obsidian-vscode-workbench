@@ -78,6 +78,26 @@ export function pidsWithCommandContaining(marker: string): number[] {
   }
 }
 
+/**
+ * Pids (other than this process) whose process group id is `pgid`. After the leader of a group has exited, whatever is still in
+ * the group is what it left behind, and the group id cannot be given to another process while any of them lives (POSIX). A leader
+ * that is still alive is not asked about here: the caller checks that first.
+ */
+export function pidsInProcessGroup(pgid: number): number[] {
+  if (!Number.isInteger(pgid) || pgid <= 1) return [];
+  try {
+    const out = execFileSync("ps", ["-A", "-o", "pid=,pgid="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const pids: number[] = [];
+    for (const line of out.split("\n")) {
+      const [pid, group] = line.trim().split(/\s+/).map(Number);
+      if (pid && group === pgid && pid !== process.pid) pids.push(pid);
+    }
+    return pids;
+  } catch {
+    return [];
+  }
+}
+
 export function signal(pid: number, sig: NodeJS.Signals): void {
   try {
     process.kill(pid, sig);

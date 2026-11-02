@@ -61,3 +61,6 @@ export class Modal {
   onOpen() {}
   onClose() {}
 }
+
+/** Imported by the Code tab module, which the drawer's host page also imports; never constructed here. */
+export class ItemView {}

@@ -18,9 +18,16 @@
 //   process group (the pty's session) with a child `python3 -m http.server p --bind 127.0.0.1`. The shell's pid is
 //   appended to FAKE_CODE_SHELL_PIDFILE. The shell is a descendant of the server and carries neither the server's
 //   token-file path nor "serve-web" on its command line, like a real shell under the pty host.
+// FAKE_CODE_SHELLS=n makes the server hold n live terminal children, started the way a shell of the real server is: children of the
+//   server in its own process group, not detached. FAKE_CODE_SHELL_KINDS=a,b,c (default: all `sleep`) picks each child's kind, in
+//   order and repeating: `sleep` is a bare `sleep 600` (an idle shell), `fg` a shell with a foreground child (`sh -c 'sleep 600; true'`),
+//   `ignore` a shell that ignores SIGTERM and SIGHUP and keeps starting `sleep 600` (only SIGKILL ends it). One more child is
+//   started the way a `nohup`/`setsid` process is: in a session of its own and re-parented to init, so neither the tree nor the
+//   process group of the server reaches it. Their pids go to FAKE_CODE_PIDFILE after the server's own, one per line, as
+//   `shell <pid>` and `setsid <pid>` (the server's line is a bare number, so a reader that wants only servers still gets them).
 // FAKE_CODE_TERMINAL_PIDFILE=f makes the server start a pty host the way the real one does (fake-pty-host.mjs: a node process
 //   with `--type=ptyHost` on its command line) whose one terminal is a long-lived `sh`. The shell's pid is appended to f.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -36,6 +43,24 @@ const token = fs.readFileSync(tokenFile, "utf8").trim();
 const mode = process.env.FAKE_CODE_MODE;
 
 if (process.env.FAKE_CODE_PIDFILE) fs.appendFileSync(process.env.FAKE_CODE_PIDFILE, `${process.pid}\n`);
+if (process.env.FAKE_CODE_SHELLS) {
+  const kinds = (process.env.FAKE_CODE_SHELL_KINDS || "sleep").split(",");
+  const commands = {
+    sleep: ["sleep", ["600"]],
+    fg: ["sh", ["-c", "sleep 600; true"]],
+    ignore: ["sh", ["-c", "trap '' TERM HUP; while :; do sleep 600; done"]],
+  };
+  for (let i = 0; i < Number(process.env.FAKE_CODE_SHELLS); i++) {
+    const [cmd, cmdArgs] = commands[kinds[i % kinds.length]];
+    const child = spawn(cmd, cmdArgs, { stdio: "ignore" });
+    child.unref();
+    if (process.env.FAKE_CODE_PIDFILE) fs.appendFileSync(process.env.FAKE_CODE_PIDFILE, `shell ${child.pid}\n`);
+  }
+  // The process that outlives its shell and its server: a background `nohup sleep` of a shell that then exits, in its own session.
+  const out = spawnSync("sh", ["-c", "nohup sleep 600 >/dev/null 2>&1 & echo $!"], { encoding: "utf8", detached: true });
+  const survivor = Number(out.stdout.trim());
+  if (survivor && process.env.FAKE_CODE_PIDFILE) fs.appendFileSync(process.env.FAKE_CODE_PIDFILE, `setsid ${survivor}\n`);
+}
 if (process.env.FAKE_CODE_SHELL_PORT) {
   // `; true` keeps the shell alive as the parent (without it, sh -c would exec the last command in place).
   const shell = spawn("sh", ["-c", `python3 -m http.server ${process.env.FAKE_CODE_SHELL_PORT} --bind 127.0.0.1; true`], { detached: true, stdio: "ignore", env: { ...process.env, FAKE_CODE_SHELL_PORT: "", FAKE_CODE_PIDFILE: "" } });

@@ -28,7 +28,7 @@ import {
   type ProfileExtension,
 } from "./server/shared-extensions";
 import { installTerminalAtExtension } from "./terminal-host/terminal-at-extension";
-import { isAlive, listDescendants, pidsWithCommandContaining, signal, signalGroup } from "./process-utils";
+import { isAlive, listDescendants, pidsInProcessGroup, pidsWithCommandContaining, signal, signalGroup } from "./process-utils";
 
 export { descendantsFromPs, listDescendants } from "./process-utils";
 
@@ -951,7 +951,12 @@ export class WorkbenchServer {
       // The wrapper is already gone, so its pid (and process group id) may have been reused by
       // another program: never signal it. Stragglers are found by our own token-file path, which
       // appears on the command line of every process the wrapper started.
-      const stragglers = this.tokenFile ? pidsWithCommandContaining(this.tokenFile) : [];
+      // What the wrapper left in its own process group (it was spawned detached, so the group id is its pid) is ours too, with no
+      // reliance on a command line: a shell the dead server had started that stayed in the group (a server killed with `kill -9`
+      // leaves its children behind). The group id is not given to another process while any member lives, so members are ours;
+      // a live process with that pid means the id was reused already, and the group is left alone.
+      const left = isAlive(pid) ? [] : pidsInProcessGroup(pid);
+      const stragglers = [...new Set([...(this.tokenFile ? pidsWithCommandContaining(this.tokenFile) : []), ...left])];
       for (const d of stragglers) signal(d, "SIGTERM");
       this.stopping = (async () => {
         const deadline = Date.now() + 3000;

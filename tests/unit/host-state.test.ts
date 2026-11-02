@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { INITIAL_HOST_STATE, hostView, reduceHost, type HostEffect, type HostEvent, type HostPhase, type HostState } from "../../src/terminal-host/host-state";
+import { INITIAL_HOST_STATE, hostView, reduceHost, type HostEffect, type HostEvent, type HostPhase, type HostState, type LostCause } from "../../src/terminal-host/host-state";
 
-const state = (phase: HostPhase, visible: boolean, error: string | null = null): HostState => ({ phase, visible, error, disposed: false });
+const state = (phase: HostPhase, visible: boolean, error: string | null = null, lostCause: LostCause | null = null): HostState => ({ phase, visible, error, disposed: false, lostCause });
 
 const SHOW_NEW: HostEvent = { type: "show", licenceAccepted: false };
 const SHOW_ACCEPTED: HostEvent = { type: "show", licenceAccepted: true };
@@ -44,15 +44,41 @@ const TRANSITIONS: Row[] = [
   // running
   { name: "running + hide -> running, hidden", from: state("running", true), event: { type: "hide" }, to: state("running", false), effects: [] },
   { name: "running + show while hidden -> running, visible, no start", from: state("running", false), event: SHOW_ACCEPTED, to: state("running", true), effects: [] },
-  { name: "running + page reloaded -> lost", from: state("running", true), event: { type: "page-reloaded" }, to: state("lost", true), effects: [] },
-  { name: "running + page reloaded while hidden -> lost, still hidden", from: state("running", false), event: { type: "page-reloaded" }, to: state("lost", false), effects: [] },
+  { name: "running + page reloaded -> lost (reload)", from: state("running", true), event: { type: "page-reloaded" }, to: state("lost", true, null, "reload"), effects: [] },
+  { name: "running + page reloaded while hidden -> lost, still hidden", from: state("running", false), event: { type: "page-reloaded" }, to: state("lost", false, null, "reload"), effects: [] },
   // lost
-  { name: "lost + dismiss -> running", from: state("lost", true), event: { type: "dismiss-lost" }, to: state("running", true), effects: [] },
+  { name: "lost (reload) + dismiss -> running, nothing owed", from: state("lost", true, null, "reload"), event: { type: "dismiss-lost" }, to: state("running", true), effects: [] },
+  { name: "lost (restart) + dismiss -> running, nothing owed", from: state("lost", true, null, "restart"), event: { type: "dismiss-lost" }, to: state("running", true), effects: [] },
   { name: "lost + hide -> lost, hidden (the notice is still there at the next show)", from: state("lost", true), event: { type: "hide" }, to: state("lost", false), effects: [] },
   { name: "lost + show -> lost, visible, no start", from: state("lost", false), event: SHOW_ACCEPTED, to: state("lost", true), effects: [] },
+  // crashed (PR-7, G13)
+  { name: "crashed + show while hidden -> crashed, visible (the banner), no start", from: state("crashed", false, null, "restart"), event: SHOW_ACCEPTED, to: state("crashed", true, null, "restart"), effects: [] },
+  { name: "crashed + hide -> crashed, hidden", from: state("crashed", true, null, "restart"), event: { type: "hide" }, to: state("crashed", false, null, "restart"), effects: [] },
+  { name: "crashed + retry -> unchanged (only Restart, which the plugin answers, brings a server back)", from: state("crashed", true, null, "restart"), event: { type: "retry" }, to: state("crashed", true, null, "restart"), effects: [] },
+  // the server under the page (PR-7, G13)
+  { name: "running + server crashed -> crashed, page dropped, lost message owed", from: state("running", true), event: { type: "server-crashed" }, to: state("crashed", true, null, "restart"), effects: ["drop-page"] },
+  { name: "running + server crashed while hidden -> crashed, still hidden (the banner is there at the next show)", from: state("running", false), event: { type: "server-crashed" }, to: state("crashed", false, null, "restart"), effects: ["drop-page"] },
+  { name: "lost + server crashed -> crashed, lost message owed", from: state("lost", true, null, "reload"), event: { type: "server-crashed" }, to: state("crashed", true, null, "restart"), effects: ["drop-page"] },
+  { name: "starting + server crashed -> crashed, page dropped, nothing owed (no terminal was shown yet)", from: state("starting", true), event: { type: "server-crashed" }, to: state("crashed", true), effects: ["drop-page"] },
+  { name: "running + server stopped (a restart) -> starting, page dropped, lost message owed, no start yet", from: state("running", true), event: { type: "server-stopped" }, to: state("starting", true, null, "restart"), effects: ["drop-page"] },
+  { name: "lost + server stopped -> starting, lost message owed", from: state("lost", false, null, "reload"), event: { type: "server-stopped" }, to: state("starting", false, null, "restart"), effects: ["drop-page"] },
+  { name: "starting + server stopped -> same state, the page being made is dropped", from: state("starting", true), event: { type: "server-stopped" }, to: state("starting", true), effects: ["drop-page"] },
+  { name: "running + server idle, drawer open -> starting again at once, nothing owed", from: state("running", true), event: { type: "server-idle" }, to: state("starting", true), effects: ["drop-page", "start"] },
+  { name: "running + server idle, drawer hidden -> stopped, nothing owed, starts at the next show", from: state("running", false), event: { type: "server-idle" }, to: state("stopped", false), effects: ["drop-page"] },
+  { name: "lost + server idle, hidden -> stopped, the owed message is cleared", from: state("lost", false, null, "reload"), event: { type: "server-idle" }, to: state("stopped", false), effects: ["drop-page"] },
+  { name: "starting + server idle, hidden -> stopped", from: state("starting", false), event: { type: "server-idle" }, to: state("stopped", false), effects: ["drop-page"] },
+  { name: "crashed + server running -> starting, start (the page comes back; the lost message is still owed)", from: state("crashed", true, null, "restart"), event: { type: "server-running" }, to: state("starting", true, null, "restart"), effects: ["start"] },
+  { name: "crashed + server running after a failed restart -> starting, error cleared", from: state("crashed", true, "no port", "restart"), event: { type: "server-running" }, to: state("starting", true, null, "restart"), effects: ["start"] },
+  { name: "starting + server running -> start (the host skips it when a start is already in flight)", from: state("starting", true, null, "restart"), event: { type: "server-running" }, to: state("starting", true, null, "restart"), effects: ["start"] },
+  { name: "crashed + server failed -> crashed, with the reason", from: state("crashed", true, null, "restart"), event: { type: "server-failed", reason: "x" }, to: state("crashed", true, "x", "restart"), effects: [] },
+  { name: "crashed with a reason + server failed again -> the new reason", from: state("crashed", true, "old", "restart"), event: { type: "server-failed", reason: "x" }, to: state("crashed", true, "x", "restart"), effects: [] },
+  { name: "starting + server failed (a restart whose page was dropped) -> error with the reason, lost message still owed", from: state("starting", true, null, "restart"), event: { type: "server-failed", reason: "x" }, to: state("error", true, "x", "restart"), effects: [] },
+  // ready after a drop
+  { name: "starting + ready with the lost message owed -> lost (restart)", from: state("starting", true, null, "restart"), event: { type: "ready" }, to: state("lost", true, null, "restart"), effects: [] },
+  { name: "error + retry with the lost message owed -> starting, start, still owed", from: state("error", true, "x", "restart"), event: { type: "retry" }, to: state("starting", true, null, "restart"), effects: ["start"] },
 ];
 
-const PHASES: HostPhase[] = ["stopped", "licence", "starting", "error", "running", "lost"];
+const PHASES: HostPhase[] = ["stopped", "licence", "starting", "error", "running", "lost", "crashed"];
 const EVENTS: HostEvent[] = [
   SHOW_NEW,
   SHOW_ACCEPTED,
@@ -64,6 +90,11 @@ const EVENTS: HostEvent[] = [
   { type: "retry" },
   { type: "page-reloaded" },
   { type: "dismiss-lost" },
+  { type: "server-crashed" },
+  { type: "server-stopped" },
+  { type: "server-idle" },
+  { type: "server-running" },
+  { type: "server-failed", reason: "x" },
   { type: "dispose" },
 ];
 
@@ -73,7 +104,7 @@ describe("reduceHost: the transition table", () => {
   });
 
   it("starts with nothing running, hidden and not disposed", () => {
-    expect(INITIAL_HOST_STATE).toEqual({ phase: "stopped", visible: false, error: null, disposed: false });
+    expect(INITIAL_HOST_STATE).toEqual({ phase: "stopped", visible: false, error: null, disposed: false, lostCause: null });
   });
 
   it("every phase, visible or hidden, handles every event, and only the rows above change anything but visibility", () => {
@@ -85,7 +116,7 @@ describe("reduceHost: the transition table", () => {
           const from = state(phase, visible, phase === "error" ? "boom" : null);
           const step = reduceHost(from, event);
           if (event.type === "dispose") {
-            expect(step, `${phase}/${visible} + dispose`).toEqual({ state: { phase: "stopped", visible: false, error: null, disposed: true }, effects: ["teardown"] });
+            expect(step, `${phase}/${visible} + dispose`).toEqual({ state: { phase: "stopped", visible: false, error: null, disposed: true, lostCause: null }, effects: ["teardown"] });
             continue;
           }
           if (listed(from, event)) continue;

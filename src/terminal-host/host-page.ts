@@ -23,6 +23,12 @@ import { LAYOUT_SCRIPT, isPainted, isPanelOnly, parseLayout, type PageLayout } f
 export const STARTING_TEXT = "Starting VS Code server...";
 export const LICENCE_TEXT = "Waiting for the VS Code server licence...";
 export const LOST_TEXT = "Terminals lost: the terminal page was reloaded, so the shells that were running in it may have ended.";
+/** The lost message after a server restart or crash (G13): one sentence, dismissible, with no token in it. */
+export const RESTART_LOST_TEXT = "Your terminals were lost: the VS Code server was restarted, so the shells that were running ended.";
+/** The crash banner in the drawer (G13): the same Restart as a Code tab's banner (CRASH_TEXT), saying the terminals are lost. */
+export const TERMINAL_CRASH_TEXT = "The VS Code server stopped unexpectedly, so your terminals are lost. Restart starts a new server and a fresh terminal.";
+/** A Restart from the crash banner that failed: the banner stays, with the reason (token-free) after this text. */
+export const TERMINAL_RESTART_FAILED_TEXT = "The VS Code server could not be restarted. Try Restart again, or use \"Restart server\" in the plugin settings.";
 export const DECLINED_NOTICE = "VS Code Workbench: the terminal needs the VS Code server licence. It will ask again the next time you open the terminal.";
 export const CANCELLED_TEXT = "The VS Code server start was cancelled.";
 export const NOT_LOADED_TEXT = "The VS Code terminal page did not load.";
@@ -54,6 +60,11 @@ export interface TerminalHostDeps {
   requestLicence(): Promise<boolean>;
   /** The plugin's shared server start (`ensureServer`): one server, one licence modal and one start however many callers. */
   ensureServer(): Promise<RunningServer>;
+  /**
+   * The crash banner's Restart: the plugin's single-flight `restartServer`. It never asks (the server is not running), shows its
+   * own failure notice and rejects when the server cannot start; the host then shows the reason in the banner.
+   */
+  restartServer?(): Promise<void>;
   /** The token-free reason for a failed start (`describeFailure`). */
   failureText(e: unknown): string;
   notice(message: string): void;
@@ -98,6 +109,14 @@ export class TerminalHostPage {
   private readonly container: HTMLElement;
   private readonly status: HTMLElement;
   private readonly banner: HTMLElement;
+  private readonly crashBanner: HTMLElement;
+  /**
+   * Counts the times a page was dropped with its server. A start in flight remembers the count it began at: when the count has
+   * moved the page it was making is gone and it ends without touching the state, which belongs to whatever came after.
+   */
+  private epoch = 0;
+  /** A Restart from the crash banner is under way: a second press shares it. */
+  private restarting = false;
   private page: HostWebview | null = null;
   /** The page finished loading and is panel-only: theme switches may run, and a later dom-ready means a reload. */
   private pageReady = false;
@@ -143,8 +162,22 @@ export class TerminalHostPage {
       background: "var(--background-modifier-error, #a33)",
       color: "var(--text-on-accent, #fff)",
     });
+    this.crashBanner = deps.createElement("div");
+    this.crashBanner.className = "vscode-workbench-terminal-host-crash";
+    Object.assign(this.crashBanner.style, {
+      position: "absolute",
+      top: "0",
+      left: "0",
+      right: "0",
+      zIndex: "3",
+      display: "none",
+      padding: "8px 12px",
+      background: "var(--background-modifier-error, #a33)",
+      color: "var(--text-on-accent, #fff)",
+    });
     c.appendChild(this.status);
     c.appendChild(this.banner);
+    c.appendChild(this.crashBanner);
     deps.parent.appendChild(c);
     this.render();
   }
@@ -227,6 +260,34 @@ export class TerminalHostPage {
     return this.themeSync.set(dark);
   }
 
+  // --- the server under the page (the plugin tells the host what the manager did) ---------------------------------
+
+  /** The server died on its own: the page is dropped and the crash banner with Restart is shown. Nothing restarts. */
+  serverCrashed(): void {
+    this.dispatch({ type: "server-crashed" });
+  }
+
+  /** The server was stopped to be started again (Restart server): the page is dropped and made again when a server runs. */
+  serverStopped(): void {
+    this.dispatch({ type: "server-stopped" });
+  }
+
+  /** The server stopped for being idle: nothing is lost, so nothing is announced; the page is made again at the next show. */
+  serverIdle(): void {
+    this.dispatch({ type: "server-idle" });
+  }
+
+  /** A server is running: a dropped page is made again at the new address and says its terminals were lost. */
+  serverRunning(): void {
+    this.dispatch({ type: "server-running" });
+  }
+
+  /** A restart that nothing in the host started could not start the server. `reason` must be token-free. A start of the host's own reports itself. */
+  serverFailed(reason: string): void {
+    if (this.flow) return;
+    this.dispatch({ type: "server-failed", reason });
+  }
+
   /** The plugin unloads: no webview, container or start is left behind. */
   dispose(): void {
     this.dispatch({ type: "dispose" });
@@ -252,6 +313,12 @@ export class TerminalHostPage {
         // One start at a time: a Retry (or a show) that arrives while one is running shares it.
         if (!this.flow) this.flow = this.runStart();
         break;
+      case "drop-page":
+        // The server under the page is gone: the page and any start making it are abandoned (the start ends by itself, silently).
+        this.epoch++;
+        this.flow = null;
+        this.removePage();
+        break;
       case "notice-declined":
         this.deps.notice(DECLINED_NOTICE);
         break;
@@ -269,21 +336,23 @@ export class TerminalHostPage {
   }
 
   private async runStart(): Promise<void> {
+    const epoch = this.epoch;
+    const abandoned = () => this.state.disposed || this.epoch !== epoch;
     try {
       if (!this.deps.licenceAccepted()) {
         const accepted = await this.deps.requestLicence();
-        if (this.state.disposed) return;
+        if (abandoned()) return;
         if (!accepted) return this.finish({ type: "licence-declined" });
         this.dispatch({ type: "licence-accepted" });
       }
       const server = await this.deps.ensureServer();
-      if (this.state.disposed) return;
+      if (abandoned()) return;
       await this.mount(server);
-      if (this.state.disposed) return;
+      if (abandoned()) return;
       this.finish({ type: "ready" });
       if (this.focusWhenReady && this.state.visible) this.runFocus(); // the drawer opened while the page was loading
     } catch (e) {
-      if (this.state.disposed) return;
+      if (abandoned()) return;
       this.removePage();
       if (e instanceof LicenceDeclinedError) return this.finish({ type: "licence-declined" });
       const reason = e instanceof StartCancelledError ? CANCELLED_TEXT : e instanceof Superseded || e instanceof PageError ? e.message : this.deps.failureText(e);
@@ -421,15 +490,32 @@ export class TerminalHostPage {
     el?.remove();
   }
 
+  /**
+   * The crash banner's Restart. Two presses share one restart. The server's `running` event brings the page back (see
+   * `serverRunning`); a restart that fails reaches the banner through `serverFailed`, so this only has to wait and swallow the
+   * rejection (its notice has been shown). It restarts nothing by itself: only a press gets here.
+   */
+  private async restartFromBanner(): Promise<void> {
+    if (this.restarting || this.state.phase !== "crashed" || !this.deps.restartServer) return;
+    this.restarting = true;
+    try {
+      await this.deps.restartServer();
+    } catch {
+      /* the failure notice was shown and the banner carries the reason */
+    } finally {
+      this.restarting = false;
+    }
+  }
+
   // --- drawing -------------------------------------------------------------------------------------------------
 
   private render(): void {
-    const { phase, visible, error } = this.state;
+    const { phase, visible, error, lostCause } = this.state;
     // Hidden means invisible and inert, in place: the webview is never moved, detached or resized (G17).
     this.container.style.visibility = visible ? "visible" : "hidden";
     this.container.style.pointerEvents = visible ? "auto" : "none";
 
-    const key = `${phase}|${error ?? ""}`;
+    const key = `${phase}|${error ?? ""}|${lostCause ?? ""}`;
     if (key !== this.statusKey) {
       this.statusKey = key;
       this.status.replaceChildren();
@@ -446,11 +532,24 @@ export class TerminalHostPage {
         retry.addEventListener("click", () => this.dispatch({ type: "retry" }));
         this.status.appendChild(retry);
       }
+      this.crashBanner.replaceChildren();
+      this.crashBanner.style.display = phase === "crashed" ? "block" : "none";
+      if (phase === "crashed") {
+        const line = this.deps.createElement("span");
+        line.textContent = error === null ? TERMINAL_CRASH_TEXT : `${TERMINAL_RESTART_FAILED_TEXT} ${error}`;
+        const restart = this.deps.createElement("button");
+        restart.textContent = "Restart";
+        restart.className = "mod-cta";
+        restart.style.marginLeft = "12px";
+        restart.addEventListener("click", () => void this.restartFromBanner());
+        this.crashBanner.appendChild(line);
+        this.crashBanner.appendChild(restart);
+      }
       this.banner.replaceChildren();
       this.banner.style.display = phase === "lost" ? "block" : "none";
       if (phase === "lost") {
         const line = this.deps.createElement("span");
-        line.textContent = LOST_TEXT;
+        line.textContent = lostCause === "restart" ? RESTART_LOST_TEXT : LOST_TEXT;
         const dismiss = this.deps.createElement("button");
         dismiss.textContent = "Dismiss";
         dismiss.style.marginLeft = "12px";

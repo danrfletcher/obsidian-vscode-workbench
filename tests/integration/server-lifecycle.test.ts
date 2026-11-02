@@ -185,6 +185,41 @@ describe("crash (kill -9)", () => {
     expect(m.state).toBe("crashed");
   });
 
+  it("with live shells under the server (FAKE_CODE_SHELLS), kill -9 gives crashed, the crash cleanup ends the shells, a setsid child is left alone, nothing restarts, and Restart gives a new port and token (G13, E6)", async () => {
+    const m = makeManager({ env: { FAKE_CODE_SHELLS: "3", FAKE_CODE_SHELL_KINDS: "sleep,fg,ignore" } });
+    const first = await m.ensureStarted();
+    const listed = () => {
+      const lines = fs.readFileSync(fakePids, "utf8").split("\n").filter(Boolean).map((l) => l.split(" "));
+      return {
+        servers: lines.filter((l) => l.length === 1).map((l) => Number(l[0])),
+        shells: lines.filter((l) => l[0] === "shell").map((l) => Number(l[1])),
+        setsid: lines.filter((l) => l[0] === "setsid").map((l) => Number(l[1])),
+      };
+    };
+    await until(() => {
+      expect(listed().shells).toHaveLength(3);
+      expect(listed().setsid).toHaveLength(1);
+    });
+    const { servers, shells, setsid } = listed();
+    extraPids.push(...setsid, ...shells);
+    for (const pid of shells) expect(isAlive(pid)).toBe(true);
+
+    process.kill(servers[0], "SIGKILL");
+    await until(() => expect(m.state).toBe("crashed"));
+    // the crash cleanup, not the test, ends the shells (the one that ignores SIGTERM takes the stop's grace period)
+    await until(() => expect(shells.filter(isAlive)).toEqual([]));
+    expect(listenersOn(first.port)).toEqual([]);
+    expect(isAlive(setsid[0])).toBe(true); // out of the server's group and session: the documented exception
+    await new Promise((res) => setTimeout(res, 400));
+    expect(m.state).toBe("crashed");
+    expect(listed().servers).toHaveLength(1); // nothing restarted by itself
+
+    const second = await m.restart();
+    expect(m.state).toBe("running");
+    expect(second.port).not.toBe(first.port);
+    expect(second.token).not.toBe(first.token);
+  });
+
   it("a server that stops answering while its process lingers is noticed by the health probe", async () => {
     const m = makeManager({ healthIntervalMs: 100 });
     await m.ensureStarted();

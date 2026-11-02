@@ -7,6 +7,7 @@
 import { Notice } from "./obsidian-shim.mjs";
 import { promptReuseBuild, promptCloseDirty, promptSaveOrDiscard, promptSaveFailed, promptRestartWithDirty } from "../../src/modals";
 import { renderExtensionList, renderExtensionsSection } from "../../src/settings/extensions-section";
+import { TerminalHostPage } from "../../src/terminal-host/host-page";
 
 const TOL = 0.5;
 
@@ -72,7 +73,7 @@ function openPrompt(sc) {
     case "quit-save-failed":
       return promptSaveFailed({}, sc.files);
     case "restart-with-dirty":
-      return promptRestartWithDirty({}, sc.files);
+      return promptRestartWithDirty({}, sc.files, sc.terminalLine ?? null);
     default:
       throw new Error(`unknown prompt ${sc.prompt}`);
   }
@@ -113,6 +114,37 @@ async function run(scenario) {
       // The tone bar is a border: it must differ from the background so the state does not rely on words alone.
       out.bars = [...list.querySelectorAll(".workbench-extension-item")].map((n) => getComputedStyle(n).borderLeftColor);
     }
+  } else if (scenario.kind === "terminal-host") {
+    // The drawer's host page in the phase a scenario names: the real TerminalHostPage draws its own crash banner or lost message
+    // into a drawer-sized box (position, size and colours are the page's own inline styles; the box is the drawer's stand-in).
+    const drawer = document.body.createDiv({ cls: "workbench-render-drawer" });
+    Object.assign(drawer.style, { position: "relative", width: "100%", height: "220px", marginTop: "40px", background: "var(--background-primary)", color: "var(--text-normal)" });
+    const noop = () => undefined;
+    const host = new TerminalHostPage({
+      parent: drawer,
+      createElement: (tag) => document.createElement(tag),
+      vaultRoot: () => "/vault",
+      licenceAccepted: () => true,
+      requestLicence: async () => true,
+      ensureServer: async () => {
+        throw new Error("not used");
+      },
+      failureText: (e) => String(e),
+      notice: noop,
+      isDark: () => document.body.classList.contains("theme-dark"),
+      workbenchOverlay: () => ({}),
+      userDataCopy: () => null,
+      trustVaultFolder: () => false,
+      heldPorts: () => [],
+    });
+    host.state = { phase: scenario.phase, visible: true, error: scenario.error ?? null, disposed: false, lostCause: scenario.lostCause ?? null };
+    host.render();
+    const el = drawer.querySelector(scenario.phase === "crashed" ? ".vscode-workbench-terminal-host-crash" : ".vscode-workbench-terminal-host-lost");
+    if (!el || getComputedStyle(el).display === "none") throw new Error(`the ${scenario.phase} banner is not shown`);
+    out.results.push(measure(el, scenario.phase));
+    out.results.push(measure(drawer, "drawer"));
+    out.buttons = [...el.querySelectorAll("button")].map((b) => b.textContent);
+    out.bannerText = el.textContent;
   } else {
     const answer = openPrompt(scenario);
     void answer;

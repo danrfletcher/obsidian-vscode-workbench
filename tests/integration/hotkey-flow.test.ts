@@ -189,6 +189,13 @@ class FakeHostPage {
   focusTerminal() { this.calls.push("focus-terminal"); }
   view() { return "running"; }
   dispose() { this.calls.push("dispose"); }
+  /** What the server did under the page (PR-7): kept apart from `calls`, which is what the drawer asked. */
+  serverEvents: string[] = [];
+  serverCrashed() { this.serverEvents.push("crashed"); }
+  serverStopped() { this.serverEvents.push("stopped"); }
+  serverIdle() { this.serverEvents.push("idle"); }
+  serverRunning() { this.serverEvents.push("running"); }
+  serverFailed(reason: string) { this.serverEvents.push(`failed: ${reason}`); }
   count(call: string) { return this.calls.filter((c) => c === call).length; }
 }
 let fakeHost: FakeHostPage;

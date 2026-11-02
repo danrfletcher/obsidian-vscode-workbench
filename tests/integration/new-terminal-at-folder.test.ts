@@ -574,14 +574,18 @@ describe("E1: the server cannot start", () => {
     expect(pending()).toEqual([]);
   });
 
-  it("a server that has stopped gets no request", async () => {
+  it("a server that stopped idle under an open drawer: the page is made again on the new server, and the choice goes to that one", async () => {
     await load({}, { serverLicenceAccepted: true });
     await choose(folderOf(INTERNALS));
     for (const f of pending()) fs.rmSync(path.join(requestsDir(), f));
+    const first = inner().manager.current!;
     await inner().manager.stop("idle");
     await choose(folderOf("Café Notes"));
-    // the host page still thinks it is running, but the server is not: nothing is written for a later start to replay
-    expect(pending()).toEqual([]);
+    // PR-7: the page that was under the stopped server is dropped and made again, so the choice reaches a running server and is
+    // written once, to the new server's own data dir (it was never written for a server that had stopped).
+    const second = inner().manager.current!;
+    expect(second.token).not.toBe(first.token);
+    expect(pending()).toHaveLength(1);
   });
 });
 

@@ -133,6 +133,25 @@ function fakeView(o: { file?: string; visible?: boolean; dirty?: boolean; saves?
   return v;
 }
 
+
+/**
+ * Make the plugin's process-table read answer with a server and `n` live terminal shells under its pty host (the shape of
+ * `tests/unit/terminal-keepalive.test.ts`), or fail with `fail`. Returns a counter of the reads.
+ */
+function shellsUnderServer(n: number, fail?: Error): { reads: () => number; set(n: number): void } {
+  const wrapper = (inner().manager.serverInstance as unknown as { pid: number }).pid;
+  let count = n;
+  let reads = 0;
+  (plugin as unknown as { processTable: () => Promise<string> }).processTable = async () => {
+    reads++;
+    if (fail) throw fail;
+    const rows = [`${wrapper} 1 code serve-web`, `${wrapper + 1} ${wrapper} node server-main.js`, `${wrapper + 2} ${wrapper + 1} node bootstrap-fork --type=ptyHost`];
+    for (let i = 0; i < count; i++) rows.push(`${wrapper + 10 + i} ${wrapper + 2} /bin/zsh -il`);
+    return rows.join("\n") + "\n";
+  };
+  return { reads: () => reads, set: (v) => void (count = v) };
+}
+
 /** Wait for the open modal, then run `then` (a button press). */
 let handledModals = 0;
 async function onModal(then: () => void): Promise<void> {
@@ -548,6 +567,82 @@ describe("quit", () => {
     expect(isAlive(w.pid)).toBe(false);
   });
 
+  describe("with live terminal shells (G14)", () => {
+    it("quit with shells and nothing unsaved: no prompt, and the server is stopped", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      const table = shellsUnderServer(2);
+      await quit();
+      expect(Modal.opened).toHaveLength(0);
+      expect(table.reads()).toBe(0); // the shells are not even asked about
+      expect(inner().manager.state).toBe("stopped");
+    });
+
+    it("quit with unsaved buffers keeps the Save / Discard prompt, which does not mention terminals; shells add no second prompt", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(3);
+      const v = fakeView({ file: "estimate.py", dirty: true });
+      const quitting = quit();
+      await onModal(() => {
+        expect(lastModal().contentEl.textContent()).toContain("estimate.py");
+        expect(lastModal().contentEl.textContent().toLowerCase()).not.toContain("terminal");
+        press("Save");
+      });
+      await quitting;
+      expect(Modal.opened).toHaveLength(1);
+      expect(v.saved).toBe(1);
+      expect(inner().manager.state).toBe("stopped");
+    });
+
+    it("the pagehide fallback does the same without a prompt", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      const w = inner().manager.serverInstance as unknown as { pid: number };
+      shellsUnderServer(2);
+      for (const l of windowListeners.pagehide ?? []) l();
+      await vi.waitFor(() => expect(isAlive(w.pid)).toBe(false), { timeout: 5000 });
+      expect(Modal.opened).toHaveLength(0);
+      expect(inner().manager.state).toBe("stopped");
+    });
+
+    it("quit while the server is crashed, failed or stopped is harmless: no prompt, no notice, state stopped", async () => {
+      // crashed
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      process.kill(serverPids()[0], "SIGKILL");
+      await vi.waitFor(() => expect(inner().manager.state).toBe("crashed"), { timeout: 5000 });
+      Notice.reset();
+      await quit();
+      expect(inner().manager.state).toBe("stopped");
+      expect(Modal.opened).toHaveLength(0);
+      expect(Notice.messages).toEqual([]);
+      plugin.onunload();
+
+      // failed
+      fs.rmSync(pidFile, { force: true });
+      Plugin.reset();
+      await load({ FAKE_CODE_MODE: "exit-plain" }, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      expect(inner().manager.state).toBe("failed");
+      Notice.reset();
+      await quit();
+      expect(inner().manager.state).toBe("stopped");
+      expect(Notice.messages).toEqual([]);
+      plugin.onunload();
+      delete process.env.FAKE_CODE_MODE;
+
+      // never started
+      Plugin.reset();
+      await load({}, { serverLicenceAccepted: true });
+      Notice.reset();
+      await quit();
+      expect(inner().manager.state).toBe("stopped");
+      expect(Notice.messages).toEqual([]);
+      expect(Modal.opened).toHaveLength(0);
+    });
+  });
+
   it("while a buffer stays unsaved the server keeps running and the prompt keeps coming back; Escape retries, never discards", async () => {
     await load({}, { serverLicenceAccepted: true });
     await plugin.openSpikeFile();
@@ -837,6 +932,160 @@ describe("restart", () => {
     await s!.button!.handler!();
     expect(inner().manager.state).toBe("running");
     expect(serverPids()).toHaveLength(1);
+  });
+
+  describe("the terminal line (G12)", () => {
+    const restartButton = "Restart and discard changes";
+
+    it("two live shells: the prompt says \"2 terminals will end.\"; Cancel keeps the server, the other shells and the page", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(2);
+      const before = inner().manager.current!;
+      const restarting = plugin.restartServer();
+      await onModal(() => {
+        expect(lastModal().contentEl.textContent()).toContain("Restart the VS Code server?");
+        expect(lastModal().contentEl.textContent()).toContain("2 terminals will end.");
+        expect(lastModal().contentEl.buttons().map((b) => b.text)).toEqual(["Cancel", restartButton]);
+        press("Cancel");
+      });
+      await restarting;
+      expect(inner().manager.current).toBe(before);
+      expect(inner().manager.state).toBe("running");
+      expect(serverPids()).toHaveLength(1);
+    });
+
+    it("one live shell: singular; Escape keeps the server", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(1);
+      const before = inner().manager.current!;
+      const restarting = plugin.restartServer();
+      await onModal(() => {
+        expect(lastModal().contentEl.textContent()).toContain("1 terminal will end.");
+        expect(lastModal().contentEl.textContent()).not.toContain("1 terminals");
+        lastModal().close();
+      });
+      await restarting;
+      expect(inner().manager.current).toBe(before);
+      expect(serverPids()).toHaveLength(1);
+    });
+
+    it("confirming restarts once: one new server, one prompt", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(3);
+      const before = inner().manager.current!;
+      const restarting = plugin.restartServer();
+      await onModal(() => press(restartButton));
+      await restarting;
+      expect(Modal.opened).toHaveLength(1);
+      expect(inner().manager.current!.token).not.toBe(before.token);
+      expect(serverPids()).toHaveLength(2);
+    });
+
+    it("unsaved buffers and live shells give ONE prompt with both lines", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      fakeView({ file: "Mock Exams/estimate.py", dirty: true });
+      shellsUnderServer(2);
+      const restarting = plugin.restartServer();
+      await onModal(() => {
+        const text = lastModal().contentEl.textContent();
+        expect(text).toContain("estimate.py has unsaved changes.");
+        expect(text).toContain("2 terminals will end.");
+        press("Cancel");
+      });
+      await restarting;
+      expect(Modal.opened).toHaveLength(1);
+      expect(serverPids()).toHaveLength(1);
+    });
+
+    it("shells that cannot be counted, with the page not loaded: no line and no prompt", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(0, new Error("ps failed"));
+      await plugin.restartServer();
+      expect(Modal.opened).toHaveLength(0);
+      expect(serverPids()).toHaveLength(2);
+    });
+
+    it("no live shell and nothing dirty: no prompt, as before", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(0);
+      await plugin.restartServer();
+      expect(Modal.opened).toHaveLength(0);
+    });
+
+    it("a server that crashed is restarted from the crash state with no prompt, shells or not", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      shellsUnderServer(2);
+      process.kill(serverPids()[0], "SIGKILL");
+      await vi.waitFor(() => expect(inner().manager.state).toBe("crashed"), { timeout: 5000 });
+      await plugin.restartServer();
+      expect(Modal.opened).toHaveLength(0);
+      expect(inner().manager.state).toBe("running");
+    });
+
+    it("a server in the failed state is restarted with no prompt", async () => {
+      await load({ FAKE_CODE_MODE: "exit-plain" }, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      expect(inner().manager.state).toBe("failed");
+      delete process.env.FAKE_CODE_MODE;
+      await plugin.restartServer();
+      expect(Modal.opened).toHaveLength(0);
+      expect(inner().manager.state).toBe("running");
+    });
+
+    it("two quick presses (the settings button twice) share one restart and one new server", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      const restart = vi.spyOn(inner().manager, "restart");
+      const first = plugin.restartServer();
+      const second = plugin.restartServer();
+      expect(second).toBe(first);
+      await Promise.all([first, second]);
+      expect(restart).toHaveBeenCalledTimes(1);
+      expect(serverPids()).toHaveLength(2);
+    });
+
+    it("the server crashes while the prompt is open: confirming still restarts, with no exception, no second prompt and no second count", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      const counted = vi.spyOn(plugin as unknown as { liveShellAnswer(): Promise<unknown> }, "liveShellAnswer");
+      const table = shellsUnderServer(2);
+      const restarting = plugin.restartServer();
+      await onModal(async () => {
+        process.kill(serverPids()[0], "SIGKILL");
+        await vi.waitFor(() => expect(inner().manager.state).toBe("crashed"), { timeout: 5000 });
+        table.set(0); // and the shells went with it
+        press(restartButton);
+      });
+      await expect(restarting).resolves.toBeUndefined();
+      expect(Modal.opened).toHaveLength(1);
+      expect(counted).toHaveBeenCalledTimes(1); // the idle poll reads the table on its own; the restart asked once
+      expect(inner().manager.state).toBe("running");
+      expect(serverPids()).toHaveLength(2);
+    });
+
+    it("a shell exits while the prompt is open: the count is not recomputed, and confirming restarts", async () => {
+      await load({}, { serverLicenceAccepted: true });
+      await plugin.openSpikeFile();
+      const counted = vi.spyOn(plugin as unknown as { liveShellAnswer(): Promise<unknown> }, "liveShellAnswer");
+      const table = shellsUnderServer(2);
+      const restarting = plugin.restartServer();
+      await onModal(() => {
+        table.set(0);
+        expect(lastModal().contentEl.textContent()).toContain("2 terminals will end.");
+        press(restartButton);
+      });
+      await restarting;
+      expect(counted).toHaveBeenCalledTimes(1); // the idle poll reads the table on its own; the restart asked once
+      expect(Modal.opened).toHaveLength(1);
+      expect(serverPids()).toHaveLength(2);
+    });
   });
 });
 
