@@ -7,9 +7,9 @@
  * synchronously, so ten presses in a second leave an open drawer after an odd count, a closed one after an even
  * count, and one shell either way.
  *
- * Focus (GP5e): opening moves focus out of the embed so the next keystrokes reach the terminal; closing from
- * the embed hands focus back to it. Closing from the terminal (its own key) returns focus to the editor through
- * the drawer's close hook (feature.ts), not through here.
+ * Focus (G1): opening moves focus out of the embed so the next keystrokes reach the terminal; closing from
+ * the embed hands focus back to it. Closing from the terminal host page (its bridged key, G16) passes no handle:
+ * the drawer returns focus to the view that had it when it opened (focus-return.ts), not through here.
  */
 
 export type ToggleState = "hidden" | "revealing" | "shown";
@@ -19,7 +19,7 @@ export type ShellProgress = "none" | "starting" | "running" | "ended";
 
 /** The drawer, as the toggle drives it (the terminal feature in the plugin; a fake in the tests). */
 export interface ToggleTarget {
-  /** The reveal command works over the current view (the non-code setting, G11). */
+  /** The reveal command and its hotkey work over the current view. True over every view (G6): only the edge follows the non-code setting. */
   hotkeyEnabled(): boolean;
   readonly isOpen: boolean;
   toggle(): void;

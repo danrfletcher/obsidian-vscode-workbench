@@ -118,10 +118,11 @@ afterEach(async () => {
 });
 
 describe("G2: reveal starts the server behind the licence modal", () => {
-  it("registers the temporary test command, and loading starts nothing", async () => {
+  it("registers the Toggle terminal drawer command (no temporary test command any more), and loading starts nothing", async () => {
     await load();
-    expect(Plugin.commands.map((c) => c.id)).toContain("toggle-terminal-host-test");
-    expect(Plugin.commands.find((c) => c.id === "toggle-terminal-host-test")!.name).toBe("Toggle terminal host (test)");
+    expect(Plugin.commands.map((c) => c.id)).toContain("toggle-terminal-drawer");
+    expect(Plugin.commands.find((c) => c.id === "toggle-terminal-drawer")!.name).toBe("Toggle terminal drawer");
+    expect(Plugin.commands.map((c) => c.id)).not.toContain("toggle-terminal-host-test");
     expect(host()).toBeNull();
     expect(serverPids()).toEqual([]);
     expect(Modal.opened).toHaveLength(0);
@@ -129,7 +130,7 @@ describe("G2: reveal starts the server behind the licence modal", () => {
 
   it("first reveal: the modal first and nothing started or downloaded; after Accept 'Starting...' then the terminal", async () => {
     await load();
-    Plugin.commands.find((c) => c.id === "toggle-terminal-host-test")!.callback!();
+    Plugin.commands.find((c) => c.id === "toggle-terminal-drawer")!.callback!();
     await vi.waitFor(() => expect(Modal.opened).toHaveLength(1));
     await new Promise((r) => setTimeout(r, 200));
     expect(lastModal().contentEl.textContent()).toContain("https://aka.ms/vscode-server-license");

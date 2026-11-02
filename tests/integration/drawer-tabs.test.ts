@@ -217,7 +217,7 @@ describe("killing a shell (G10)", () => {
     expect(root().classList.contains("vscw-open")).toBe(false);
     expect(strip()).not.toBeNull();
     expect(r.feature.drawer?.open).toBe(false);
-    expect((r.data[DRAWER_KEY] as Record<string, { open: boolean }>)["device-aaaa-1111"].open).toBe(false);
+    expect((r.data[DRAWER_KEY] as Record<string, Record<string, unknown>>)["device-aaaa-1111"].open).toBeUndefined(); // the open state is never stored (PR-3)
     expect(px("--vscw-open-height")).toBe(0);
 
     strip().click();
@@ -358,11 +358,11 @@ describe("the non-code toggle (G11, GP6)", () => {
       expect([type, root().hidden, r.feature.hotkeyEnabled()]).toEqual([type, false, true]);
       r.setting.nonCodeDrawer = false;
       r.feature.applyVisibility();
-      expect([type, root().hidden, r.feature.hotkeyEnabled()]).toEqual([type, true, false]);
+      expect([type, root().hidden, r.feature.hotkeyEnabled()]).toEqual([type, true, true]); // PR-3: the hotkey no longer follows the setting
     }
   });
 
-  it("GP6: toggle off hides the strip and drawer and the hotkey, keeps the shells running, and removes the layout offset completely", async () => {
+  it("GP6: toggle off hides the strip and drawer, keeps the shells running, and removes the layout offset completely (the hotkey stays, PR-3)", async () => {
     const r = await opened();
     await addTab();
     r.setting.nonCodeDrawer = false;
@@ -372,9 +372,7 @@ describe("the non-code toggle (G11, GP6)", () => {
     expect(document.body.classList.contains("vscw-terminal-open")).toBe(false);
     expect(px("--vscw-open-height")).toBe(0);
     expect(px("--vscw-status-lift")).toBe(0);
-    expect(r.feature.hotkeyEnabled()).toBe(false);
-    r.feature.toggle();
-    expect(r.feature.drawer?.open).toBe(true); // the hotkey did nothing
+    expect(r.feature.hotkeyEnabled()).toBe(true);
 
     // The shells keep running: output still arrives, and nothing was signalled.
     r.world.spawned[0].child.output("still going");
@@ -422,30 +420,28 @@ describe("the non-code toggle (G11, GP6)", () => {
     expect(r.feature.drawer?.open).toBe(false);
   });
 
-  it("the toggle key is ignored over a note with the toggle off, and the strip is gone to click", async () => {
+  it("the toggle key opens the drawer over a note even with the toggle off (PR-3: explicit actions are not gated)", async () => {
     const r = rig();
     r.feature.mount();
     r.setting.nonCodeDrawer = false;
     r.feature.applyVisibility();
     r.feature.toggle();
     await tick();
-    expect(r.feature.drawer?.open).toBe(false);
-    expect(r.world.spawned).toHaveLength(0);
+    expect(r.feature.drawer?.open).toBe(true);
   });
 
-  it("a restored open drawer starts no shell while it is hidden, and makes the first one when it comes into view", async () => {
+  it("a drawer saved open starts closed, whatever the view (PR-3: the open state is never restored)", async () => {
     const data = { [DRAWER_KEY]: { "device-aaaa-1111": { height: 300, open: true } } };
     const r = rig({ data });
     r.setting.nonCodeDrawer = false;
     r.feature.mount();
     await tick();
-    expect(root().hidden).toBe(true);
+    expect(r.feature.drawer?.open).toBe(false);
     expect(r.world.spawned).toHaveLength(0);
     r.view.type = CODE_VIEW;
     r.feature.applyVisibility();
     await tick();
-    expect(r.world.spawned).toHaveLength(1);
-    expect(tabLabels()).toEqual(["zsh 1"]);
+    expect(r.world.spawned).toHaveLength(0);
   });
 
   it("closing the drawer removes the layout offset completely", async () => {
@@ -577,11 +573,13 @@ describe("the plugin (F1, G11)", () => {
   }
 
   const command = () => Plugin.commands.find((c) => c.id === "toggle-terminal-drawer");
+  const edge = () => document.querySelector(".vscw-edge") as HTMLElement | null;
 
   beforeEach(() => {
     vault = tempDir();
     Plugin.reset();
     Notice.reset();
+    resetPage();
     mostRecent = { view: { getViewType: () => "markdown" } };
     layoutHandlers = [];
     Platform.isDesktopApp = true;
@@ -592,59 +590,81 @@ describe("the plugin (F1, G11)", () => {
     plugin = undefined;
     Platform.isDesktopApp = true;
     await tick();
+    resetPage();
   });
 
-  it("F1: off desktop the plugin adds no drawer, no strip, no command and no status-bar item", async () => {
+  it("F1: off desktop the plugin adds no edge, no command and no status-bar item", async () => {
     Platform.isDesktopApp = false;
     await load();
     expect(command()).toBeUndefined();
-    expect(strip()).toBeNull();
+    expect(edge()).toBeNull();
     expect(Plugin.statusBarItems).toHaveLength(0);
   });
 
-  it("on desktop it registers the command and the strip", async () => {
+  it("on desktop it registers the command and the edge, which has no label and no old strip beside it", async () => {
     await load();
     expect(command()).toBeDefined();
-    expect(strip()).not.toBeNull();
+    expect(edge()).not.toBeNull();
+    expect(edge()!.textContent).toBe("");
+    expect(document.querySelector(".vscw-strip")).toBeNull();
+    expect(document.body.textContent).not.toContain("Terminal");
   });
 
-  it("the command is unavailable over a note with the toggle off, so the hotkey does nothing, and available over a Code tab", async () => {
+  it("G6: with the setting off the edge is hidden over a note, the command stays available, and the edge returns over a Code tab", async () => {
     await load({ nonCodeDrawer: false });
-    const check = command()?.checkCallback as (checking: boolean) => boolean;
-    expect(root().hidden).toBe(true);
-    expect(check(true)).toBe(false);
-    expect(check(false)).toBe(false);
-    expect(q(".vscw-drawer")).not.toBeNull();
-    expect(root().classList.contains("vscw-open")).toBe(false);
+    expect(edge()!.hidden).toBe(true);
+    expect(command()?.checkCallback).toBeUndefined();
+    expect(command()?.callback).toBeTypeOf("function");
 
     mostRecent = { view: { getViewType: () => CODE_VIEW } };
     for (const h of layoutHandlers) h(); // the workspace reports the active tab changed
-    expect(root().hidden).toBe(false);
-    expect(check(true)).toBe(true);
+    expect(edge()!.hidden).toBe(false);
   });
 
   it("changing the setting applies live, with no reload", async () => {
     await load();
-    expect(root().hidden).toBe(false);
+    expect(edge()!.hidden).toBe(false);
     await plugin!.updateSettings({ nonCodeDrawer: false });
-    expect(root().hidden).toBe(true);
-    expect(document.body.classList.contains("vscw-terminal-on")).toBe(false);
+    expect(edge()!.hidden).toBe(true);
     await plugin!.updateSettings({ nonCodeDrawer: true });
-    expect(root().hidden).toBe(false);
-    expect(document.body.classList.contains("vscw-terminal-on")).toBe(true);
+    expect(edge()!.hidden).toBe(false);
   });
 
   it("a sidebar view being active does not count: the most recent main-area tab decides", async () => {
     await load({ nonCodeDrawer: false });
-    expect(root().hidden).toBe(true); // a note, setting off
+    expect(edge()!.hidden).toBe(true); // a note, setting off
     mostRecent = { view: { getViewType: () => CODE_VIEW } };
     for (const h of layoutHandlers) h(); // active-leaf-change, with the file explorer the active view
-    expect(root().hidden).toBe(false);
+    expect(edge()!.hidden).toBe(false);
   });
 
   it("with no main-area leaf at all the setting decides, like any non-code view", async () => {
     mostRecent = null;
     await load({ nonCodeDrawer: false });
-    expect(root().hidden).toBe(true);
+    expect(edge()!.hidden).toBe(true);
+    await plugin!.updateSettings({ nonCodeDrawer: true });
+    expect(edge()!.hidden).toBe(false);
+  });
+
+  it("G6: an open drawer stays open when the setting goes off over a Code tab and the view changes to a note, and when it goes back on", async () => {
+    mostRecent = { view: { getViewType: () => CODE_VIEW } };
+    await load();
+    const drawer = (plugin as unknown as { drawer: { isOpen: boolean; openDrawer(): void } }).drawer;
+    const host = (plugin as unknown as { terminalHostPage(): { show(): void; focusTerminal(): void } }).terminalHostPage();
+    vi.spyOn(host, "show").mockImplementation(() => undefined); // opening for real starts a server (terminal-host.test.ts covers that)
+    vi.spyOn(host, "focusTerminal").mockImplementation(() => undefined);
+    drawer.openDrawer();
+    expect(drawer.isOpen).toBe(true);
+    await plugin!.updateSettings({ nonCodeDrawer: false });
+    mostRecent = { view: { getViewType: () => "markdown" } };
+    for (const h of layoutHandlers) h();
+    expect(edge()!.hidden).toBe(true);
+    expect(drawer.isOpen).toBe(true);
+    expect(document.body.classList.contains("vscw-drawer-open")).toBe(true);
+    expect(document.body.style.getPropertyValue("--vscw-open-height")).toBe("300px");
+    await plugin!.updateSettings({ nonCodeDrawer: true });
+    expect(edge()!.hidden).toBe(false);
+    expect(drawer.isOpen).toBe(true);
+    vi.restoreAllMocks();
   });
 });

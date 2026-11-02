@@ -11,6 +11,7 @@ import { FileSystemAdapter, Notice, Plugin, TFile, WorkspaceLeaf, type MockApp }
 import VSCodeWorkbenchPlugin from "../../src/main";
 import { DrawerUI } from "../../src/terminal/drawer-ui";
 import { HEADROOM, MIN_HEIGHT } from "../../src/terminal/drawer-geometry";
+import { TerminalDrawer } from "../../src/terminal/terminal-drawer";
 import { DRAWER_KEY } from "../../src/terminal/drawer-state";
 import { SAVE_DEBOUNCE_MS, TerminalFeature, type TerminalHost } from "../../src/terminal/feature";
 import type { PreflightResult } from "../../src/terminal/pty-preflight";
@@ -603,18 +604,18 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
   });
 
   describe("per-device state in data.json", () => {
-    it("saves the open state and the dragged height under this device's id", async () => {
+    it("saves the dragged height under this device's id, and never the open state (PR-3)", async () => {
       const r = rig();
       r.feature.mount();
       strip().click();
       handle().dispatchEvent(pointer("pointerdown", { clientY: 600 }));
       window.dispatchEvent(pointer("pointermove", { clientY: 450 }));
       window.dispatchEvent(pointer("pointerup", { buttons: 0 }));
-      expect(r.data[DRAWER_KEY]).toEqual({ [r.id]: { height: 450, open: true } });
+      expect(r.data[DRAWER_KEY]).toEqual({ [r.id]: { height: 450 } });
       await new Promise((res) => setTimeout(res, SAVE_DEBOUNCE_MS + 100));
       expect(r.saves).toBe(1);
       strip().click();
-      expect(r.data[DRAWER_KEY]).toEqual({ [r.id]: { height: 450, open: false } });
+      expect(r.data[DRAWER_KEY]).toEqual({ [r.id]: { height: 450 } });
     });
 
     it("a burst of window resizes writes data.json once, after they stop; the in-memory state is current throughout (PR-6 R4)", async () => {
@@ -647,7 +648,7 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
       expect(r.saves).toBe(1); // the timer was cleared, no second write
     });
 
-    it("restores height and open state after the plugin is reloaded: the drawer comes back open with a fresh shell", async () => {
+    it("restores the height after the plugin is reloaded, but never the open state: the drawer comes back closed with no shell (PR-3)", async () => {
       const first = rig({ id: "device-aaaa-1111" });
       first.feature.mount();
       strip().click();
@@ -660,10 +661,11 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
       const second = rig({ id: "device-aaaa-1111", data: saved, vault: first.vault });
       second.feature.mount();
       await tick();
-      expect(second.feature.drawer?.open).toBe(true);
+      expect(first.feature.drawer).toBeNull(); // disposed
+      expect(second.feature.drawer?.open).toBe(false);
       expect(second.feature.drawer?.currentHeight).toBe(400);
-      expect(root().classList.contains("vscw-open")).toBe(true);
-      expect(second.world.spawned).toHaveLength(1);
+      expect(root().classList.contains("vscw-open")).toBe(false);
+      expect(second.world.spawned).toHaveLength(0);
     });
 
     it("a different device id keeps its own value and starts from the default", async () => {
@@ -679,16 +681,17 @@ describe("the drawer with its shell (G12) and its state (G9)", () => {
       expect(b.feature.drawer?.currentHeight).toBe(300);
       strip().click();
       expect(Object.keys(b.data[DRAWER_KEY] as object).sort()).toEqual(["device-aaaa-1111", "device-bbbb-2222"]);
-      expect((b.data[DRAWER_KEY] as Record<string, { open: boolean }>)["device-aaaa-1111"].open).toBe(true);
+      expect((b.data[DRAWER_KEY] as Record<string, { height: number }>)["device-aaaa-1111"].height).toBe(300);
     });
 
     it("clamps a saved height taller than the window on restore, and corrects the stored value (E14)", async () => {
       setWindowHeight(600);
       const r = rig({ data: { [DRAWER_KEY]: { "device-aaaa-1111": { height: 4000, open: true } } } });
       r.feature.mount();
+      expect(r.feature.drawer?.open).toBe(false); // the saved open flag is ignored
       expect(r.feature.drawer?.currentHeight).toBe(600 - HEADROOM);
+      strip().click();
       expect(px("--vscw-open-height")).toBe(600 - HEADROOM);
-      expect(strip()).not.toBeNull();
       expect((r.data[DRAWER_KEY] as Record<string, { height: number }>)["device-aaaa-1111"].height).toBe(600 - HEADROOM);
       await new Promise((res) => setTimeout(res, SAVE_DEBOUNCE_MS + 100));
       expect(r.saves).toBeGreaterThan(0);
@@ -799,24 +802,27 @@ describe("the command (G8)", () => {
     expect(command.hotkeys).toEqual([{ modifiers: ["Ctrl"], key: "`" }]);
   });
 
-  it("a strip is on the page whenever the plugin is enabled, and the command toggles the drawer", async () => {
+  it("an edge is on the page whenever the plugin is enabled (it has no label), and the command toggles the drawer whatever the view", async () => {
     await load();
-    expect(strip()).not.toBeNull(); // visible over a note with no Code tab open
-    expect(root().classList.contains("vscw-open")).toBe(false);
-    // Opening for real would start a real shell and a real xterm: that path is covered by the rig tests above.
-    const toggle = vi.spyOn(TerminalFeature.prototype, "toggle").mockImplementation(() => undefined);
-    const command = Plugin.commands.find((c) => c.id === "toggle-terminal-drawer") as unknown as { checkCallback: (checking: boolean) => boolean };
-    expect(command.checkCallback(true)).toBe(true); // asking whether it is available does not toggle
-    expect(toggle).not.toHaveBeenCalled();
-    command.checkCallback(false);
-    command.checkCallback(false);
+    const edge = document.querySelector(".vscw-edge") as HTMLElement;
+    expect(edge).not.toBeNull(); // visible over a note with no Code tab open
+    expect(edge.textContent).toBe("");
+    expect(document.querySelector(".vscw-strip")).toBeNull();
+    // Opening for real would start a real server: that path is covered by terminal-host.test.ts. Here only the toggle is watched.
+    const toggle = vi.spyOn(TerminalDrawer.prototype, "toggle").mockImplementation(() => undefined);
+    const command = Plugin.commands.find((c) => c.id === "toggle-terminal-drawer") as unknown as { callback?: () => void; checkCallback?: unknown };
+    expect(command.checkCallback).toBeUndefined(); // an explicit action: never made unavailable by the non-code setting (G6)
+    command.callback!();
+    command.callback!();
     expect(toggle).toHaveBeenCalledTimes(2);
     vi.restoreAllMocks();
   });
 
-  it("disabling the plugin takes the strip and the drawer off the page", async () => {
+  it("disabling the plugin takes the edge and every page variable off the page", async () => {
     await load();
+    expect(document.querySelector(".vscw-edge")).not.toBeNull();
     plugin?.onunload();
-    expect(root()).toBeNull();
+    expect(document.querySelector(".vscw-edge")).toBeNull();
+    expect(document.body.classList.contains("vscw-drawer-on")).toBe(false);
   });
 });

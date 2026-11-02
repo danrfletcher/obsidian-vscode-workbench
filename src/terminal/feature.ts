@@ -154,11 +154,11 @@ export class TerminalFeature {
     this.ui = ui;
     // A saved height taller than this window is corrected in the file as well as on screen (E14).
     if (this.storedHeight(id) !== undefined && this.storedHeight(id) !== initial.height) this.persist(initial);
-    ui.setHidden(!this.visibility().strip);
+    ui.setHidden(!this.visibility().edge);
     ui.mount(doc.body);
   }
 
-  /** What the strip, the drawer and the hotkey do over the view the user is on (G11, GP6). */
+  /** What the strip, the drawer and the hotkey do over the view the user is on (the 0.1.0 drawer, removed in PR-4; the rule is drawer-visibility.ts). */
   visibility(): Visibility {
     return drawerVisibility({
       kind: viewKind(this.host.activeViewType(), this.host.codeViewType),
@@ -194,7 +194,7 @@ export class TerminalFeature {
     const ui = this.ui;
     if (!ui) return;
     const v = this.visibility();
-    ui.setHidden(!v.strip);
+    ui.setHidden(!v.edge);
     if (v.drawer) this.reveal(); // back in view with no shell (the first reveal happened while hidden): make the first one
   }
 

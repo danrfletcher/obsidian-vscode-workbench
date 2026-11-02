@@ -1,3 +1,68 @@
+/* VS Code Workbench: the terminal drawer's bottom edge and the room it takes (the host page is VS Code's own terminal). */
+
+/*
+ * The open drawer takes its height from the main pane area only: the sidebars keep the full window height. The status
+ * bar floats at the bottom right; it is lifted over the drawer only when the drawer reaches that corner. The variables
+ * come from the drawer and its layout controller (terminal-drawer.ts, layout.ts) and are 0 while the drawer is closed.
+ */
+body.vscw-drawer-on .workspace-split.mod-root {
+  margin-bottom: var(--vscw-open-height, 0px);
+}
+
+body.vscw-drawer-on .status-bar {
+  bottom: var(--vscw-status-lift, 0px);
+}
+
+/* The host page: the drawer's body. It is hidden by the plugin (visibility), never resized or moved, so the page stays mounted. */
+.vscode-workbench-terminal-host {
+  position: fixed;
+  left: var(--vscw-left, 0px);
+  width: var(--vscw-width, 100%);
+  bottom: 0;
+  height: var(--vscw-height, 300px);
+  box-sizing: border-box;
+  z-index: var(--layer-status-bar, 20);
+  background: var(--background-primary, #1e1e1e);
+  border-top: 1px solid var(--background-modifier-border, #444);
+}
+
+/* While the edge is dragged, the page under the pointer must not take the move events. */
+body.vscw-terminal-dragging .vscode-workbench-terminal-host {
+  pointer-events: none !important;
+}
+
+body.vscw-terminal-dragging {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: ns-resize;
+}
+
+/*
+ * The bottom edge: a thin line along the bottom of the main pane area (the top of the drawer while it is open). It has no
+ * label or icon. A few px tall so it is easy to hit; the line is 1px until the pointer is on it, then it is the accent colour.
+ */
+.vscw-edge {
+  position: fixed;
+  left: var(--vscw-left, 0px);
+  width: var(--vscw-width, 100%);
+  bottom: max(0px, calc(var(--vscw-open-height, 0px) - 2px));
+  height: 4px;
+  z-index: calc(var(--layer-status-bar, 20) + 1);
+  box-sizing: border-box;
+  cursor: ns-resize;
+  touch-action: none;
+  background: linear-gradient(var(--background-modifier-border, #444), var(--background-modifier-border, #444)) center / 100% 1px no-repeat;
+}
+
+.vscw-edge[hidden] {
+  display: none;
+}
+
+.vscw-edge:hover,
+.vscw-edge.vscw-dragging {
+  background: var(--interactive-accent, #3b82f6);
+}
+
 /* VS Code Workbench: the terminal drawer. xterm's own stylesheet comes first in styles.css (esbuild.config.mjs). */
 
 body.vscw-terminal-on {

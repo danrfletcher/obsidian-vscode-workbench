@@ -297,7 +297,7 @@ export class WorkbenchSettingTab extends PluginSettingTab {
     const s = this.host.workbenchSettings();
     new Setting(el)
       .setName("Terminal drawer over non-code views")
-      .setDesc("Show the terminal strip and drawer over notes, canvas, graph and PDF as well as Code tabs. Off hides the strip, the drawer and the hotkey over those views (shells keep running and the status bar shows how many); a Code tab always has them. Takes effect at once.")
+      .setDesc("Show the thin line at the bottom of the main pane area, which opens the terminal drawer, over notes, canvas, graph and PDF as well as Code tabs. Off hides that line over those views; a Code tab always has it. The hotkey and the Toggle terminal drawer command still open the drawer over any view, and an open drawer stays open. Takes effect at once.")
       .addToggle((t) => {
         t.setValue(s.nonCodeDrawer);
         t.onChange((v) => void this.host.updateSettings({ nonCodeDrawer: v }));

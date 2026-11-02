@@ -1,13 +1,16 @@
 // @vitest-environment jsdom
 /**
- * Ctrl+` from the embed: the toggle state machine against a mocked drawer controller, then the same presses
- * against the real terminal feature (fake emulator and fake helper processes) for shell counts, the window clamp,
- * the red messages and the non-code setting.
+ * Ctrl+` from the embed: the toggle state machine against a mocked drawer controller, the same presses against the
+ * real terminal drawer (PR-3: odd/even counts, blur and focus handoff, the G1 focus-back fallback to the active leaf), and
+ * against the 0.1.0 terminal feature (fake emulator and fake helper processes) until PR-4 removes it.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DrawerToggle, toggleState, type FocusHandle, type ShellProgress, type ToggleTarget } from "../../src/hotkey/drawer-toggle";
 import { CODE_VIEW, featureRig, resetPage, tick, type Rig } from "../feature-rig";
 import { HEADROOM } from "../../src/terminal/drawer-geometry";
+import { FocusReturn } from "../../src/terminal/focus-return";
+import { TerminalDrawer, type DrawerHost } from "../../src/terminal/terminal-drawer";
+import type { HostView } from "../../src/terminal-host/host-state";
 
 /** The drawer controller as PR-6 offers it, reduced to what the toggle drives; the first reveal makes one shell. */
 class FakeDrawer implements ToggleTarget {
@@ -229,18 +232,162 @@ describe("the real terminal feature under hotkey presses", () => {
     expect(r.feature.drawer?.open).toBe(false);
   });
 
-  it("with the non-code setting off the press does nothing over a note, canvas, graph or PDF, and works over a Code tab", async () => {
+  it("with the non-code setting off the press still works over every view (G6: explicit actions are not gated)", async () => {
     r.setting.nonCodeDrawer = false;
     r.feature.applyVisibility();
     const t = new DrawerToggle(r.feature);
-    for (const type of ["markdown", "canvas", "graph", "pdf"]) {
-      r.view.type = type;
-      expect(t.press(), type).toBeNull();
-    }
-    expect(r.feature.drawer?.open).toBe(false);
-    expect(r.feature.sessions.sessions).toHaveLength(0);
-    r.view.type = CODE_VIEW;
+    r.view.type = "markdown";
     expect(t.press()).toBe("revealing");
     expect(r.feature.drawer?.open).toBe(true);
+  });
+});
+
+/** The drawer the plugin uses (PR-3), driven by the same toggle, with a fake host page and fake leaves. */
+describe("the real TerminalDrawer under hotkey presses (G1, E9)", () => {
+  interface Leaf { name: string }
+  const leaves = { a: { name: "a" } as Leaf, b: { name: "b" } as Leaf };
+  let alive: Leaf[];
+  let active: Leaf | null;
+  let focused: string[];
+  let calls: string[];
+  let progress: HostView;
+  let drawer: TerminalDrawer;
+
+  const host: DrawerHost = {
+    show: () => calls.push("show"),
+    hide: () => calls.push("hide"),
+    focusTerminal: () => calls.push("focus-terminal"),
+    view: () => progress,
+  };
+
+  beforeEach(() => {
+    resetPage();
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 900 });
+    alive = [leaves.a, leaves.b];
+    active = leaves.a;
+    focused = [];
+    calls = [];
+    progress = "hidden";
+    drawer = new TerminalDrawer({
+      document,
+      window,
+      host: () => host,
+      initialHeight: 300,
+      saveHeight: () => undefined,
+      viewKind: () => "markdown",
+      nonCodeDrawer: () => false, // the edge is off over this note; the hotkey is not
+      focus: new FocusReturn<Leaf>({
+        activeLeaf: () => active,
+        isAlive: (l) => alive.includes(l),
+        focusLeaf: (l) => focused.push(l.name),
+      }) as FocusReturn<unknown>,
+    });
+    drawer.mount();
+  });
+  afterEach(() => {
+    drawer.dispose();
+    resetPage();
+  });
+
+  it("the toggle is available over every view whatever the setting, and the edge is off", () => {
+    expect(drawer.hotkeyEnabled()).toBe(true);
+    expect((document.querySelector(".vscw-edge") as HTMLElement).hidden).toBe(true);
+    expect(new DrawerToggle(drawer).press()).toBe("revealing");
+    expect(drawer.isOpen).toBe(true);
+  });
+
+  it.each([1, 2, 3, 10, 11])("%i presses end open when odd and closed when even, showing the one host page once per open", (n) => {
+    const t = new DrawerToggle(drawer);
+    for (let i = 0; i < n; i++) t.press();
+    expect(drawer.isOpen).toBe(n % 2 === 1);
+    expect(calls.filter((c) => c === "show")).toHaveLength(Math.ceil(n / 2));
+    expect(calls.filter((c) => c === "hide")).toHaveLength(Math.floor(n / 2));
+  });
+
+  it("opening: the embed gives up focus first, the host is shown, then the terminal takes focus; closing from the embed hands focus back", () => {
+    const embed = new FakeFocus();
+    const t = new DrawerToggle(drawer);
+    embed.blur = () => calls.push("embed-blur");
+    embed.focus = () => calls.push("embed-focus");
+    t.press(embed);
+    expect(calls).toEqual(["embed-blur", "show", "focus-terminal"]);
+    t.press(embed);
+    expect(calls.slice(3)).toEqual(["hide", "embed-focus"]);
+  });
+
+  it("hiding sends focus back to the leaf that had it when the drawer opened, even if another is active now", () => {
+    const t = new DrawerToggle(drawer);
+    t.press(); // remembers a
+    active = leaves.b;
+    t.press();
+    expect(focused).toEqual(["a"]);
+  });
+
+  it("G1: when that leaf is gone, focus goes to the active leaf", () => {
+    const t = new DrawerToggle(drawer);
+    t.press();
+    alive = [leaves.b];
+    active = leaves.b;
+    t.press();
+    expect(focused).toEqual(["b"]);
+  });
+
+  it("with no leaf at all, closing does not throw and focuses nothing", () => {
+    active = null;
+    const t = new DrawerToggle(drawer);
+    t.press();
+    expect(() => t.press()).not.toThrow();
+    expect(focused).toEqual([]);
+  });
+
+  it("the host closing itself (the licence declined) closes the drawer and sends focus back, without a second hide", () => {
+    const t = new DrawerToggle(drawer);
+    t.press();
+    drawer.hostClosed();
+    expect(drawer.isOpen).toBe(false);
+    expect(focused).toEqual(["a"]);
+    expect(calls).not.toContain("hide");
+    expect(t.state).toBe("hidden");
+  });
+
+  it.each<[HostView, string]>([
+    ["hidden", "revealing"],
+    ["stopped", "revealing"],
+    ["licence", "revealing"],
+    ["starting", "revealing"],
+    ["running", "shown"],
+    ["lost", "shown"],
+    ["error", "shown"],
+  ])("with the host page %s the open drawer reads %s", (view, expected) => {
+    progress = view;
+    drawer.openDrawer();
+    expect(toggleState(drawer)).toBe(expected);
+  });
+
+  it("a drawer saved open is not restored: a new drawer starts closed", () => {
+    expect(drawer.isOpen).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it("E9: reopening after the window shrank clamps the height", () => {
+    const t = new DrawerToggle(drawer);
+    t.press();
+    t.press();
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 300 });
+    t.press();
+    expect(drawer.currentHeight).toBe(300 - HEADROOM);
+  });
+});
+
+describe("FocusReturn", () => {
+  it("forgets the remembered leaf after one restore: the next close uses the active leaf", () => {
+    const out: string[] = [];
+    let active: string | null = "x";
+    const f = new FocusReturn<string>({ activeLeaf: () => active, isAlive: () => true, focusLeaf: (l) => out.push(l) });
+    f.remember();
+    active = "y";
+    f.restore();
+    f.restore();
+    expect(out).toEqual(["x", "y"]);
   });
 });

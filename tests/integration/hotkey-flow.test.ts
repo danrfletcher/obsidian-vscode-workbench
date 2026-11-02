@@ -1,33 +1,17 @@
 // @vitest-environment jsdom
 /**
  * The hotkey bridge end to end through the real plugin class (main.ts): the drawer command is registered with its
- * default hotkey, a key relayed from a stub embed page opens the drawer (a real shell from the real Python PTY
- * helper in a temp vault) or runs `switcher:open`, a rebinding is followed live, and the fallback (decision `no`)
- * leaves the strip and the command working. The stub page runs the real page script against synthetic key events
- * and reports back the way the real page does: a console line (webview) or `postMessage` (iframe).
- * Only the terminal emulator (xterm) and Obsidian are stand-ins.
+ * default hotkey, a key relayed from a stub embed page toggles the real TerminalDrawer (the terminal host page behind
+ * it is a recording stand-in, except in the G16 block, which uses the real one) or runs `switcher:open`, a rebinding is
+ * followed live, and the fallback (decision `no`) leaves the edge and the command working. The stub page runs the real
+ * page script against synthetic key events and reports back the way the real page does: a console line (webview) or
+ * `postMessage` (iframe). Only the VS Code page and Obsidian are stand-ins.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FakeTerminalView } from "../fake-terminal-view";
 import { FAKE_CODE, isAlive, tempDir } from "../helpers";
 import { listDescendants } from "../../src/process-utils";
-
-const emulators: FakeTerminalView[] = [];
-/** What the plugin gave each terminal view to find the close key with (the real view reads it on every key). */
-const viewOptions: Array<{ toggleChords?: () => ReadonlyArray<Record<string, unknown>> } | undefined> = [];
-vi.mock("../../src/terminal/xterm-view", async () => {
-  const { FakeTerminalView } = await import("../fake-terminal-view");
-  return {
-    createXtermView: (_host: unknown, options?: (typeof viewOptions)[number]) => {
-      viewOptions.push(options);
-      const v = new FakeTerminalView();
-      emulators.push(v);
-      return v;
-    },
-  };
-});
 
 const VIEW = "vscode-workbench-code";
 const TOGGLE_COMMAND = "obsidian-vscode-workbench:toggle-terminal-drawer";
@@ -44,10 +28,9 @@ let app: any;
 let created: any[];
 let revealed: any[];
 let switcherOpened: number;
-let view: { type: string; file: string | null; instance?: unknown };
+let view: { type: string; file: string | null; instance?: unknown; leaves: unknown[] };
 let custom: Record<string, Array<{ modifiers: string[]; key: string }>>;
 const logged: string[] = [];
-const pids = new Set<number>();
 
 class FakeKey {
   prevented = 0;
@@ -135,6 +118,8 @@ function makeApp(root: string): any {
       getActiveFile: () => null,
       getActiveViewOfType: () => view.instance ?? (view.file ? { file: { path: view.file } } : null),
       getMostRecentLeaf: () => ({ view: { getViewType: () => view.type } }),
+      iterateAllLeaves: (cb: (leaf: unknown) => void) => view.leaves.forEach(cb),
+      setActiveLeaf: () => undefined,
       getLeavesOfType: (type: string) => created.filter((l) => !l.detached && l.viewState?.type === type),
       getLeaf: () => {
         const l = new CodeLeaf();
@@ -181,16 +166,32 @@ class CodeLeaf {
   }
 }
 
-async function loadPlugin(data: Record<string, unknown> = {}): Promise<void> {
+async function loadPlugin(data: Record<string, unknown> = {}, realHost = false): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile });
   app = makeApp(vault);
   plugin = new PluginCtor(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
-  (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, serverLicenceAccepted: true, shellPath: "/bin/sh", ...data };
+  (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, serverLicenceAccepted: true, ...data };
   await plugin.onload();
+  fakeHost = new FakeHostPage();
+  if (!realHost) (plugin as unknown as { terminalHost: unknown }).terminalHost = fakeHost;
 }
 
-const term = () => plugin as unknown as { terminal: import("../../src/terminal/feature").TerminalFeature; manager: { current: { baseUrl: string } | null } };
-const drawerOpen = () => term().terminal.drawer?.open ?? false;
+type DrawerLike = { isOpen: boolean; currentHeight: number };
+const drawer = () => (plugin as unknown as { drawer: DrawerLike }).drawer;
+const drawerOpen = () => drawer().isOpen;
+
+/** A recording stand-in for the terminal host page: what the drawer asks of it, in order. */
+class FakeHostPage {
+  calls: string[] = [];
+  webview: unknown = null;
+  show() { this.calls.push("show"); }
+  hide() { this.calls.push("hide"); }
+  focusTerminal() { this.calls.push("focus-terminal"); }
+  view() { return "running"; }
+  dispose() { this.calls.push("dispose"); }
+  count(call: string) { return this.calls.filter((c) => c === call).length; }
+}
+let fakeHost: FakeHostPage;
 
 async function waitUntil(cond: () => boolean, ms = 10000): Promise<void> {
   const end = Date.now() + ms;
@@ -207,14 +208,16 @@ async function openEmbed(mode: "webview" | "iframe" = "webview"): Promise<StubEm
   return embed;
 }
 
-/** One shell, past its start (the status-bar count includes a shell that is still starting, so count alone no longer says it runs). */
-function shellRunning(): boolean {
-  const m = term().terminal.sessions;
-  return m.count === 1 && m.sessions.every((x: { controller: { state: { kind: string } } }) => x.controller.state.kind === "running");
-}
-
-function rememberShellPids(): void {
-  for (const c of (plugin as unknown as { registry: { list(): Array<{ pid: number; label: string }> } }).registry.list()) if (c.label === "terminal-shell") pids.add(c.pid);
+/** The edge click a user makes: press and release in place. */
+function clickEdge(): void {
+  const edge = document.querySelector(".vscw-edge") as HTMLElement;
+  const at = (type: string, buttons: number) => {
+    const ev = new MouseEvent(type, { bubbles: true, cancelable: true, clientY: 800, button: 0, buttons });
+    Object.defineProperty(ev, "pointerId", { value: 1 });
+    return ev;
+  };
+  edge.dispatchEvent(at("pointerdown", 1));
+  window.dispatchEvent(at("pointerup", 0));
 }
 
 beforeEach(async () => {
@@ -227,9 +230,7 @@ beforeEach(async () => {
   revealed = [];
   switcherOpened = 0;
   custom = {};
-  view = { type: VIEW, file: null };
-  emulators.length = 0;
-  viewOptions.length = 0;
+  view = { type: VIEW, file: null, leaves: [] };
   logged.length = 0;
   mocks.Plugin.reset();
   mocks.Notice.reset();
@@ -239,19 +240,17 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  rememberShellPids();
+  vi.useRealTimers();
   plugin?.onunload();
   await new Promise((r) => setTimeout(r, 400));
-  for (const pid of pids) {
+  const serverPids = fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf8").split("\n").filter(Boolean).map(Number) : [];
+  for (const pid of serverPids) {
     if (!isAlive(pid)) continue;
     for (const d of listDescendants(pid)) {
       try { process.kill(d, "SIGKILL"); } catch { /* gone */ }
     }
     try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
   }
-  pids.clear();
-  const serverPids = fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf8").split("\n").filter(Boolean).map(Number) : [];
-  for (const pid of serverPids) if (isAlive(pid)) process.kill(pid, "SIGKILL");
   for (const k of ["FAKE_CODE_NODE", "FAKE_CODE_PIDFILE"]) delete process.env[k];
   vi.restoreAllMocks();
 });
@@ -265,63 +264,58 @@ describe("the command and its hotkey (G8)", () => {
     expect(`obsidian-vscode-workbench:${cmd.id}`).toBe(TOGGLE_COMMAND);
   });
 
-  it("the command and the strip still open the drawer after the bridge is added (nothing removed)", async () => {
+  it("the command and the edge still open the drawer after the bridge is added (nothing removed)", async () => {
     await loadPlugin();
     await openEmbed();
     const cmd = mocks.Plugin.commands.find((c: any) => c.id === "toggle-terminal-drawer") as any;
-    expect(cmd.checkCallback(true)).toBe(true);
-    cmd.checkCallback(false);
+    cmd.callback();
     expect(drawerOpen()).toBe(true);
-    cmd.checkCallback(false);
+    cmd.callback();
     expect(drawerOpen()).toBe(false);
-    (document.querySelector(".vscw-strip") as HTMLElement).click();
+    clickEdge();
     expect(drawerOpen()).toBe(true);
+    clickEdge();
+    expect(drawerOpen()).toBe(false);
+    expect(fakeHost.count("show")).toBe(2);
   });
 });
 
 describe("Ctrl+` relayed from the embed (webview channel)", () => {
-  it("opens the drawer, consumes the key, and starts one real shell in the active file's folder (G12, GP5b)", async () => {
-    fs.mkdirSync(path.join(vault, "AWS SA Associate Mock Exams/scripts"), { recursive: true });
-    view.file = "AWS SA Associate Mock Exams/scripts/estimate_time.py";
+  it("opens the drawer, consumes the key, and shows the one host page and focuses its terminal (G1)", async () => {
     await loadPlugin();
     const embed = await openEmbed();
     expect(embed.scripts).toHaveLength(1);
     const ev = embed.press({ key: "`", ctrlKey: true });
     expect(ev.prevented).toBe(1); // no backtick typed into the editor
     expect(drawerOpen()).toBe(true);
+    expect(drawer().currentHeight).toBe(300);
     expect(embed.focusCalls).toEqual(["blur"]); // focus leaves the embed so the terminal gets the typing
-    await waitUntil(shellRunning);
-    rememberShellPids();
-    emulators[0].type("pwd\n");
-    await waitUntil(() => emulators[0].text().includes(path.join(vault, "AWS SA Associate Mock Exams/scripts")));
+    expect(fakeHost.calls).toEqual(["show", "focus-terminal"]);
   });
 
-  it("a second press hides it and gives focus back to the embed; a third reveals the same shell, not a new one", async () => {
+  it("a second press hides it and gives focus back to the embed; a third reveals the same host page", async () => {
     await loadPlugin();
     const embed = await openEmbed();
     embed.press({ key: "`", ctrlKey: true });
-    await waitUntil(shellRunning);
-    rememberShellPids();
-    const [firstPid] = [...pids];
     embed.press({ key: "`", ctrlKey: true });
     expect(drawerOpen()).toBe(false);
     expect(embed.focusCalls).toEqual(["blur", "focus"]);
     embed.press({ key: "`", ctrlKey: true });
     expect(drawerOpen()).toBe(true);
-    expect(term().terminal.sessions.sessions).toHaveLength(1);
-    expect([...pids]).toEqual([firstPid]);
+    expect(fakeHost.count("show")).toBe(2);
+    expect((plugin as unknown as { terminalHost: unknown }).terminalHost).toBe(fakeHost); // never replaced
   });
 
-  it("ten presses in a row leave a consistent state and exactly one shell (a held key adds none)", async () => {
+  it("ten presses in a row end closed and a held key adds none; an eleventh ends open (odd/even)", async () => {
     await loadPlugin();
     const embed = await openEmbed();
     for (let i = 0; i < 10; i++) embed.press({ key: "`", ctrlKey: true });
-    for (let i = 0; i < 5; i++) embed.press({ key: "`", ctrlKey: true, repeat: true }); // auto-repeat of the last press
-    await new Promise((r) => setTimeout(r, 50));
     expect(drawerOpen()).toBe(false);
-    expect(term().terminal.sessions.sessions).toHaveLength(1);
-    rememberShellPids();
-    expect(pids.size).toBe(1);
+    expect(fakeHost.count("show")).toBe(5);
+    expect(fakeHost.count("hide")).toBe(5);
+    embed.press({ key: "`", ctrlKey: true });
+    expect(drawerOpen()).toBe(true);
+    expect(fakeHost.count("show")).toBe(6);
   });
 
   it("unrelated keys reach VS Code untouched: Cmd+P, Cmd+S, Ctrl+Space, typing", async () => {
@@ -333,96 +327,39 @@ describe("Ctrl+` relayed from the embed (webview channel)", () => {
     expect(switcherOpened).toBe(0);
   });
 
-  it("with the non-code setting off the key does nothing over a note, and works over a Code tab", async () => {
-    await loadPlugin({ nonCodeDrawer: false });
-    const embed = await openEmbed();
-    view.type = "markdown";
-    embed.press({ key: "`", ctrlKey: true });
-    expect(drawerOpen()).toBe(false);
-    expect(term().terminal.sessions.sessions).toHaveLength(0);
-    view.type = VIEW;
-    embed.press({ key: "`", ctrlKey: true });
-    expect(drawerOpen()).toBe(true);
-  });
-
-  it("a hotkey reveal with python3 missing shows the red message and the same key hides the drawer (E9)", async () => {
-    const saved = process.env.PATH;
-    try {
-      await loadPlugin();
-      const embed = await openEmbed();
-      process.env.PATH = "/nonexistent-path-for-test"; // after the fake server started; the preflight reads it at reveal
-      embed.press({ key: "`", ctrlKey: true });
-      await waitUntil(() => !!document.querySelector(".vscw-message.vscw-error"));
-      expect(document.querySelector(".vscw-message")!.textContent).toMatch(/python3/);
-      embed.press({ key: "`", ctrlKey: true });
-      expect(drawerOpen()).toBe(false);
-    } finally {
-      process.env.PATH = saved;
-    }
-  });
-
-  it("a hotkey reveal with a missing shell binary shows the red message and the same key hides it (E10)", async () => {
-    await loadPlugin({ shellPath: "/no/such/shell" });
-    const embed = await openEmbed();
-    embed.press({ key: "`", ctrlKey: true });
-    await waitUntil(() => !!document.querySelector(".vscw-message.vscw-error"));
-    expect(document.querySelector(".vscw-message")!.textContent).toContain("/no/such/shell");
-    embed.press({ key: "`", ctrlKey: true });
-    expect(drawerOpen()).toBe(false);
-  });
-
   it.each(["markdown", "canvas", "graph", "pdf"])(
-    "with the non-code setting off the command is unavailable over %s, so Obsidian does not consume the key; over a Code tab it is available (C22)",
+    "G6: with the non-code setting off the key and the command still open the drawer over %s, and the open drawer stays open",
     async (type) => {
       await loadPlugin({ nonCodeDrawer: false });
+      const embed = await openEmbed();
       const cmd = mocks.Plugin.commands.find((c: any) => c.id === "toggle-terminal-drawer") as any;
       view.type = type;
-      expect(cmd.checkCallback(true)).toBe(false); // false = the hotkey is not taken, the key goes on to Obsidian
-      expect(cmd.checkCallback(false)).toBe(false);
+      expect(cmd.checkCallback).toBeUndefined(); // never unavailable, so Obsidian takes the key
+      embed.press({ key: "`", ctrlKey: true });
+      expect(drawerOpen()).toBe(true);
+      expect((document.querySelector(".vscw-edge") as HTMLElement).hidden).toBe(true); // only the always-visible edge is off
+      cmd.callback();
       expect(drawerOpen()).toBe(false);
-      expect(term().terminal.sessions.sessions).toHaveLength(0);
-      view.type = VIEW;
-      expect(cmd.checkCallback(true)).toBe(true);
-      cmd.checkCallback(false);
+      cmd.callback();
       expect(drawerOpen()).toBe(true);
     },
   );
 
-  it("a hotkey reveal while a Code tab is focused starts the shell in that file's folder, and a later tab switch does not move it (G12)", async () => {
-    fs.mkdirSync(path.join(vault, "Café Notes"), { recursive: true });
-    fs.mkdirSync(path.join(vault, "other"), { recursive: true });
-    view.file = "Café Notes/my script.py";
-    await loadPlugin();
-    const embed = await openEmbed();
-    embed.press({ key: "`", ctrlKey: true });
-    await waitUntil(shellRunning);
-    rememberShellPids();
-    view.file = "other/b.py"; // the user moves to another tab afterwards
-    emulators[0].type("pwd\n");
-    await waitUntil(() => emulators[0].text().includes(path.join(vault, "Café Notes")));
-    expect(emulators[0].text()).not.toContain(path.join(vault, "other"));
-  });
-
-  describe("keyboard focus when the drawer closes with focus in the terminal (GP5e)", () => {
-    async function revealAndFocusTerminal(embed: StubEmbed): Promise<void> {
-      embed.press({ key: "`", ctrlKey: true });
-      await waitUntil(shellRunning);
-      rememberShellPids();
-      const field = document.createElement("textarea"); // xterm's helper textarea
-      document.querySelector(".vscw-terminal")!.appendChild(field);
-      field.focus();
-      embed.focusCalls.length = 0;
-    }
+  describe("keyboard focus when the drawer closes (G1)", () => {
+    const press = (embed: StubEmbed) => embed.press({ key: "`", ctrlKey: true });
 
     it("over a Code tab the embed gets keyboard focus back (the real CodeView.focusEmbed)", async () => {
       await loadPlugin();
       const embed = await openEmbed();
       const { CodeView } = await import("../../src/code-view");
-      const tab = Object.create(CodeView.prototype) as { frame: unknown };
+      const tab = Object.create(CodeView.prototype) as { frame: unknown; leaf: unknown };
       tab.frame = embed;
+      tab.leaf = { view: tab };
       view.instance = tab;
-      await revealAndFocusTerminal(embed);
-      emulators[0].pressToggleKey(); // Ctrl+` typed in the terminal
+      view.leaves = [tab.leaf];
+      press(embed); // opens, remembering the Code tab's leaf
+      embed.focusCalls.length = 0;
+      (plugin as unknown as { drawer: { close(): void } }).drawer.close(); // closed from inside the terminal: no embed handle
       expect(drawerOpen()).toBe(false);
       expect(embed.focusCalls).toEqual(["focus"]);
     });
@@ -431,21 +368,127 @@ describe("Ctrl+` relayed from the embed (webview channel)", () => {
       await loadPlugin();
       const embed = await openEmbed();
       let focused = 0;
-      view.instance = { editor: { focus: () => void (focused += 1) } };
-      await revealAndFocusTerminal(embed);
-      emulators[0].pressToggleKey();
+      const note: { editor: unknown; leaf?: unknown } = { editor: { focus: () => void (focused += 1) } };
+      note.leaf = { view: note };
+      view.instance = note;
+      view.leaves = [note.leaf];
+      press(embed);
+      (plugin as unknown as { drawer: { close(): void } }).drawer.close();
       expect(drawerOpen()).toBe(false);
       expect(focused).toBe(1);
-      expect(embed.focusCalls).toEqual([]);
+      expect(embed.focusCalls).toEqual(["blur"]); // only the blur on opening
+    });
+
+    it("when the view that had focus is gone, the active leaf gets it", async () => {
+      await loadPlugin();
+      const embed = await openEmbed();
+      let first = 0;
+      let second = 0;
+      const gone: { editor: unknown; leaf?: unknown } = { editor: { focus: () => void (first += 1) } };
+      gone.leaf = { view: gone };
+      const other: { editor: unknown; leaf?: unknown } = { editor: { focus: () => void (second += 1) } };
+      other.leaf = { view: other };
+      view.instance = gone;
+      view.leaves = [gone.leaf, other.leaf];
+      press(embed);
+      view.leaves = [other.leaf]; // the tab was closed while the terminal was up
+      view.instance = other;
+      (plugin as unknown as { drawer: { close(): void } }).drawer.close();
+      expect([first, second]).toEqual([0, 1]);
     });
 
     it("with no view to hand focus to, closing does not throw", async () => {
       await loadPlugin();
       const embed = await openEmbed();
-      await revealAndFocusTerminal(embed);
-      expect(() => emulators[0].pressToggleKey()).not.toThrow();
+      press(embed);
+      expect(() => (plugin as unknown as { drawer: { close(): void } }).drawer.close()).not.toThrow();
       expect(drawerOpen()).toBe(false);
     });
+  });
+});
+
+describe("G16: the bridge inside the terminal host page", () => {
+  /**
+   * The real host page, made by the real plugin path (licence accepted, the fake server running): its webview element is
+   * given the pieces a real <webview> has (`executeJavaScript`, `getURL`), and a stub page that runs the real key script
+   * and reports back as a console line. The plugin's own `attachKeys` wiring decides whether any of it is watched.
+   */
+  async function realHostFrame(): Promise<{ el: HTMLElement; page: StubEmbed; scripts: string[] }> {
+    await loadPlugin({}, true);
+    const server = await plugin.ensureServer();
+    const page = new StubEmbed(server.baseUrl, "webview");
+    (plugin as unknown as { showTerminalHost(): void }).showTerminalHost();
+    const host = () => (plugin as unknown as { terminalHost: { webview: HTMLElement | null } | null }).terminalHost;
+    await waitUntil(() => host()?.webview != null);
+    const el = host()!.webview as HTMLElement & { executeJavaScript?: unknown; getURL?: unknown };
+    const scripts: string[] = [];
+    el.getURL = () => page.getURL();
+    el.executeJavaScript = async (code: string) => {
+      if (code.includes("__vscw_key__")) {
+        scripts.push(code);
+        page.inject(code);
+      }
+      return "seeded";
+    };
+    page.addEventListener("console-message", (ev) => {
+      const msg = Object.assign(new Event("console-message"), { message: ev.message });
+      el.dispatchEvent(msg);
+    });
+    return { el, page, scripts };
+  }
+
+  it("the plugin watches the host page's frame: its script is delivered on dom-ready, and Ctrl+` from inside it closes an open drawer", async () => {
+    const { el, page, scripts } = await realHostFrame();
+    expect((plugin as unknown as { keyRelay: { attachedCount: number } }).keyRelay.attachedCount).toBe(1);
+    el.dispatchEvent(new Event("dom-ready"));
+    expect(scripts).toHaveLength(1);
+    page.load(false); // the page's own window gets the script
+    page.inject(scripts[0]);
+    (plugin as unknown as { drawer: { openDrawer(): void } }).drawer.openDrawer();
+    expect(drawerOpen()).toBe(true);
+    const ev = page.press({ key: "`", ctrlKey: true });
+    expect(ev.prevented).toBe(1);
+    expect(drawerOpen()).toBe(false);
+    // The press from the terminal gave no focus handle to blur/focus: the frame was not touched by the toggle
+    expect(page.focusCalls).toEqual([]);
+    page.press({ key: "`", ctrlKey: true });
+    expect(drawerOpen()).toBe(true);
+  });
+
+  it("the page script carries no token or address, and a line without the page's nonce does not close the drawer", async () => {
+    const { el, scripts } = await realHostFrame();
+    el.dispatchEvent(new Event("dom-ready"));
+    expect(scripts.join("")).not.toMatch(/TOKEN-NOT-FOR-LOGS|127\.0\.0\.1|tkn/);
+    (plugin as unknown as { drawer: { openDrawer(): void } }).drawer.openDrawer();
+    el.dispatchEvent(Object.assign(new Event("console-message"), { message: '__vscw_key__:{"v":1,"action":"toggle-terminal"}' }));
+    el.dispatchEvent(Object.assign(new Event("console-message"), { message: '__vscw_key__:{"v":1,"action":"toggle-terminal","n":"guess"}' }));
+    expect(drawerOpen()).toBe(true);
+  });
+
+  it("a rebinding is followed by the host page within the sync interval (CHORD_SYNC_MS)", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const { el, page, scripts } = await realHostFrame();
+    el.dispatchEvent(new Event("dom-ready"));
+    expect(scripts).toHaveLength(1);
+    custom[TOGGLE_COMMAND] = [{ modifiers: ["Ctrl", "Alt"], key: "j" }];
+    vi.advanceTimersByTime(999);
+    expect(scripts).toHaveLength(1); // not yet
+    vi.advanceTimersByTime(1);
+    expect(scripts).toHaveLength(2);
+    page.load(false);
+    page.inject(scripts[1]);
+    expect(page.press({ key: "`", ctrlKey: true }).prevented).toBe(0);
+    (plugin as unknown as { drawer: { openDrawer(): void } }).drawer.openDrawer();
+    expect(page.press({ key: "j", ctrlKey: true, altKey: true }).prevented).toBe(1);
+    expect(drawerOpen()).toBe(false);
+  });
+
+  it("taking the page down (the plugin unloading) stops watching it", async () => {
+    await realHostFrame();
+    const relay = (plugin as unknown as { keyRelay: { attachedCount: number } }).keyRelay;
+    expect(relay.attachedCount).toBe(1);
+    plugin.onunload();
+    expect(relay.attachedCount).toBe(0);
   });
 });
 
@@ -515,19 +558,6 @@ describe("rebinding and reloads", () => {
     expect(drawerOpen()).toBe(false);
     embed.press({ key: "j", ctrlKey: true, altKey: true });
     expect(drawerOpen()).toBe(true);
-  });
-
-  it("the terminal's own close key is the command's live hotkey list: Ctrl+` by default, the new chord after a rebinding, none when unbound (PR-8 R3)", async () => {
-    await loadPlugin();
-    const embed = await openEmbed();
-    embed.press({ key: "`", ctrlKey: true });
-    await waitUntil(shellRunning);
-    const chordsNow = () => (viewOptions[0]!.toggleChords!() as Array<Record<string, unknown>>).map((c) => [c.ctrl, c.alt, c.shift, c.meta, c.key]);
-    expect(chordsNow()).toEqual([[true, false, false, false, "`"]]);
-    custom[TOGGLE_COMMAND] = [{ modifiers: ["Ctrl", "Alt"], key: "j" }];
-    expect(chordsNow()).toEqual([[true, true, false, false, "j"]]); // no resync needed: read on every key
-    custom[TOGGLE_COMMAND] = [];
-    expect(chordsNow()).toEqual([]);
   });
 
   it("unbinding the command in Obsidian frees the chord for VS Code", async () => {
@@ -622,27 +652,26 @@ describe("the fallback: the recorded decision is `no` (E12, F2)", () => {
     expect(switcherOpened).toBe(0);
   });
 
-  it("the order of the container check: Ctrl+` inside the embed does nothing, then the strip click opens the drawer (E12, C42)", async () => {
+  it("the order of the container check: Ctrl+` inside the embed does nothing, then the edge click opens the drawer (E12, C42)", async () => {
     await loadWithDecisionNo();
     const embed = await openEmbed();
     const ev = embed.press({ key: "`", ctrlKey: true });
     expect(ev.prevented).toBe(0); // the key is left to VS Code, nothing harmful happens
     expect(drawerOpen()).toBe(false);
-    expect(term().terminal.sessions.sessions).toHaveLength(0);
+    expect(fakeHost.calls).toEqual([]);
     expect(embed.focusCalls).toEqual([]);
-    (document.querySelector(".vscw-strip") as HTMLElement).click();
+    clickEdge();
     expect(drawerOpen()).toBe(true);
-    await waitUntil(shellRunning);
-    rememberShellPids();
+    expect(fakeHost.calls).toEqual(["show", "focus-terminal"]);
   });
 
-  it("the strip still opens the drawer, and the command works once a non-embed pane has focus", async () => {
+  it("the edge still opens the drawer, and the command works once a non-embed pane has focus", async () => {
     await loadWithDecisionNo();
     await openEmbed();
-    (document.querySelector(".vscw-strip") as HTMLElement).click();
+    clickEdge();
     expect(drawerOpen()).toBe(true);
     const cmd = mocks.Plugin.commands.find((c: any) => c.id === "toggle-terminal-drawer") as any;
-    cmd.checkCallback(false);
+    cmd.callback();
     expect(drawerOpen()).toBe(false);
   });
 

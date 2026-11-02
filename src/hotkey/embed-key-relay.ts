@@ -16,7 +16,7 @@
  *
  * Nothing here opens a listener on a socket, loads a script from outside, or sends anything out of the process.
  * The decision constant (E12) is asked when the relay is installed: with `no` nothing is installed, no frame is
- * given a script, and the plugin runs on the strip and the hotkey outside the embed.
+ * given a script, and the plugin runs on the bottom edge and the hotkey outside the embed.
  */
 import {
   BRIDGE_ACTION_NAMES,

@@ -12,7 +12,7 @@ import { createClickInterceptor, readMode, type ClickLike, type ExtensionlessMod
 import { describeFailure, type StartFailure } from "./failure-messages";
 import { IdleTimer } from "./idle-timer";
 import { LicenceDeclinedError, LicenceGate } from "./licence";
-import { promptCloseDirty, promptKillShell, promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard, type CloseDirtyRequest } from "./modals";
+import { promptCloseDirty, promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard, type CloseDirtyRequest } from "./modals";
 import { OpenFiles } from "./open-file";
 import { PidFile, sweepOrphans } from "./pidfile";
 import { carryEdits as carryEditsOnDisk, readBaseline as readBaselineOnDisk, statSignature as statSignatureOnDisk, type CarryResult } from "./rename-carry";
@@ -40,15 +40,18 @@ import { profileForInstance, userDataRootFor, type ProfileState } from "./profil
 import type { MirrorRequest, MirrorResult } from "./mirror/mirror";
 import { MirrorStateCache, profileExtensionsFile } from "./server/shared-extensions";
 import { instanceUserDir, profileSeedSource, seedUserData } from "./server/user-data-seed";
-import { dataObject, effectiveShell, readSettings, type WorkbenchSettings } from "./settings/data";
+import { dataObject, readSettings, type WorkbenchSettings } from "./settings/data";
 import { type PortStatus, type SpikeResult } from "./settings/extensions-section";
 import { SPIKE_RESULT } from "./settings/spike-result";
 import { buildExtensionList } from "./settings/extension-list";
 import type { ExtensionListView } from "./settings/extension-states";
 import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
 import { workbenchOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
-import { DEVICE_ID_KEY } from "./terminal/drawer-state";
-import { TerminalFeature } from "./terminal/feature";
+import { DEVICE_ID_KEY, deviceId } from "./terminal/drawer-state";
+import { viewKind } from "./terminal/drawer-visibility";
+import { FocusReturn } from "./terminal/focus-return";
+import { HeightStore } from "./terminal/height-store";
+import { TerminalDrawer } from "./terminal/terminal-drawer";
 import { TerminalHostPage } from "./terminal-host/host-page";
 import { TabRegistry } from "./tab-registry";
 import { decideFile, extensionOf, fileName, opensInCodeTab } from "./text-file-rules";
@@ -75,7 +78,7 @@ interface WorkbenchData extends Partial<WorkbenchSettings> {
   serverLicenceAccepted?: boolean;
   /** The last server build that started: lets an offline re-download after a VS Code update name the change. */
   lastServer?: { commit: string; version: string };
-  /** The terminal drawer's height and open state, per device: `{ [deviceId]: { height, open } }`. */
+  /** The terminal drawer's height, per device: `{ [deviceId]: { height } }`. The open state is never stored. */
   drawer?: unknown;
 }
 
@@ -114,7 +117,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private lastBuild: CodeBuild | null = null;
   /** The instance's settings and keybindings as copied at the last server start; the Code tab seeds its browser profile from it. */
   private copy: UserDataCopy | null = null;
-  private terminal: TerminalFeature | null = null;
+  /** The bottom edge and the drawer: shows, hides and sizes the terminal host page. Null where there is no desktop app. */
+  private drawer: TerminalDrawer | null = null;
+  private heightStore: HeightStore | null = null;
   /** The terminal host page (VS Code's own terminal panel in a webview). Made at the first show, kept mounted until unload. */
   private terminalHost: TerminalHostPage | null = null;
   /** The hotkey bridge: carries Ctrl+` and the quick switcher out of the embed (G8, G1). Null until onload; inactive when the spike decision is `no`. */
@@ -199,52 +204,41 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     });
     this.addSettingTab(new WorkbenchSettingTab(this.app, this, this));
 
-    // The terminal drawer: a strip along the bottom of the window, one shell on the first reveal, more from the +
-    // button. It needs neither a Code tab nor the VS Code server, and it is desktop only (F1). The page is drawn
-    // once the workspace is ready (below).
+    // The terminal drawer: a thin edge along the bottom of the main pane area, and the terminal host page behind it (VS Code's
+    // own terminal). It is desktop only and only in the main window (F7): the edge and the drawer go on this window's
+    // document, so a pop-out window gets neither. The page is drawn once the workspace is ready (below).
     if (Platform.isDesktopApp) {
-      this.terminal = new TerminalFeature({
-        document,
-        window,
-        vaultRoot: () => this.vaultRoot(),
-        activeFile: () => this.activeFilePath(),
+      this.heightStore = new HeightStore({
         data: () => this.data_ as Record<string, unknown>,
         save: () => this.saveData(this.data_),
-        shell: () => effectiveShell(this.workbenchSettings()),
-        runtimeDir: () => this.runtimeDir(),
-        registry: this.registry,
-        deviceStore: {
+        deviceId: deviceId({
           get: () => this.app.loadLocalStorage?.(DEVICE_ID_KEY),
           set: (id) => this.app.saveLocalStorage?.(DEVICE_ID_KEY, id),
-        },
+        }),
+        windowHeight: () => window.innerHeight,
+      });
+      this.drawer = new TerminalDrawer({
+        document,
+        window,
+        host: () => this.terminalHostPage(),
+        initialHeight: this.heightStore.read(),
+        saveHeight: (height) => this.heightStore?.write(height),
+        viewKind: () => viewKind(this.mainViewType(), VIEW_TYPE_CODE),
         nonCodeDrawer: () => this.workbenchSettings().nonCodeDrawer,
-        activeViewType: () => this.mainViewType(),
-        codeViewType: VIEW_TYPE_CODE,
-        addStatusBarItem: () => this.addStatusBarItem(),
-        confirmKill: (title) => promptKillShell(this.app, title),
-        focusEditor: () => this.focusActiveEditor(),
-        toggleChords: () =>
-          resolveChords((id) => this.hotkeysOf(id), this.isMac()).chords.filter((c) => c.action === "toggle-terminal"),
+        focus: new FocusReturn<WorkspaceLeaf>({
+          activeLeaf: () => this.activeLeaf(),
+          isAlive: (leaf) => this.leafIsAlive(leaf),
+          focusLeaf: (leaf) => this.focusLeafView(leaf),
+        }) as FocusReturn<unknown>,
       });
-      this.bridgeToggle = new DrawerToggle(this.terminal);
-      // Temporary: opens and hides the terminal host page so it can be tried before the drawer's edge exists. PR-3 replaces it.
-      this.addCommand({
-        id: "toggle-terminal-host-test",
-        name: "Toggle terminal host (test)",
-        callback: () => this.toggleTerminalHost(),
-      });
+      this.bridgeToggle = new DrawerToggle(this.drawer);
       this.addCommand({
         id: "toggle-terminal-drawer",
         name: "Toggle terminal drawer",
         // Ctrl, not Mod: on macOS Mod is Cmd, and Ctrl+` is the VS Code binding. Rebindable in Obsidian's hotkey settings.
+        // An explicit action: it opens the drawer over every view, whatever the non-code setting says (G6).
         hotkeys: [{ modifiers: ["Ctrl"], key: "`" }],
-        // Over a note, canvas, graph or PDF with the non-code setting off the command is unavailable, so the hotkey does nothing (G11).
-        checkCallback: (checking: boolean) => {
-          const terminal = this.terminal;
-          if (!terminal || !terminal.hotkeyEnabled()) return false;
-          if (!checking) terminal.toggle();
-          return true;
-        },
+        callback: () => this.drawer?.toggle(),
       });
     }
 
@@ -266,7 +260,6 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.registerEvent(
       this.app.workspace.on("css-change", () => {
         void this.themeSync.set(this.isDark());
-        this.terminal?.themeChanged();
         void this.terminalHost?.themeChanged(this.isDark());
       }),
     );
@@ -275,9 +268,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       for (const v of this.views) v.notifyVisible();
       void this.idle.evaluate();
       this.keyRelay?.sync();
-      // The tab the user is on decides whether the strip and drawer show (G11); a moved pane or sidebar changes the drawer's bounds.
-      this.terminal?.applyVisibility();
-      this.terminal?.layoutChanged();
+      // The tab the user is on decides whether the edge shows (G6); a moved pane or sidebar changes the drawer's bounds.
+      this.drawer?.applyVisibility();
+      this.drawer?.layoutChanged();
     };
     this.registerEvent(this.app.workspace.on("active-leaf-change", visibilityChanged));
     this.registerEvent(this.app.workspace.on("layout-change", visibilityChanged));
@@ -306,7 +299,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     // The scan runs in the background in small slices; nothing waits for it.
     this.app.workspace.onLayoutReady(() => {
       if (this.unloaded) return;
-      this.terminal?.mount();
+      this.drawer?.mount();
       this.registerEvent(this.app.vault.on("create", (f) => this.onFileAppeared(f)));
       this.registerEvent(this.app.vault.on("rename", (f) => this.onFileAppeared(f)));
       // Open Code tabs follow the vault (G3): a rename or move re-points the tab, a delete closes it. A modify is
@@ -359,8 +352,11 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     // The terminal host page goes with the plugin: no webview left behind (a start still running is dropped at its next step).
     this.terminalHost?.dispose();
     this.terminalHost = null;
-    // The drawer's shell and its helper go too; the kill signals are sent before this returns.
-    void this.terminal?.dispose();
+    // The edge and the layout variables go off the page, and the drawer height still waiting to be written is written.
+    this.drawer?.dispose();
+    this.drawer = null;
+    this.heightStore?.flush();
+    this.heightStore = null;
     // shutdown() sends its kill signals synchronously; unload does not wait for the exit.
     void this.manager?.shutdown();
   }
@@ -393,10 +389,13 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return manager?.getHotkeys?.(commandId) ?? manager?.getDefaultHotkeys?.(commandId) ?? [];
   }
 
-  /** A bridged chord was pressed inside the embed. Only the action name arrived; nothing is logged. */
+  /** A bridged chord was pressed inside the embed or the terminal host page. Only the action name arrived; nothing is logged. */
   private onBridgedKey(action: BridgeAction, frame: RelayFrame): void {
     if (action === "toggle-terminal") {
-      this.bridgeToggle?.press(frame);
+      // From the terminal page the press gives no focus handle: closing the drawer sends focus back to the view that had it (G1),
+      // not to the webview that is being hidden.
+      const fromTerminal = (frame as unknown) === this.terminalHost?.webview;
+      this.bridgeToggle?.press(fromTerminal ? null : frame);
       return;
     }
     // The quick switcher: the embed gives up focus first so the switcher's search box gets the typing.
@@ -404,10 +403,28 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     (this.app as unknown as { commands?: { executeCommandById?(id: string): boolean } }).commands?.executeCommandById?.("switcher:open");
   }
 
-  /** Keyboard focus back to the editor of the tab the user is on (the drawer closed with focus in the terminal). */
-  private focusActiveEditor(): void {
-    const ws = this.app.workspace as unknown as { getActiveViewOfType?: (t: unknown) => unknown };
-    const view = ws.getActiveViewOfType?.(ItemView);
+  /** The leaf the user is on: the focused one (a sidebar's too), else the last used in the main area. */
+  private activeLeaf(): WorkspaceLeaf | null {
+    const ws = this.app.workspace as unknown as { getActiveViewOfType?: (t: unknown) => { leaf?: WorkspaceLeaf } | null };
+    return ws.getActiveViewOfType?.(ItemView)?.leaf ?? this.app.workspace.getMostRecentLeaf?.() ?? null;
+  }
+
+  /** The leaf is still in the workspace (its tab was not closed). */
+  private leafIsAlive(leaf: WorkspaceLeaf): boolean {
+    let found = false;
+    this.app.workspace.iterateAllLeaves?.((l) => {
+      if (l === leaf) found = true;
+    });
+    return found;
+  }
+
+  /** Keyboard focus into a leaf's view (the drawer hid): a Code tab's embed, or a note's editor. */
+  private focusLeafView(leaf: WorkspaceLeaf): void {
+    const active = document.activeElement as HTMLElement | null;
+    if (active?.tagName === "WEBVIEW") active.blur(); // the terminal page keeps focus otherwise, though it is hidden
+    const ws = this.app.workspace as unknown as { setActiveLeaf?: (l: WorkspaceLeaf, o?: { focus: boolean }) => void };
+    ws.setActiveLeaf?.(leaf, { focus: true });
+    const view = leaf.view as unknown;
     if (view instanceof CodeView) view.focusEmbed();
     else (view as { editor?: { focus?(): void } } | null | undefined)?.editor?.focus?.();
   }
@@ -568,11 +585,13 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       heldPorts: () => this.heldPorts(),
       noteTrustOutcome: (outcome) => this.noteTrustOutcome(outcome),
       mac: this.isMac(),
+      attachKeys: (frame) => this.keyRelay?.attach(frame as unknown as RelayFrame) ?? (() => undefined),
+      closedByHost: () => this.drawer?.hostClosed(),
     });
     return this.terminalHost;
   }
 
-  /** Open the terminal host (internal; PR-3's drawer calls this). Starts the server on the first show. */
+  /** Show the terminal host directly, without the drawer's edge and layout. Starts the server on the first show. */
   showTerminalHost(): void {
     this.terminalHostPage()?.show();
   }
@@ -580,11 +599,6 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   /** Hide the terminal host. The page stays mounted and alive. */
   hideTerminalHost(): void {
     this.terminalHost?.hide();
-  }
-
-  toggleTerminalHost(): void {
-    const host = this.terminalHostPage();
-    if (host) host.toggle();
   }
 
   // --- Starting the server ------------------------------------------------
@@ -844,7 +858,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   async updateSettings(patch: Partial<WorkbenchSettings>): Promise<void> {
     Object.assign(this.data_, patch);
-    this.terminal?.applyVisibility(); // the non-code setting takes effect now, with no reload
+    this.drawer?.applyVisibility(); // the non-code setting takes effect now, with no reload
     await this.saveData(this.data_);
   }
 

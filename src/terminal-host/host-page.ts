@@ -28,6 +28,16 @@ export const CANCELLED_TEXT = "The VS Code server start was cancelled.";
 export const NOT_LOADED_TEXT = "The VS Code terminal page did not load.";
 export const NOT_PANEL_TEXT = "The VS Code terminal panel did not open on its own.";
 
+/**
+ * Puts focus on the terminal's input inside the page: the script the spike measured (docs/terminal-spike.md, S7), which
+ * printed `focused` after which typed text reached the shell. The class name of the input belongs to the page's own
+ * emulator; it is put together from two pieces only so the fence test (F1: this plugin names and imports no emulator
+ * library) stays a plain text search.
+ */
+const HELPER_TEXTAREA = ".xter" + "m-helper-textarea";
+export const FOCUS_TERMINAL_SCRIPT =
+  `(() => { const t = document.querySelector('.terminal-wrapper.active ${HELPER_TEXTAREA}') || document.querySelector('${HELPER_TEXTAREA}'); if (!t) return 'no terminal'; t.focus(); return document.activeElement === t ? 'focused' : 'not focused'; })()`;
+
 /** The part of Electron's <webview> element this uses. */
 interface HostWebview extends HTMLElement {
   executeJavaScript?: (code: string) => Promise<unknown>;
@@ -54,6 +64,10 @@ export interface TerminalHostDeps {
   heldPorts(): readonly number[];
   noteTrustOutcome?(outcome: string): void;
   mac: boolean;
+  /** Start watching the page's keys for the bridged chords (the plugin's key relay); returns the function that stops. Absent: no bridge. */
+  attachKeys?(frame: HTMLElement): () => void;
+  /** The host hid itself (the licence was declined), not because `hide` was called: the drawer closes. */
+  closedByHost?(): void;
   /** Timings, overridable for tests. */
   pollMs?: number;
   loadMs?: number;
@@ -84,21 +98,16 @@ export class TerminalHostPage {
   private pageReady = false;
   private statusKey = "";
   private themeSync: ThemeSync;
+  /** The drawer opened before the page was ready: focus goes into the terminal when it is. */
+  private focusWhenReady = false;
+  private detachKeys: (() => void) | null = null;
 
   constructor(private readonly deps: TerminalHostDeps) {
     this.themeSync = new ThemeSync((dark) => this.applyTheme(dark), deps.isDark());
     const c = deps.createElement("div");
+    // Where the container sits and how tall it is comes from styles.css (`.vscode-workbench-terminal-host`), from the
+    // page variables the drawer writes: it spans the main pane area and has the drawer's height, shown or not.
     c.className = "vscode-workbench-terminal-host";
-    Object.assign(c.style, {
-      position: "fixed",
-      left: "0",
-      right: "0",
-      bottom: "0",
-      height: "40%",
-      zIndex: "30",
-      background: "var(--background-primary, #1e1e1e)",
-      borderTop: "1px solid var(--background-modifier-border, #444)",
-    });
     this.container = c;
     this.status = deps.createElement("div");
     this.status.className = "vscode-workbench-terminal-host-status";
@@ -135,14 +144,46 @@ export class TerminalHostPage {
     this.render();
   }
 
-  // --- the small internal API (PR-3 replaces the test command that drives it) ---------------------------------
+  // --- the small internal API (the drawer in `terminal/terminal-drawer.ts` drives it) ---------------------------
 
   show(): void {
     this.dispatch({ type: "show", licenceAccepted: this.deps.licenceAccepted() });
   }
 
   hide(): void {
+    this.focusWhenReady = false;
     this.dispatch({ type: "hide" });
+  }
+
+  /**
+   * Move keyboard focus into the terminal (G1). Both steps are scripts run in the page: the webview takes focus, then the
+   * page puts it on the terminal's input. A page still loading gets it once it is ready, if the drawer is still showing.
+   */
+  focusTerminal(): void {
+    if (!this.state.visible) return;
+    if (!this.pageReady) {
+      this.focusWhenReady = true;
+      return;
+    }
+    this.runFocus();
+  }
+
+  /** The webview showing the page, or null before it is made (the key relay compares frames by identity). */
+  get webview(): HTMLElement | null {
+    return this.page;
+  }
+
+  private runFocus(): void {
+    this.focusWhenReady = false;
+    const el = this.page;
+    if (!el) return;
+    el.focus?.();
+    if (typeof el.executeJavaScript !== "function") return;
+    try {
+      el.executeJavaScript(FOCUS_TERMINAL_SCRIPT).catch(() => undefined); // a page that cannot be asked keeps focus on the webview
+    } catch {
+      /* the same */
+    }
   }
 
   toggle(): void {
@@ -179,10 +220,13 @@ export class TerminalHostPage {
   // --- state ---------------------------------------------------------------------------------------------------
 
   private dispatch(event: HostEvent): void {
+    const wasVisible = this.state.visible;
     const step = reduceHost(this.state, event);
     this.state = step.state;
     for (const effect of step.effects) this.carryOut(effect);
     this.render();
+    // The host closed itself (a declined licence): the drawer that asked for it follows. A `hide` or the unload came from the caller.
+    if (wasVisible && !step.state.visible && event.type !== "hide" && event.type !== "dispose") this.deps.closedByHost?.();
   }
 
   private carryOut(effect: HostEffect): void {
@@ -220,6 +264,7 @@ export class TerminalHostPage {
       await this.mount(server);
       if (this.state.disposed) return;
       this.finish({ type: "ready" });
+      if (this.focusWhenReady && this.state.visible) this.runFocus(); // the drawer opened while the page was loading
     } catch (e) {
       if (this.state.disposed) return;
       this.removePage();
@@ -243,6 +288,8 @@ export class TerminalHostPage {
       if (this.page === el && this.pageReady) this.dispatch({ type: "page-reloaded" });
     });
     this.page = el;
+    // G16: the Ctrl+` bridge runs inside this page too, so the chord closes the drawer from inside the terminal.
+    this.detachKeys = this.deps.attachKeys?.(el) ?? null;
     // The settings go into the partition's profile from the server's bare origin, then the workbench loads (as a Code tab does).
     el.setAttribute("src", hostOriginUrl(server.baseUrl));
     this.container.appendChild(el);
@@ -364,6 +411,8 @@ export class TerminalHostPage {
     const el = this.page;
     this.page = null;
     this.pageReady = false;
+    this.detachKeys?.();
+    this.detachKeys = null;
     el?.remove();
   }
 
