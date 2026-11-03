@@ -1,11 +1,15 @@
 /** The Code tab: one Obsidian tab hosting the VS Code web workbench for one file. */
 import { ItemView, type ViewStateResult, type WorkspaceLeaf } from "obsidian";
-import { DIRTY_SCRIPT, fileDirtyScript } from "./dirty-script";
+import type { KeybindingEntry } from "./chrome-settings";
+import { CHROME_SCRIPT_INSTALLED } from "./chrome-script";
+import { DIRTY_SCRIPT } from "./dirty-script";
 import { decide, resolveChoice, SETTLE_MS, SETTLE_POLL_MS, type AutoSave, type BufferState } from "./dirty-guard";
 import { LicenceDeclinedError } from "./licence";
 import type { CloseDirtyRequest } from "./modals";
+import { buildGoToLineScript, GO_TO_LINE_DONE, GO_TO_LINE_TOTAL_MS } from "./goto-line-script";
 import { fileKey } from "./open-file";
-import { buildFileUri, buildFileUrl } from "./paths";
+import { buildOpenInterceptScript, isOtherEditorReport, OPEN_INTERCEPT_INSTALLED, parseOpenReport, RESTORE_OPEN_SCRIPT, RESTORE_SWITCHED, type OpenReport } from "./open-intercept-script";
+import { authorityOf, buildFileUri, buildFileUrl, normalizeLine, targetOfUri, type EditorTarget } from "./paths";
 import type { CarryResult } from "./rename-carry";
 import type { RunningServer } from "./server";
 import type { ServerState } from "./server-manager";
@@ -27,6 +31,19 @@ export const CODE_TAB_PARTITION = "persist:vscode-workbench";
  * not subject to those headers. Both are kept switchable for the spike.
  */
 export type EmbedElement = "webview" | "iframe";
+
+/**
+ * What hides the parts of the workbench that no setting hides (src/chrome-script.ts) and keeps them hidden: the keybinding overlay
+ * the browser profile's keybindings gain at every load (src/keybinding-overlay.ts: the chords the page script presses and the
+ * disabled layout chords), and the page script that presses them and puts away a bar a command brings back. A host that gives none (or `null`) leaves the tab with
+ * the chrome the settings overlay hides, as in 0.1.0 (F3).
+ */
+export interface ChromeHiding {
+  keybindings: readonly KeybindingEntry[];
+  /** The commands a copied keybinding must not bind to any chord (`unbindCommands()`); unset: none are unbound. */
+  unbind?: readonly string[];
+  script: string;
+}
 
 /** What the view needs from the plugin. */
 export interface CodeViewHost {
@@ -60,8 +77,16 @@ export interface CodeViewHost {
   confirmClose?(request: CloseDirtyRequest): Promise<"save" | "discard" | "cancel">;
   /** Bring a tab to the front and focus it (Cancel on the close prompt). */
   focusTab?(leaf: WorkspaceLeaf): void | Promise<void>;
+  /**
+   * True when `leaf` is the tab the user is on right now. Asked when the workbench page finishes loading: only the active
+   * tab takes keyboard focus then, so a background tab (restored with the layout, or opened behind the active one) does not
+   * steal it. Absent: no tab takes focus on load.
+   */
+  isActiveTab?(leaf: WorkspaceLeaf): boolean;
   /** The plugin's own theme and chrome settings for this load, laid over the browser profile's user settings (G5, G6). */
   workbenchOverlay?(): Record<string, unknown>;
+  /** The chords and the page script that close the side bar, secondary side bar and panel in this load (GP1). Read at every load. */
+  chromeHiding?(): ChromeHiding | null;
   /**
    * The `trustVaultFolder` setting, read at every tab load: true runs the trust seed (G5), false or absent runs
    * nothing and leaves whatever is stored alone (G6).
@@ -80,6 +105,13 @@ export interface CodeViewHost {
   skipCloseGuard?(): boolean;
   /** Open a file in a new Code tab (the file a tab was asked to navigate to while its own unsaved edits were kept). */
   openInNewTab?(file: string): void;
+  /**
+   * A file was opened from inside the editor of `from` (Go to Definition, quick open, a link): open it as a new Obsidian tab beside
+   * `from`, in front, at `line` (null: the cursor stays where the file puts it), or focus the tab that already shows it, or, for a
+   * kind that is not a Code tab or a file outside the vault, do what Obsidian does for that kind. Absent: the tab does not watch for
+   * such opens and the file opens inside the tab as VS Code would (F3).
+   */
+  openFromEditor?(from: WorkspaceLeaf, target: EditorTarget, line: number | null): void | Promise<void>;
   /** The bytes of a vault file now (null if unreadable): taken when a rename leaves unsaved edits bound to the old path. */
   readBaseline?(file: string): Promise<Buffer | null>;
   /**
@@ -169,6 +201,8 @@ export const RESTART_FAILED_TEXT =
 
 interface CodeViewState {
   file?: string;
+  /** Not persisted (`getState` leaves it out): the line a tab opened for a file opened from the editor puts the cursor on. */
+  line?: unknown;
   [key: string]: unknown;
 }
 
@@ -232,10 +266,25 @@ export async function runScriptsInWebview(el: WebviewLike, scripts: readonly str
   return outcomes;
 }
 
+/** Say in the console when the cursor could not be put on a line; the tab is open at the file's own cursor then. */
+export function logGoToLine(outcome: unknown): void {
+  if (outcome === GO_TO_LINE_DONE) console.debug("VS Code Workbench: cursor moved to the requested line");
+  else console.warn(`VS Code Workbench: the cursor was not moved to the requested line (${String(outcome)}); the file is open at its own cursor.`);
+}
+
 /** Say in the console how the browser-profile seed went, so a seed that quietly stops working can be seen. */
 export function logSeedOutcome(outcome: unknown): void {
   if (outcome === "seeded") console.debug("VS Code Workbench: browser profile seeded");
   else console.warn(`VS Code Workbench: the browser profile seed did not apply (${String(outcome)}); the workbench opens with its own defaults, so extension update checks, experiments and telemetry may not be switched off for this tab.`);
+}
+
+/**
+ * Say in the console how the chrome-hiding script went. Anything but the install answer (the page never reported dom-ready, the
+ * script threw, the webview cannot run scripts) leaves the parts the settings cannot hide on screen, so it is said once per load.
+ */
+export function logChromeOutcome(outcome: unknown): void {
+  if (outcome === CHROME_SCRIPT_INSTALLED) console.debug("VS Code Workbench: chrome-hiding script installed");
+  else console.warn(`VS Code Workbench: the chrome-hiding script did not run (${String(outcome)}); this tab may show the side bar, secondary side bar or panel of VS Code.`);
 }
 
 /** Say in the console how the trust seed went, the way `logSeedOutcome` does for the settings seed. */
@@ -274,6 +323,18 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
   private closed = false;
   private closing: Promise<void> | null = null;
   private repointing = false;
+  /** The line to put the cursor on once the workbench page has loaded (set by `setState` or `goToLine`), or null. Cleared when a load ends. */
+  private pendingLine: number | null = null;
+  /** The workbench page of the current load has reported dom-ready (the first dom-ready is the server's origin page). */
+  private workbenchReady = false;
+  /**
+   * The page of the current load may hold an editor besides the tab's own file (PR-5 R1). The window title that `bufferState`
+   * reads follows the ACTIVE editor only, so an unsaved editor behind the tab's file would read clean. Set when the open-from-editor
+   * script did not install, or when putting an opened editor away did not end in "pressed" (the unsaved editor stayed, the
+   * close was blocked, timed out or threw), or when the page shows an editor that stays in the tab (an untitled file, user
+   * settings, a file of another server: R7). While set, `bufferState` never answers "clean". Cleared when the page is loaded again.
+   */
+  private mayHoldOtherEditor = false;
   /**
    * Set by a rename of the loaded file: the workbench's buffer stays bound to `from`, the path it was loaded from,
    * while the file is now at `to` (this.file, or the ineligible new name). A save writes the edits to `from`; they are
@@ -353,6 +414,8 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
           return;
         }
         (this.leaf as unknown as { updateHeader?: () => void }).updateHeader?.();
+        const line = (state as CodeViewState).line;
+        this.pendingLine = line === undefined || line === null ? null : normalizeLine(line);
         await this.loadWorkbench();
       }
     }
@@ -460,37 +523,21 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
 
   /**
    * What the workbench in this tab holds: "dirty" or "clean" as the page reports, or "unreadable" when the
-   * page cannot be asked (not loaded yet, an iframe, the script fails or does not answer). A tab with no
-   * file has nothing to lose and is "clean".
+   * page cannot be asked (not loaded yet, an iframe, the script fails or does not answer, or the window title that
+   * carries the signal is not there: `DIRTY_SCRIPT` throws then). The page reports the tab's one file: the
+   * title's dirty mark follows the active editor, and a tab holds one file. A tab with no file has nothing to lose
+   * and is "clean". While the page may hold another editor behind the tab's file (`mayHoldOtherEditor`) the title
+   * cannot vouch for it, so a title that reads clean is "unreadable" instead (a dirty title is still "dirty").
    */
   async bufferState(): Promise<BufferState> {
     if (!this.file) return "clean";
     const f = this.frame as WebviewLike | null;
     if (!f || typeof f.executeJavaScript !== "function" || !this.domReady) return "unreadable";
     try {
-      return (await withTimeout(f.executeJavaScript(DIRTY_SCRIPT), READ_TIMEOUT_MS)) === true ? "dirty" : "clean";
+      if ((await withTimeout(f.executeJavaScript(DIRTY_SCRIPT), READ_TIMEOUT_MS)) === true) return "dirty";
+      return this.mayHoldOtherEditor ? "unreadable" : "clean";
     } catch {
       return "unreadable";
-    }
-  }
-
-  /**
-   * Like `bufferState`, but for the buffer of ONE file when other editors of the page may be unsaved too. The page-wide
-   * probe stays "dirty" while any editor is unsaved, which would hide a save of this file's own buffer. So when the page
-   * reads dirty, the tab of this file is asked: "clean" only when that tab is found and is not dirty. A tab that is
-   * not found (tab strip hidden by a setting, editor closed), an answer that makes no sense or a failed read keep the
-   * page-wide "dirty": never a guess towards clean.
-   */
-  private async fileState(path: string): Promise<BufferState> {
-    const page = await this.bufferState();
-    if (page !== "dirty") return page;
-    const f = this.frame as WebviewLike | null;
-    if (!f || typeof f.executeJavaScript !== "function") return page;
-    try {
-      const name = path.slice(path.lastIndexOf("/") + 1);
-      return (await withTimeout(f.executeJavaScript(fileDirtyScript(name)), READ_TIMEOUT_MS)) === "clean" ? "clean" : "dirty";
-    } catch {
-      return "dirty";
     }
   }
 
@@ -669,6 +716,47 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     }
   }
 
+  /** The host's overlay for this load; a host that fails to give one leaves the browser profile's own settings (logged), never a blank tab (F3). */
+  private overlay(): Record<string, unknown> {
+    try {
+      return this.host.workbenchOverlay?.() ?? {};
+    } catch (e) {
+      console.warn(`VS Code Workbench: the workbench settings were not built (${e instanceof Error ? e.message : String(e)}); this tab opens with VS Code's own layout settings.`);
+      return {};
+    }
+  }
+
+  private async runChromeScript(el: HTMLElement, hiding: ChromeHiding): Promise<void> {
+    const outcome = await runInWebview(el as WebviewLike, hiding.script);
+    if (this.frame === el) logChromeOutcome(outcome); // a reload since has its own script and its own outcome
+  }
+
+  /**
+   * The editor takes keyboard focus on open: when the workbench page's dom-ready fires, the webview is focused if it is still
+   * this tab's current frame (a reload since has replaced it) and this tab is the one the user is on. Obsidian's own
+   * setActiveLeaf({focus:true}) focuses nothing inside an ItemView, so without this typing would not reach the editor.
+   */
+  private focusWhenReady(el: HTMLElement): void {
+    el.addEventListener(
+      "dom-ready",
+      () => {
+        if (this.frame !== el || this.closed) return;
+        if (this.host.isActiveTab?.(this.leaf)) el.focus?.();
+      },
+      { once: true },
+    );
+  }
+
+  /** The chrome-hiding chords and script for this load, or null when the host gives none or fails to build them (logged; the tab opens with the chrome the settings leave). */
+  private chromeHiding(): ChromeHiding | null {
+    try {
+      return this.host.chromeHiding?.() ?? null;
+    } catch (e) {
+      console.warn(`VS Code Workbench: the chrome-hiding script was not built (${e instanceof Error ? e.message : String(e)}); this tab may show the side bar, secondary side bar or panel of VS Code.`);
+      return null;
+    }
+  }
+
   private async restartFromBanner(): Promise<void> {
     const loadsBefore = this.loadCount;
     try {
@@ -691,6 +779,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     this.crashed = false;
     this.stale = false;
     this.domReady = false;
+    this.mayHoldOtherEditor = false; // a new page holds only the tab's own file
     this.dropBridge();
     this.contentEl.empty();
     this.frame = null;
@@ -724,14 +813,24 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
       if (isWebview) {
         // One page, one dom-ready: both seeds run from it, the settings seed first, then the trust seed.
         const trust = this.trustSeedScript(server);
-        const settingsSeed = buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...this.host.workbenchOverlay?.() }, this.host.userDataCopy());
+        const hiding = this.chromeHiding();
+        const settingsSeed = buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...this.overlay() }, this.host.userDataCopy(), hiding?.keybindings, hiding?.unbind);
         const outcomes = await runScriptsInWebview(el as WebviewLike, trust === null ? [settingsSeed] : [settingsSeed, trust]);
         logSeedOutcome(outcomes[0]);
         if (trust !== null) {
           logTrustOutcome(outcomes[1]);
           this.host.noteTrustOutcome?.(String(outcomes[1]));
         }
-        if (this.frame === el) el.setAttribute("src", url);
+        if (this.frame === el) {
+          el.setAttribute("src", url);
+          // The workbench page's own dom-ready (the second this element reports: the first was the server's origin page) runs
+          // the script that closes the parts. Not awaited: a script that fails or times out is logged and changes nothing
+          // else, and the load is finished (F3). The listener is added in the same tick as the navigation, before the event.
+          if (hiding) void this.runChromeScript(el, hiding);
+          if (hiding && this.host.openFromEditor) this.watchOpens(el, authorityOf(server.baseUrl));
+          this.placeCursorOnLoad(el);
+          this.focusWhenReady(el);
+        }
       }
     } catch (e) {
       // A declined licence opens the file in the system app, as the explicit open does (a tab Obsidian
@@ -740,6 +839,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
       // main.ts has already shown the (token-free) reason. A tab is closed rather than left blank; only a
       // tab that was showing the crash banner (its page may hold text to copy) keeps its place and offers Restart.
       this.frame = null;
+      this.pendingLine = null; // a line asked for during a load that failed is not kept for the next one
       this.contentEl.empty();
       if (keepForRestart) {
         this.crashed = true;
@@ -751,6 +851,107 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
       this.loading = false;
       if (!this.closed) void this.afterLoad();
     }
+  }
+
+  /**
+   * A file opened from inside this tab's editor becomes an Obsidian tab of its own (PR-4). The page script reports the new file and
+   * line through the console; the report carries a nonce made for this load. The tab puts the opened editor away, so it shows its
+   * own file at its own cursor again, and hands the file to the host. It never navigates in place.
+   */
+  private watchOpens(el: HTMLElement, authority: string): void {
+    const nonce = globalThis.crypto.randomUUID();
+    el.addEventListener("console-message", (event: Event) => {
+      if (this.frame !== el || this.closed) return;
+      const message = (event as { message?: unknown } | undefined)?.message;
+      // An editor VS Code keeps inside the tab (untitled, settings, output): it may hold typed text behind the tab's file (R7).
+      if (isOtherEditorReport(message, nonce)) this.mayHoldOtherEditor = true;
+      const report = parseOpenReport(message, nonce);
+      if (report) void this.openedFromEditor(el, authority, report);
+    });
+    void runInWebview(el as WebviewLike, buildOpenInterceptScript(nonce)).then((outcome) => {
+      if (this.frame !== el) return;
+      if (outcome !== OPEN_INTERCEPT_INSTALLED) {
+        this.mayHoldOtherEditor = true; // nothing puts an opened editor away, so one may sit behind the tab's file
+        console.warn(`VS Code Workbench: the open-from-editor script did not install (${String(outcome)}); a file opened from this tab's editor opens inside the tab, as VS Code does.`);
+      }
+    });
+  }
+
+  private async openedFromEditor(el: HTMLElement, authority: string, report: OpenReport): Promise<void> {
+    const target = targetOfUri(report.uri, authority, this.host.vaultRoot());
+    if (target.kind === "other") {
+      // Not a file of this server (another authority, say): it opens inside the tab as VS Code does, and may hold typed text there.
+      if (this.frame === el) this.mayHoldOtherEditor = true;
+      return;
+    }
+    // The tab's own file is not "another file" (a spelling of the same path): leave the editor alone.
+    if (target.kind === "vault" && [this.file, this.shownFile].some((own) => own !== "" && fileKey(own) === fileKey(target.file))) return;
+    try {
+      const f = el as WebviewLike;
+      if (typeof f.executeJavaScript === "function") {
+        const restored = await withTimeout(f.executeJavaScript(RESTORE_OPEN_SCRIPT), 3000);
+        if (restored !== "pressed" && this.frame === el) this.mayHoldOtherEditor = true;
+        if (restored === RESTORE_SWITCHED) {
+          // The opened file already held unsaved edits in this tab, so VS Code would not close it without asking. The prompt was
+          // cancelled and the tab shows its own file; the edits stay here (nothing was saved or discarded for the user).
+          console.info("VS Code Workbench: the file opened from the editor has unsaved edits in this tab; they stay in this tab, which shows its own file again.");
+        } else if (restored !== "pressed") {
+          console.warn(`VS Code Workbench: the opened editor was not put away (${String(restored)}); this tab may show the other file too.`);
+        }
+      }
+    } catch (e) {
+      if (this.frame === el) this.mayHoldOtherEditor = true;
+      console.warn(`VS Code Workbench: could not put the opened editor away (${e instanceof Error ? e.message : String(e)}); this tab may show the other file too.`);
+    }
+    try {
+      await this.host.openFromEditor?.(this.leaf, target, report.line);
+    } catch (e) {
+      console.warn(`VS Code Workbench: a file opened from the editor was not opened as a tab (${e instanceof Error ? e.message : String(e)}).`);
+    }
+  }
+
+  /**
+   * The line asked for at load: once the workbench page (the second dom-ready this element reports) has loaded, the page script
+   * moves the cursor. A line asked for before that moment (`goToLine` on a tab still loading its page) waits in `pendingLine` and
+   * is taken here. Best effort; the tab is open either way.
+   */
+  private placeCursorOnLoad(el: HTMLElement): void {
+    this.workbenchReady = false;
+    el.addEventListener(
+      "dom-ready",
+      () => {
+        if (this.frame !== el || this.closed) return;
+        this.workbenchReady = true;
+        const line = this.pendingLine;
+        this.pendingLine = null;
+        if (line !== null) void this.runGoToLine(el as WebviewLike, line);
+      },
+      { once: true },
+    );
+  }
+
+  private async runGoToLine(f: WebviewLike, line: number): Promise<void> {
+    if (typeof f.executeJavaScript !== "function") return logGoToLine("unsupported");
+    try {
+      logGoToLine(await withTimeout(f.executeJavaScript(buildGoToLineScript(line)), GO_TO_LINE_TOTAL_MS));
+    } catch (e) {
+      logGoToLine(`error:${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /**
+   * Put this tab's cursor on `line` (an already-open tab that a file opened from the editor named again, E3; or a restored tab
+   * that has just been loaded). A tab whose workbench page has not loaded yet keeps the line for when it has. A line that is zero, negative or
+   * not a number is line 1, and one past the end of the file is the last line. No-op on an iframe, which cannot be scripted (F5).
+   */
+  async goToLine(line: unknown): Promise<void> {
+    const n = normalizeLine(line);
+    const f = this.frame as WebviewLike | null;
+    if (this.loading || !f || !this.workbenchReady) {
+      this.pendingLine = n;
+      return;
+    }
+    await this.runGoToLine(f, n);
   }
 
   // --- following the vault (G3) --------------------------------------------
@@ -824,12 +1025,11 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
    * Look at the buffer and at the old path of a renamed file, and note whether the tab saved since the last look
    * (R8). A save is the buffer going from dirty to clean while the old path's file changed, because a save writes the
    * file before the buffer reads clean. Edits that are undone (clean again with no write by the tab) leave the file
-   * as it was, so a file put there by something else is never taken for the tab's save. The page-wide probe stays
-   * dirty while ANY editor of the page is unsaved (another file's edits, or a buffer the workbench restored), so the
-   * state is read for this file's own tab (`fileState`): a save of this buffer shows as dirty-to-clean even then.
-   * Only when that tab cannot be found does the page-wide answer stand, and a save is then not seen: it is not
-   * carried (it cannot be told from a write by something else), and settleRename tells the user that the text is in
-   * the old path. Nothing is lost or overwritten. Never throws.
+   * as it was, so a file put there by something else is never taken for the tab's save. The state is the tab's own
+   * (`bufferState`: the window title's dirty mark follows the tab's one file), so unsaved edits of another buffer in
+   * the page do not hide a save of this one. A state that cannot be read ("unreadable") is not counted as a save: it
+   * is not carried (it cannot be told from a write by something else), and settleRename tells the user that the text
+   * is in the old path. Nothing is lost or overwritten. Never throws.
    */
   observeMove(): Promise<void> {
     const look = this.observing.then(() => this.lookAtMove()).catch(() => undefined);
@@ -846,7 +1046,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     if (!from) return;
     const stat = (): Promise<string | null> => this.statOld(from);
     const before = await stat();
-    const state = await this.fileState(from);
+    const state = await this.bufferState();
     if (state === "unreadable") {
       // The buffer was not seen, so a later dirty-to-clean change cannot be matched with the earlier look: it is not
       // counted as a save (R11). A save made in this gap is then reported as "not moved", never carried on a guess.
@@ -922,9 +1122,8 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
    * (the load's end calls this again), while the tab is stopped or crashed (its next load uses the new
    * path), or while the buffer holds unsaved edits or cannot be read: a reload would drop them, so the
    * embed stays on the old buffer, and the move is applied once it is saved (checked when the tab is shown, and at every look of the move watch, so a save made inside the embed applies it within about a second),
-   * after the saved text has been carried from the old path into the renamed file. The reload waits for every
-   * editor of the page to be saved, but the carrying does not: a save of this file's own buffer is carried at once
-   * (`carryHeld`), even while another editor stays unsaved.
+   * after the saved text has been carried from the old path into the renamed file. A save that lands between the
+   * look that found the buffer unsaved and now is carried at once (`carryHeld`), without waiting for the reload.
    * Repeated renames end in one reload to the final path.
    */
   private async repoint(): Promise<void> {
@@ -953,15 +1152,15 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
   }
 
   /**
-   * The page cannot be reloaded (some editor of it is unsaved), but this renamed file's own buffer may have been saved
+   * The reload is held back (the buffer reads unsaved), but this renamed file's own buffer may have been saved
    * meanwhile: its text sits in the old path, where it would stay until the reload. Carry it into the renamed file now.
    * The buffer is still bound to the old path, so the move is remembered again: a later save of it is carried too, and
-   * not left to recreate the old file. Does nothing unless a save was seen and this file's own tab reads clean.
+   * not left to recreate the old file. Does nothing unless a save was seen and the tab now reads clean.
    */
   private async carryHeld(): Promise<void> {
     const move = this.pendingMove;
     if (!move?.saved || this.closed || this.deleted) return;
-    if ((await this.fileState(move.from)) !== "clean") return;
+    if ((await this.bufferState()) !== "clean") return;
     const carried = await this.settleRename();
     if (carried && !this.closed && !this.deleted) this.notePendingMove(this.file);
   }

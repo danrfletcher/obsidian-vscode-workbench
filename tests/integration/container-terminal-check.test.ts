@@ -661,7 +661,7 @@ describe("open-page (T29: nothing in the plugin opens a panel-only page, so the 
     expect(r.opened).toEqual([r.file]); // opened after it was made, not before
     expect(r.commandsRun).toEqual([]);
     const main = fs.readFileSync(path.join(REPO_ROOT, "src", "main.ts"), "utf8");
-    expect(main).toMatch(/\n  async openCodeFile\(file: string\)/); // public: the helper calls it
+    expect(main).toMatch(/\n  async openCodeFile\(file: string[,)]/); // public: the helper calls it
     expect(main).toContain("open a code file first"); // what open-spike-file does with no code file in the vault
   });
 

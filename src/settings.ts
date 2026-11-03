@@ -18,7 +18,8 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { chromeSettings } from "./chrome-settings";
+import { chromeSettings, legacyChromeSettings, type KeybindingEntry } from "./chrome-settings";
+import { KEYBINDING_OVERLAY_JS } from "./keybinding-overlay";
 import { excludeGlobs, EXCLUDE_SETTING_KEYS, writeAtomic } from "./server/user-data-seed";
 import { themeSettings } from "./theme-map";
 import { WORKBENCH_DB_NAME, WORKBENCH_DB_VERSION, WORKBENCH_SETTINGS_KEY, WORKBENCH_USERDATA_STORE } from "./workbench-db";
@@ -42,18 +43,27 @@ export const BROWSER_APP_SETTINGS: Readonly<Record<string, unknown>> = {
 };
 
 /**
- * The plugin's own theme and chrome settings (G5, G6). They are written to the Machine file at every server
- * start and also laid over the browser profile's user settings on every load (`buildBrowserSeedScript`), so
- * a `workbench.colorTheme` or layout setting copied from the chosen instance cannot override them.
+ * The plugin's own theme and chrome settings (G5, G6): the settings that hide every part but the editor, and the Zen Mode
+ * overrides (src/chrome-settings.ts). They are written to the Machine file at every server start and also laid over the browser
+ * profile's user settings on every load (`buildBrowserSeedScript`), so a `workbench.colorTheme`, tab or layout setting copied from the
+ * chosen instance cannot override them. Same bytes for the same `dark`, on every call.
  */
 export function workbenchOverlay(opts: { dark: boolean }): Record<string, unknown> {
   return { ...themeSettings(opts.dark), ...chromeSettings() };
 }
 
+/**
+ * The overlay of the terminal drawer's host page: its theme and the parts the Code tab hid before the editor-only tab. It does
+ * not carry the Code tab's hiding settings (tab strip, breadcrumbs, Zen overrides: F2), so the drawer is exactly what it was.
+ */
+export function terminalOverlay(opts: { dark: boolean }): Record<string, unknown> {
+  return { ...themeSettings(opts.dark), ...legacyChromeSettings() };
+}
+
 export function buildMachineSettings(opts: { dark: boolean }): Record<string, unknown> {
   return {
     // Theme follows Obsidian light/dark (applied at server start; a running tab is switched live), and the
-    // chrome-hiding settings (src/chrome-settings.ts: only the parts that have a settings switch).
+    // chrome-hiding settings (src/chrome-settings.ts: the settings of every route, and the Zen Mode overrides).
     ...workbenchOverlay(opts),
     // Quiet start: no welcome page. Workspace Trust is left on: the one-time "Trust" click
     // is stored in the Code tab's browser profile (see docs/spike-decision.md).
@@ -71,7 +81,7 @@ export function buildMachineSettings(opts: { dark: boolean }): Record<string, un
  * Write the Machine settings file, regenerating it whole every time: whatever was there before (missing,
  * corrupt, a folder where the file belongs) is replaced, so the output is the same bytes on every call. A
  * write that cannot be done is logged and skipped, never thrown: the tab still opens, with the workbench's
- * own defaults (F11). Only ever writes inside the plugin's own server data dir (F3).
+ * own defaults (F3). Only ever writes inside the plugin's own server data dir (F3).
  */
 export function writeMachineSettings(serverDataDir: string, opts: { dark: boolean }): string {
   const file = path.join(serverDataDir, "data", "Machine", "settings.json");
@@ -134,15 +144,31 @@ export type SeedOutcome = "seeded" | "kept" | "version-mismatch" | "no-store" | 
  * instance's settings, a key set inside the tab, a file that no longer parses, is gone, as the README says.
  * `settings` (the off switches) win over the copy, and keybindings.json is replaced by the copy or removed
  * when the instance has none.
+ *
+ * With `keybindings` (the Code tab's keybinding overlay, src/chrome-settings.ts `overlayKeybindings()`: the chords the chrome page
+ * script presses and the `-command` removals of the disabled layout chords) and `unbind` (the commands a user rule must not bind,
+ * `unbindCommands()`), the overlay is laid over keybindings.json at EVERY load, with or without a copy: over the copy's text on a
+ * new copy, over the stored file otherwise, so a reload (same copy id) keeps it even after the file was edited in the tab. The
+ * user's bytes stay exactly as they were, in any file (missing, empty, `[]`, comments, trailing commas, byte-order mark, or not
+ * JSON at all); src/keybinding-overlay.ts has the layout. Without `keybindings` (the terminal drawer's host page), keybindings.json
+ * is the copy byte for byte, or untouched when there is no copy.
  */
-export function buildBrowserSeedScript(settings: Readonly<Record<string, unknown>> = BROWSER_APP_SETTINGS, copy?: UserDataCopy | null): string {
+export function buildBrowserSeedScript(
+  settings: Readonly<Record<string, unknown>> = BROWSER_APP_SETTINGS,
+  copy?: UserDataCopy | null,
+  keybindings?: readonly KeybindingEntry[],
+  unbind: readonly string[] = [],
+): string {
   const db = WORKBENCH_DB;
   const keybindingsKey = "/User/keybindings.json";
   return `(async () => {
   const ours = ${JSON.stringify(settings)};
   const copy = ${JSON.stringify(copy ?? null)};
+  const chords = ${JSON.stringify(keybindings ?? [])};
+  const unbind = ${JSON.stringify(unbind)};
   const markerKey = ${JSON.stringify(USER_DATA_MARKER_KEY)};
   const stores = ["vscode-userdata-store", "vscode-logs-store", "vscode-filehandles-store"];
+  ${KEYBINDING_OVERLAY_JS}
   let db;
   try {
     db = await new Promise((resolve, reject) => {
@@ -156,11 +182,12 @@ export function buildBrowserSeedScript(settings: Readonly<Record<string, unknown
   }
   try {
     if (!db.objectStoreNames.contains(${JSON.stringify(db.store)})) return "no-store";
-    const existing = await new Promise((resolve, reject) => {
-      const q = db.transaction(${JSON.stringify(db.store)}).objectStore(${JSON.stringify(db.store)}).get(${JSON.stringify(db.settingsKey)});
+    const read = (key) => new Promise((resolve, reject) => {
+      const q = db.transaction(${JSON.stringify(db.store)}).objectStore(${JSON.stringify(db.store)}).get(key);
       q.onsuccess = () => resolve(q.result);
       q.onerror = () => reject(q.error);
     });
+    const existing = await read(${JSON.stringify(db.settingsKey)});
     const applyCopy = copy !== null && (typeof localStorage === "undefined" || localStorage.getItem(markerKey) !== copy.id);
     let merged = Object.assign({}, applyCopy ? copy.settings : {}, ours);
     if (existing !== undefined && !applyCopy) {
@@ -172,11 +199,26 @@ export function buildBrowserSeedScript(settings: Readonly<Record<string, unknown
         merged = Object.assign({}, current, ours);
       }
     }
+    // The overlay (chords and removals) goes into keybindings.json at every load, over the user's text, which stays as it was.
+    // null: no overlay for this host.
+    let overlayText = null;
+    if (chords.length > 0) {
+      const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+      let text = null;
+      if (applyCopy) {
+        if (copy.keybindingsBase64 !== null) text = decoder.decode(Uint8Array.from(atob(copy.keybindingsBase64), (c) => c.charCodeAt(0)));
+      } else {
+        const stored = await read(${JSON.stringify(keybindingsKey)});
+        if (stored !== undefined) text = typeof stored === "string" ? stored : decoder.decode(stored);
+      }
+      overlayText = withOverlay(text, chords, unbind);
+    }
     await new Promise((resolve, reject) => {
       const tx = db.transaction(${JSON.stringify(db.store)}, "readwrite");
       const store = tx.objectStore(${JSON.stringify(db.store)});
       store.put(new TextEncoder().encode(JSON.stringify(merged, null, 2)), ${JSON.stringify(db.settingsKey)});
-      if (applyCopy) {
+      if (overlayText !== null) store.put(new TextEncoder().encode(overlayText), ${JSON.stringify(keybindingsKey)});
+      else if (applyCopy) {
         if (copy.keybindingsBase64 !== null) store.put(Uint8Array.from(atob(copy.keybindingsBase64), (c) => c.charCodeAt(0)), ${JSON.stringify(keybindingsKey)});
         else store.delete(${JSON.stringify(keybindingsKey)});
       }

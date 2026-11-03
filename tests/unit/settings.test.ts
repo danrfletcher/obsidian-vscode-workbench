@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { BROWSER_APP_SETTINGS, USER_DATA_MARKER_KEY, buildBrowserSeedScript, buildMachineSettings, writeMachineSettings, type UserDataCopy } from "../../src/settings";
+import { BROWSER_APP_SETTINGS, USER_DATA_MARKER_KEY, buildBrowserSeedScript, buildMachineSettings, workbenchOverlay, writeMachineSettings, type UserDataCopy } from "../../src/settings";
 import { excludeGlobs, profileSeedSource, seedUserData } from "../../src/server/user-data-seed";
 import { STOP_TEXT, describeAge, describeDisabledLists, describeExtensionsSection, describePort, describeProfile, renderExtensionsSection, type PortStatus, type SpikeResult } from "../../src/settings/extensions-section";
 import { SPIKE_RESULT } from "../../src/settings/spike-result";
@@ -13,6 +13,10 @@ import { findMirroredProfile, type MirroredProfile, type ProfileState } from "..
 import { PROFILES, TOGGLE_PANEL_KEY, TRUST_KEYS, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
 import type { MirrorResult } from "../../src/mirror/mirror";
 import { tempDir } from "../helpers";
+import { fakeIndexedDB, fakeStorage } from "../fake-seed-page";
+import { chromeKeybindings, overlayKeybindings, unbindCommands, type KeybindingEntry } from "../../src/chrome-settings";
+import { OVERLAY_END } from "../../src/keybinding-overlay";
+import { applyOverlay, removeOverlay, rulesOf, type Rule } from "../overlay-runner";
 
 describe("writeMachineSettings", () => {
   it("writes the dark theme and chrome-hiding settings into the plugin's own server data dir", () => {
@@ -80,75 +84,133 @@ describe("application-scoped off switches (F5)", () => {
   });
 });
 
-/** The smallest IndexedDB the seed script touches: one database, named stores, get/put. */
-function fakeIndexedDB(initial: Record<string, unknown> = {}) {
-  const stores = new Map<string, Map<string, unknown>>();
-  const state = { version: 0, opened: [] as [string, number][], closed: 0 };
-  if (Object.keys(initial).length) {
-    stores.set("vscode-userdata-store", new Map(Object.entries(initial)));
-    state.version = 3;
-  }
-  const request = <T>(run: () => T) => {
-    const r: { result?: T; error?: unknown; onsuccess?: () => void; onerror?: () => void } = {};
-    queueMicrotask(() => {
-      r.result = run();
-      r.onsuccess?.();
-    });
-    return r;
-  };
-  const db = {
-    objectStoreNames: { contains: (n: string) => stores.has(n) },
-    createObjectStore: (n: string) => stores.set(n, new Map()),
-    close: () => void state.closed++,
-    transaction: (n: string) => {
-      const tx: { oncomplete?: () => void; onerror?: () => void; objectStore: (x: string) => unknown } = {
-        objectStore: () => ({
-          get: (k: string) => request(() => stores.get(n)?.get(k)),
-          put: (v: unknown, k: string) => {
-            stores.get(n)?.set(k, v);
-            queueMicrotask(() => tx.oncomplete?.());
-          },
-          delete: (k: string) => {
-            stores.get(n)?.delete(k);
-            queueMicrotask(() => tx.oncomplete?.());
-          },
-        }),
-      };
-      return tx;
-    },
-  };
-  const indexedDB = {
-    open: (name: string, version: number) => {
-      state.opened.push([name, version]);
-      const r: { result: typeof db; onupgradeneeded?: () => void; onsuccess?: () => void; error?: unknown; onerror?: () => void } = { result: db };
-      queueMicrotask(() => {
-        if (state.version < version) {
-          state.version = version;
-          r.onupgradeneeded?.();
-        }
-        r.onsuccess?.();
-      });
-      return r;
-    },
-  };
-  return { indexedDB, stores, state };
-}
-
-/** localStorage of the server's origin: survives across seed runs when the same object is passed. */
-function fakeStorage() {
-  const m = new Map<string, string>();
-  return { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v), map: m };
-}
-
-async function runSeed(initial?: Record<string, unknown>, copy?: UserDataCopy | null, storage = fakeStorage()) {
+/** `chords` is the keybinding overlay the Code tab passes (`overlayKeybindings()`); without it the host-page path runs (the terminal drawer). */
+async function runSeed(initial?: Record<string, unknown>, copy?: UserDataCopy | null, storage = fakeStorage(), chords?: readonly KeybindingEntry[], unbind: readonly string[] = chords ? unbindCommands() : []) {
   const fake = fakeIndexedDB(initial);
-  const run = new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${buildBrowserSeedScript(BROWSER_APP_SETTINGS, copy)}`) as (...a: unknown[]) => Promise<string>;
+  const run = new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${buildBrowserSeedScript(BROWSER_APP_SETTINGS, copy, chords, unbind)}`) as (...a: unknown[]) => Promise<string>;
   const outcome = await run(fake.indexedDB, storage, TextEncoder, TextDecoder);
   const raw = fake.stores.get("vscode-userdata-store")?.get("/User/settings.json") as Uint8Array | string | undefined;
   const text = raw === undefined ? undefined : typeof raw === "string" ? raw : new TextDecoder().decode(raw);
   const kb = fake.stores.get("vscode-userdata-store")?.get("/User/keybindings.json") as Uint8Array | undefined;
-  return { outcome, text, keybindings: kb === undefined ? undefined : new TextDecoder().decode(kb), storage, ...fake };
+  // ignoreBOM: a byte-order mark is part of the bytes under test
+  return { outcome, text, keybindings: kb === undefined ? undefined : new TextDecoder("utf-8", { ignoreBOM: true }).decode(kb), storage, ...fake };
 }
+
+describe("the overlay and the Machine settings carry the hiding set (GP1, G5)", () => {
+  const HIDING_KEYS = [
+    "workbench.activityBar.location",
+    "workbench.statusBar.visible",
+    "window.commandCenter",
+    "workbench.layoutControl.enabled",
+    "window.menuBarVisibility",
+    "workbench.editor.showTabs",
+    "workbench.editor.editorActionsLocation",
+    "workbench.editor.enablePreview",
+    "breadcrumbs.enabled",
+    "workbench.secondarySideBar.defaultVisibility",
+    "workbench.panel.defaultLocation",
+  ];
+  const ZEN = { "zenMode.fullScreen": false, "zenMode.silentNotifications": false, "zenMode.centerLayout": false, "zenMode.hideLineNumbers": false };
+
+  it.each([true, false])("dark=%s: every hiding setting and the four Zen overrides, in both the Machine settings and the overlay", (dark) => {
+    for (const settings of [buildMachineSettings({ dark }), workbenchOverlay({ dark })]) {
+      for (const k of HIDING_KEYS) expect(settings, k).toHaveProperty(k);
+      expect(settings).toMatchObject(ZEN);
+      expect(settings["workbench.editor.showTabs"]).toBe("none");
+      expect(settings["breadcrumbs.enabled"]).toBe(false);
+      expect(settings["workbench.colorTheme"]).toBe(dark ? "Dark Modern" : "Light Modern");
+    }
+  });
+
+  it("is byte-identical on repeated calls, and the written Machine file too", () => {
+    for (const dark of [true, false]) {
+      const once = JSON.stringify(buildMachineSettings({ dark }));
+      const overlay = JSON.stringify(workbenchOverlay({ dark }));
+      for (let i = 0; i < 5; i++) {
+        expect(JSON.stringify(buildMachineSettings({ dark }))).toBe(once);
+        expect(JSON.stringify(workbenchOverlay({ dark }))).toBe(overlay);
+      }
+    }
+    const dir = tempDir();
+    const file = writeMachineSettings(dir, { dark: false });
+    const first = fs.readFileSync(file, "utf8");
+    for (let i = 0; i < 3; i++) writeMachineSettings(dir, { dark: false });
+    expect(fs.readFileSync(file, "utf8")).toBe(first);
+  });
+
+  it.each([true, false])("dark=%s: the overlay (what the Code tab writes on every load) has no key that silences notifications, trust, close or save dialogs (F8)", (dark) => {
+    const overlay = workbenchOverlay({ dark });
+    // the one notification-related key is Zen Mode's, carried only to keep it false
+    expect(overlay["zenMode.silentNotifications"]).toBe(false);
+    const keys = Object.keys(overlay).filter((k) => k !== "zenMode.silentNotifications");
+    expect(keys.filter((k) => /notification|trust|confirm|tips|dialog|conflict|hotExit|autoSave|restoreWindows/i.test(k))).toEqual([]);
+    for (const k of ["workbench.tips.enabled", "window.confirmBeforeClose", "files.hotExit", "files.autoSave", "security.workspace.trust.enabled", "security.workspace.trust.startupPrompt", "security.workspace.trust.banner"]) {
+      expect(overlay, k).not.toHaveProperty(k);
+    }
+  });
+
+  it("the Machine file has no key that silences notifications, trust or save dialogs, and no extensions.* key (F8, GP5)", () => {
+    const all = Object.keys(buildMachineSettings({ dark: true }));
+    // the extensions.* keys are the update off switches from before this PR (BROWSER_APP_SETTINGS); hiding adds none
+    const extensionKeys = all.filter((k) => /^extensions\./.test(k));
+    for (const k of extensionKeys) expect(Object.keys(BROWSER_APP_SETTINGS), k).toContain(k);
+    expect(extensionKeys.sort()).toEqual(Object.keys(BROWSER_APP_SETTINGS).filter((k) => /^extensions\./.test(k)).sort());
+    for (const k of ["workbench.tips.enabled", "window.confirmBeforeClose", "files.hotExit"]) expect(all, k).not.toContain(k);
+    expect(all.filter((k) => /trust/i.test(k))).toEqual([]);
+  });
+
+  it("the overlay wins over copied settings that turn each part back on, on the first load and on every later one (same copy id)", async () => {
+    const hostile = {
+      "workbench.statusBar.visible": true,
+      "zenMode.centerLayout": true,
+      "workbench.editor.showTabs": "multiple",
+      "breadcrumbs.enabled": true,
+      "workbench.activityBar.location": "default",
+      "zenMode.hideLineNumbers": true,
+      "editor.fontSize": 21,
+    };
+    const copy: UserDataCopy = { id: "same", settings: hostile, keybindingsBase64: null };
+    const overlay = { ...BROWSER_APP_SETTINGS, ...workbenchOverlay({ dark: true }) };
+    const fake = fakeIndexedDB();
+    const storage = fakeStorage();
+    const seed = () =>
+      (new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${buildBrowserSeedScript(overlay, copy, chromeKeybindings())}`) as (...a: unknown[]) => Promise<string>)(fake.indexedDB, storage, TextEncoder, TextDecoder);
+    const stored = () => JSON.parse(new TextDecoder().decode(fake.stores.get("vscode-userdata-store")!.get("/User/settings.json") as Uint8Array)) as Record<string, unknown>;
+    for (let load = 1; load <= 3; load++) {
+      expect(await seed(), `load ${load}`).toBe("seeded");
+      expect(stored(), `load ${load}`).toMatchObject(workbenchOverlay({ dark: true }));
+      expect(stored()["editor.fontSize"], `load ${load}`).toBe(21); // what the user did not set against us is theirs
+    }
+    // the tab changes a hiding setting itself between loads: the next load puts ours back
+    const tampered = { ...stored(), "workbench.statusBar.visible": true, "breadcrumbs.enabled": true };
+    fake.stores.get("vscode-userdata-store")!.set("/User/settings.json", new TextEncoder().encode(JSON.stringify(tampered)));
+    expect(await seed()).toBe("seeded");
+    expect(stored()).toMatchObject({ "workbench.statusBar.visible": false, "breadcrumbs.enabled": false });
+  });
+
+  it("line numbers are the user's: the plugin sets no editor.lineNumbers, keeps Zen's hideLineNumbers false, and a copied editor.lineNumbers survives every load (GP6)", async () => {
+    for (const dark of [true, false]) {
+      for (const built of [buildMachineSettings({ dark }), workbenchOverlay({ dark })]) {
+        expect(built).not.toHaveProperty("editor.lineNumbers");
+        expect(built["zenMode.hideLineNumbers"]).toBe(false);
+      }
+    }
+    for (const value of ["off", "relative", "interval"]) {
+      const copy: UserDataCopy = { id: `ln-${value}`, settings: { "editor.lineNumbers": value, "zenMode.hideLineNumbers": true }, keybindingsBase64: null };
+      const overlay = { ...BROWSER_APP_SETTINGS, ...workbenchOverlay({ dark: false }) };
+      const fake = fakeIndexedDB();
+      const storage = fakeStorage();
+      const seed = () =>
+        (new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${buildBrowserSeedScript(overlay, copy, chromeKeybindings())}`) as (...a: unknown[]) => Promise<string>)(fake.indexedDB, storage, TextEncoder, TextDecoder);
+      for (let load = 1; load <= 2; load++) {
+        await seed();
+        const stored = JSON.parse(new TextDecoder().decode(fake.stores.get("vscode-userdata-store")!.get("/User/settings.json") as Uint8Array)) as Record<string, unknown>;
+        expect(stored["editor.lineNumbers"], `${value} load ${load}`).toBe(value);
+        expect(stored["zenMode.hideLineNumbers"], `${value} load ${load}`).toBe(false); // the one line-number key we own
+      }
+    }
+  });
+});
 
 describe("buildBrowserSeedScript (run against a fake IndexedDB)", () => {
   it("creates the workbench's database and writes the off switches into /User/settings.json", async () => {
@@ -185,11 +247,21 @@ describe("buildBrowserSeedScript with the copy of the instance's settings and ke
     keybindingsBase64: Buffer.from(kb).toString("base64"),
   };
 
-  it("writes the copied keys and the keybindings into the browser profile, the off switches winning", async () => {
+  it("writes the copied keys and the keybindings into the browser profile, the off switches winning (the drawer's host page: the keybindings byte for byte)", async () => {
     const r = await runSeed(undefined, copy);
     expect(r.outcome).toBe("seeded");
     expect(JSON.parse(r.text as string)).toEqual({ ...copy.settings, ...BROWSER_APP_SETTINGS });
     expect(r.keybindings).toBe(kb); // byte for byte, comment included
+    expect(r.storage.map.get(USER_DATA_MARKER_KEY)).toBe("start-1");
+  });
+
+  it("in a Code tab the copied keybindings keep the user's bytes and gain the overlay (GP4, E9)", async () => {
+    const r = await runSeed(undefined, copy, undefined, overlayKeybindings());
+    expect(r.outcome).toBe("seeded");
+    expect(JSON.parse(r.text as string)).toEqual({ ...copy.settings, ...BROWSER_APP_SETTINGS });
+    expect(removeOverlay(r.keybindings as string)).toBe(kb); // the user's bytes, comment included
+    expect(r.keybindings).not.toBe(kb);
+    expect(r.keybindings).toContain(OVERLAY_END);
     expect(r.storage.map.get(USER_DATA_MARKER_KEY)).toBe("start-1");
   });
 
@@ -201,6 +273,36 @@ describe("buildBrowserSeedScript with the copy of the instance's settings and ke
     // the copy replaces the profile's file whole: a key set inside the tab (editor.tabSize) or removed from the instance is gone
     expect(JSON.parse(r.text as string)).toEqual({ ...copy.settings, ...BROWSER_APP_SETTINGS });
     expect(r.keybindings).toBeUndefined();
+  });
+
+  // Characterisation (chrome spike S3): without the overlay the seed treats keybindings.json as the instance's file, not as ours
+  // (the terminal drawer's host page, which has no overlay). Chord disables written into the profile's file (`-command` entries)
+  // are not in the instance's copy, so a seed with a new copy id wipes them. The Code tab re-applies the overlay on every load
+  // for exactly that reason (the describe block on the keybinding overlay below).
+  it("replaces a profile keybindings.json that holds `-command` chord disables with the copy, so the disables are lost and need a re-apply route (S3)", async () => {
+    const disables = [
+      { key: "cmd+b", command: "-workbench.action.toggleSidebarVisibility" },
+      { key: "cmd+j", command: "-workbench.action.togglePanel" },
+      { key: "cmd+k z", command: "-workbench.action.toggleZenMode" },
+      { key: "cmd+w", command: "-workbench.action.closeActiveEditor" },
+    ];
+    const withDisables = new TextEncoder().encode(JSON.stringify(disables));
+    const initial = { "/User/settings.json": new TextEncoder().encode("{}"), "/User/keybindings.json": withDisables };
+    const storage = fakeStorage();
+
+    // the same copy id (a tab reload): the profile's file is left alone, the disables are still there
+    storage.map.set(USER_DATA_MARKER_KEY, "start-1");
+    const reload = await runSeed(initial, copy, storage);
+    expect(reload.keybindings).toContain("-workbench.action.toggleSidebarVisibility");
+
+    // a new copy id (a server start): the copy replaces the file whole, and none of the four disables survive
+    const start = await runSeed(initial, { ...copy, id: "start-2" }, storage);
+    expect(start.keybindings).toBe(kb);
+    for (const d of disables) expect(start.keybindings).not.toContain(d.command);
+
+    // and a copy with no keybindings removes the file, the disables with it
+    const bare = await runSeed(initial, { ...copy, id: "start-3", keybindingsBase64: null }, fakeStorage());
+    expect(bare.keybindings).toBeUndefined();
   });
 
   it("drops a key the instance removed since the last start, instead of keeping it in the profile (PR-3 R4)", async () => {
@@ -285,6 +387,159 @@ describe("the seed script built from a stripped profile copy holds no trust key 
     expect(Object.keys(machine).filter((k) => k.startsWith("security.workspace.trust."))).toEqual([]);
     expect(BROWSER_APP_SETTINGS).toMatchObject({ "telemetry.telemetryLevel": "off" });
     expect(buildBrowserSeedScript(BROWSER_APP_SETTINGS, copyFor(PROFILES.custom.location))).toContain('"telemetry.telemetryLevel":"off"');
+  });
+});
+
+describe("buildBrowserSeedScript with the keybinding overlay (GP1, GP4, E9; the chrome spike's S3 re-apply route)", () => {
+  const overlay = overlayKeybindings();
+  const ours: Rule[] = overlay;
+  const parse = (text: string | undefined) => rulesOf(text as string);
+  const kb = '// mine\n[{ "key": "ctrl+alt+n", "command": "workbench.action.toggleSidebarVisibility" },]\n';
+  const copy: UserDataCopy = { id: "start-1", settings: {}, keybindingsBase64: Buffer.from(kb).toString("base64") };
+  const mine = { key: "ctrl+alt+n", command: "workbench.action.toggleSidebarVisibility" };
+  const unboundMine = { key: "ctrl+alt+n", command: "" };
+  const enc = (s: string) => new TextEncoder().encode(s);
+
+  it("writes the overlay into a profile that has no keybindings.json, with and without a copy", async () => {
+    for (const c of [null, { ...copy, keybindingsBase64: null }]) {
+      const r = await runSeed(undefined, c, undefined, overlay);
+      expect(r.outcome).toBe("seeded");
+      expect(parse(r.keybindings)).toEqual(ours);
+    }
+  });
+
+  it("lays it over the copied rules (comments and trailing commas read): the user's bytes kept, the rule that brings the side bar back unbound after ours", async () => {
+    const r = await runSeed(undefined, copy, undefined, overlay);
+    expect(r.outcome).toBe("seeded");
+    expect(removeOverlay(r.keybindings as string)).toBe(kb);
+    expect(parse(r.keybindings)).toEqual([mine, ...ours, unboundMine]);
+    expect(r.keybindings).toBe(applyOverlay(kb)); // the page and the runner give the same bytes
+  });
+
+  it("is the same bytes on every load: a reload with the same copy id does not add it twice, with or without the copy given again", async () => {
+    const first = await runSeed(undefined, copy, undefined, overlay);
+    const again = await runSeed({ "/User/keybindings.json": enc(first.keybindings as string), "/User/settings.json": enc(first.text as string) }, copy, first.storage, overlay);
+    expect(again.keybindings).toBe(first.keybindings);
+    const noCopy = await runSeed({ "/User/keybindings.json": enc(first.keybindings as string) }, null, undefined, overlay);
+    expect(noCopy.keybindings).toBe(first.keybindings);
+  });
+
+  it("re-applies on a reload within one server start (same copy id) after the profile's keybindings were edited in the tab", async () => {
+    const first = await runSeed(undefined, copy, undefined, overlay);
+    expect(first.storage.map.get(USER_DATA_MARKER_KEY)).toBe("start-1");
+    const typed: Rule = { key: "ctrl+k", command: "-x" };
+    // the user replaced the whole file with their own text, our block and the chords gone
+    const replaced = await runSeed({ "/User/keybindings.json": enc(JSON.stringify([typed, { key: "cmd+b", command: "workbench.action.toggleSidebarVisibility" }])) }, copy, first.storage, overlay);
+    expect(replaced.outcome).toBe("seeded");
+    expect(parse(replaced.keybindings)).toEqual([typed, { key: "cmd+b", command: "workbench.action.toggleSidebarVisibility" }, ...ours, { key: "cmd+b", command: "" }]);
+    // the user added a rule inside the tab after our block (a file whose last rule has no trailing comma, so the overlay brought its own)
+    const plain = JSON.stringify([mine]);
+    const withBlock = applyOverlay(plain);
+    const added = await runSeed({ "/User/keybindings.json": enc(withBlock.replace(/\n\]$/, `\n,  {"key":"ctrl+alt+m","command":"x"}\n]`)) }, copy, first.storage, overlay);
+    expect(parse(added.keybindings)).toEqual([mine, { key: "ctrl+alt+m", command: "x" }, ...ours, unboundMine]);
+  });
+
+  it("a rule the tab's keybinding editor wrote right after our last entry (before the end comment) is still there after the next load", async () => {
+    const first = await runSeed(undefined, copy, undefined, overlay);
+    const added = { key: "ctrl+alt+m", command: "x" };
+    const removed = { key: "cmd+shift+o", command: "-workbench.action.gotoSymbol" };
+    // jsonc-parser's setProperty(text, [-1], rule) puts the rule after the last element, inside our block
+    const edited = (first.keybindings as string).replace(`\n${OVERLAY_END}`, `,\n${JSON.stringify(added, null, 4)},\n${JSON.stringify(removed, null, 4)}\n${OVERLAY_END}`);
+    expect(edited).not.toBe(first.keybindings);
+    const again = await runSeed({ "/User/keybindings.json": enc(edited) }, copy, first.storage, overlay);
+    expect(parse(again.keybindings)).toEqual([mine, added, removed, ...ours, unboundMine]);
+    const third = await runSeed({ "/User/keybindings.json": enc(again.keybindings as string) }, copy, first.storage, overlay);
+    expect(third.keybindings).toBe(again.keybindings);
+  });
+
+  it("an instance with no keybindings.json: a rule the keybinding editor added inside our array is still there, and the file still parses, after the next loads", async () => {
+    const added = { key: "ctrl+alt+m", command: "x" };
+    const removed = { key: "cmd+shift+o", command: "-workbench.action.gotoSymbol" };
+    const withArgs = { key: "ctrl+alt+a", command: "type", args: { text: "}{ // not a comment" } };
+    for (const c of [null, { ...copy, keybindingsBase64: null }]) {
+      const first = await runSeed(undefined, c, undefined, overlay);
+      let text = first.keybindings as string;
+      // jsonc-parser puts each rule right after the array's last element
+      for (const rule of [added, removed, withArgs]) {
+        const last = text.lastIndexOf("}", text.indexOf(`\n${OVERLAY_END}`));
+        text = text.slice(0, last + 1) + `,\n${JSON.stringify(rule, null, 4)}` + text.slice(last + 1);
+      }
+      const again = await runSeed({ "/User/keybindings.json": enc(text) }, c, first.storage, overlay);
+      expect(parse(again.keybindings)).toEqual([added, removed, withArgs, ...ours]);
+      const third = await runSeed({ "/User/keybindings.json": enc(again.keybindings as string) }, c, first.storage, overlay);
+      expect(third.keybindings).toBe(again.keybindings);
+    }
+  });
+
+  it("puts ours last for the same chord, after a copied rule on one of our chords", async () => {
+    const theirs = { key: "ctrl+alt+shift+1", command: "workbench.action.toggleSidebarVisibility" };
+    const withTheirs: UserDataCopy = { ...copy, keybindingsBase64: Buffer.from(JSON.stringify([theirs])).toString("base64") };
+    const r = await runSeed(undefined, withTheirs, undefined, overlay);
+    const rules = parse(r.keybindings);
+    expect(rules.filter((x) => x.key === "ctrl+alt+shift+1").map((x) => x.command)).toEqual(["workbench.action.toggleSidebarVisibility", "workbench.action.closeSidebar", ""]);
+  });
+
+  it("a new copy (a new server start, or Dan changed his instance's keybindings) replaces the profile's file and carries the overlay too", async () => {
+    const storage = fakeStorage();
+    const first = await runSeed(undefined, copy, storage, overlay);
+    const changed: UserDataCopy = { ...copy, id: "start-2", keybindingsBase64: Buffer.from('[{ "key": "ctrl+alt+k", "command": "workbench.action.togglePanel" }]').toString("base64") };
+    const second = await runSeed({ "/User/keybindings.json": enc(first.keybindings as string), "/User/settings.json": enc(first.text as string) }, changed, storage, overlay);
+    expect(storage.map.get(USER_DATA_MARKER_KEY)).toBe("start-2");
+    expect(parse(second.keybindings)).toEqual([{ key: "ctrl+alt+k", command: "workbench.action.togglePanel" }, ...ours, { key: "ctrl+alt+k", command: "" }]);
+    expect(second.keybindings).not.toContain("ctrl+alt+n");
+  });
+
+  it("with an instance that has no keybindings, a new copy leaves the overlay alone in the profile", async () => {
+    const r = await runSeed({ "/User/keybindings.json": enc("[]") }, { ...copy, keybindingsBase64: null }, undefined, overlay);
+    expect(parse(r.keybindings)).toEqual(ours);
+  });
+
+  // The files E9 names, through the seed script itself and not only the builder: each ends with the overlay, the user's bytes untouched.
+  const FILES: Array<[string, string]> = [
+    ["empty", ""],
+    ["an empty array", "[]"],
+    ["not valid JSON", "not json at all"],
+    ["an object", "{"],
+    ["comments and trailing commas", '// c\n[ /* x */ { "key": "ctrl+alt+m", "command": "y", }, ]'],
+    ["a byte-order mark", '\ufeff[{ "key": "ctrl+alt+m", "command": "y" }]'],
+  ];
+  it.each(FILES)("%s, as the copy: ends with the overlay and the user's bytes intact", async (_n, text) => {
+    const r = await runSeed(undefined, { ...copy, keybindingsBase64: Buffer.from(text).toString("base64") }, undefined, overlay);
+    expect(r.outcome).toBe("seeded");
+    expect(removeOverlay(r.keybindings as string)).toBe(text);
+    expect(r.keybindings).toBe(applyOverlay(text));
+    expect(r.keybindings).toContain(OVERLAY_END);
+  });
+  it.each(FILES)("%s, as the profile's stored file on a reload: ends with the overlay and the user's bytes intact", async (_n, text) => {
+    const storage = fakeStorage();
+    storage.setItem(USER_DATA_MARKER_KEY, "start-1");
+    const r = await runSeed({ "/User/settings.json": enc("{}"), "/User/keybindings.json": enc(text) }, copy, storage, overlay);
+    expect(r.outcome).toBe("seeded");
+    expect(removeOverlay(r.keybindings as string)).toBe(text);
+    expect(r.keybindings).toBe(applyOverlay(text));
+  });
+
+  it("still seeds the settings when keybindings.json is not JSON", async () => {
+    const r = await runSeed({ "/User/keybindings.json": enc("not json at all") }, null, undefined, overlay);
+    expect(r.outcome).toBe("seeded");
+    expect(JSON.parse(r.text as string)).toEqual(BROWSER_APP_SETTINGS);
+  });
+
+  it("without the overlay (the drawer's host page) the keybinding handling is what it was", async () => {
+    const r = await runSeed(undefined, copy);
+    expect(r.keybindings).toBe(kb);
+    const stored = await runSeed({ "/User/keybindings.json": enc("not json at all") }, null);
+    expect(stored.keybindings).toBe("not json at all");
+  });
+
+  it("an emptied unbind list unbinds nothing (the seed passes the list on)", async () => {
+    const r = await runSeed(undefined, copy, undefined, overlay, []);
+    expect(parse(r.keybindings)).toEqual([mine, ...ours]);
+  });
+
+  it("the chrome chords alone (no removals) still work as before, for a host that gives only those", async () => {
+    const r = await runSeed(undefined, null, undefined, chromeKeybindings());
+    expect(parse(r.keybindings)).toEqual(chromeKeybindings());
   });
 });
 

@@ -5,7 +5,7 @@ import { checkFile, refusalMessage } from "./binary-guard";
 import { ChildRegistry } from "./child-registry";
 import { AUTO_SAVE_KEY, autoSaveMode, withAutoSaveDefault, type AutoSave } from "./dirty-guard";
 import { ownerOfExtension, type ViewRegistryLike } from "./coexistence";
-import { CodeView, VIEW_TYPE_CODE, baseName, type CodeViewHost, type EmbedElement } from "./code-view";
+import { CodeView, VIEW_TYPE_CODE, baseName, type ChromeHiding, type CodeViewHost, type EmbedElement } from "./code-view";
 import { ExtensionRegistry } from "./extension-registry";
 import { scanVault } from "./extension-scan";
 import { createClickInterceptor, readMode, type ClickLike, type ExtensionlessMode } from "./extensionless-intercept";
@@ -17,6 +17,8 @@ import { readProcessTable } from "./process-utils";
 import { LicenceDeclinedError, LicenceGate } from "./licence";
 import { promptCloseDirty, promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard, type CloseDirtyRequest } from "./modals";
 import { OpenFiles } from "./open-file";
+import { openCodeTabOnce, openFromEditor as routeEditorOpen } from "./open-from-editor";
+import { normalizeLine, type EditorTarget } from "./paths";
 import { PidFile, sweepOrphans } from "./pidfile";
 import { carryEdits as carryEditsOnDisk, readBaseline as readBaselineOnDisk, statSignature as statSignatureOnDisk, type CarryResult } from "./rename-carry";
 import {
@@ -49,7 +51,9 @@ import { SPIKE_RESULT } from "./settings/spike-result";
 import { buildExtensionList } from "./settings/extension-list";
 import type { ExtensionListView } from "./settings/extension-states";
 import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
-import { workbenchOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
+import { workbenchOverlay, terminalOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
+import { overlayKeybindings, unbindCommands } from "./chrome-settings";
+import { buildChromeHideScript } from "./chrome-script";
 import { DEVICE_ID_KEY, deviceId } from "./terminal/drawer-state";
 import { viewKind } from "./terminal/drawer-visibility";
 import { FocusReturn } from "./terminal/focus-return";
@@ -492,6 +496,16 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return workbenchOverlay({ dark: this.isDark() });
   }
 
+  /** The terminal drawer's host page has an overlay of its own: it never reads the Code tab's hiding settings (F2). */
+  terminalOverlay(): Record<string, unknown> {
+    return terminalOverlay({ dark: this.isDark() });
+  }
+
+  /** The keybinding overlay and page script that keep the bars of a Code tab closed and the layout chords dead; read at every load (GP1, GP4). */
+  chromeHiding(): ChromeHiding {
+    return { keybindings: overlayKeybindings(), unbind: unbindCommands(), script: buildChromeHideScript() };
+  }
+
   /** Read at every tab load, so the toggle applies at the next load (G6). */
   trustVaultFolder(): boolean {
     return this.workbenchSettings().trustVaultFolder;
@@ -529,8 +543,38 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return this.focusLeaf(leaf);
   }
 
+  isActiveTab(leaf: WorkspaceLeaf): boolean {
+    return this.activeLeaf() === leaf;
+  }
+
   openInNewTab(file: string): void {
     void this.openCodeFile(file);
+  }
+
+  /**
+   * A file was opened from inside the editor of the Code tab `from` (Go to Definition, quick open, a link). It becomes an Obsidian tab
+   * beside `from`, in front, at `line`; a tab that already shows it is focused instead; a note, canvas, base, image or PDF opens the
+   * way Obsidian opens it; a file outside the vault only gets a notice (E2, E3, E4).
+   */
+  async openFromEditor(from: WorkspaceLeaf, target: EditorTarget, line: number | null): Promise<void> {
+    // The new tab goes into the tab group of the active tab, so a Code tab in a split pane must be the active one first.
+    if (!this.isActiveTab(from)) (this.app.workspace as unknown as { setActiveLeaf?: (l: WorkspaceLeaf, o?: { focus: boolean }) => void }).setActiveLeaf?.(from, { focus: false });
+    await routeEditorOpen(target, line, {
+      excluded: () => this.workbenchSettings().excludeExtensions,
+      openCode: (file, at) => this.openCodeFile(file, at),
+      openInObsidian: (file) => this.openInObsidian(file),
+      notify: (message) => void new Notice(message, 10000),
+    });
+  }
+
+  /** Obsidian's usual open for a file that is not a Code tab's (a note, canvas, base, image or PDF), in a new tab. */
+  private async openInObsidian(file: string): Promise<void> {
+    const found = this.findVaultFile(file);
+    if (!found) {
+      new Notice(`VS Code Workbench: ${fileName(file)} is not in this vault, so Obsidian cannot open it.`, 10000);
+      return;
+    }
+    await this.app.workspace.getLeaf("tab").openFile(found, { active: true });
   }
 
   readBaseline(file: string): Promise<Buffer | null> {
@@ -594,7 +638,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       failureText: (e) => this.describeStartFailure(e).message,
       notice: (message) => void new Notice(message, 10000),
       isDark: () => this.isDark(),
-      workbenchOverlay: () => this.workbenchOverlay(),
+      workbenchOverlay: () => this.terminalOverlay(),
       userDataCopy: () => this.copy,
       trustVaultFolder: () => this.trustVaultFolder(),
       heldPorts: () => this.heldPorts(),
@@ -1212,17 +1256,26 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
    * Open a file in a Code tab, or focus the one that already shows it (one tab per file; a second
    * call while the first is still opening waits for it). The guard comes first, then the server (and,
    * the first time, the licence modal): a refused file or a failed start leaves no tab, and a declined
-   * licence opens the file in the system app instead.
+   * licence opens the file in the system app instead. `line` (a file opened from the editor at a definition) puts the cursor
+   * there, in a new tab and in the tab that already shows the file; zero, negative or non-numeric is line 1, and one past the
+   * end of the file is the last line. Without it the cursor stays where VS Code puts it.
    */
-  async openCodeFile(file: string): Promise<void> {
-    await this.openFiles.openOnce(
-      file,
-      () => this.createCodeTab(file),
-      (leaf) => this.focusLeaf(leaf),
-    );
+  async openCodeFile(file: string, line?: unknown): Promise<void> {
+    const at = line === undefined ? null : normalizeLine(line);
+    await openCodeTabOnce(this.openFiles, file, at, {
+      create: () => this.createCodeTab(file, at),
+      focus: (leaf) => this.focusLeaf(leaf),
+      placeCursor: (leaf, n) => this.placeCursor(leaf, n),
+    });
   }
 
-  private async createCodeTab(file: string): Promise<void> {
+  /** Put the cursor of the Code tab in `leaf` on `line`; a tab restored from the last session and not loaded yet is loaded first. */
+  private async placeCursor(leaf: WorkspaceLeaf, line: number): Promise<void> {
+    await (leaf as unknown as { loadIfDeferred?: () => Promise<void> }).loadIfDeferred?.();
+    if (leaf.view instanceof CodeView) await leaf.view.goToLine(line);
+  }
+
+  private async createCodeTab(file: string, line: number | null = null): Promise<void> {
     const kind = decideFile(file).kind;
     if (kind === "never" || kind === "hidden") {
       new Notice(`VS Code Workbench: ${fileName(file)} is not opened in a Code tab; Obsidian's own view handles it.`);
@@ -1237,7 +1290,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     }
     if (this.unloaded) return; // unloaded while the server started: no tab on a plugin that is gone
     const leaf = this.app.workspace.getLeaf("tab");
-    await leaf.setViewState({ type: VIEW_TYPE_CODE, state: { file }, active: true });
+    await leaf.setViewState({ type: VIEW_TYPE_CODE, state: line === null ? { file } : { file, line }, active: true });
     await this.app.workspace.revealLeaf(leaf);
   }
 }

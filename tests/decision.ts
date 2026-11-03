@@ -30,3 +30,16 @@ export function parseDecision(text: string): Decision {
 export function stopMessage(d: Decision): string | null {
   return d.embed === "fails" ? "STOP: ask Dan. The VS Code embed cannot run inside Obsidian; there is no Monaco fallback." : null;
 }
+
+/** Whether the side bar can be hidden by some route, per measured build (docs/spike-chrome.md, rows S1). */
+export type SideBarHideable = { "1.143.1": boolean; "1.144.0": boolean };
+
+/**
+ * The chrome spike's stop rule (PR-1 of "Code tab shows just the editor"): the build stops only when NEITHER measured
+ * build can hide the side bar by any route. One build hiding it is a pass; the other build's gap is recorded in the report.
+ */
+export function chromeStopMessage(hideable: SideBarHideable): string | null {
+  return hideable["1.143.1"] || hideable["1.144.0"]
+    ? null
+    : "STOP: ask Dan. The side bar cannot be hidden by any route on either VS Code build (1.143.1, 1.144.0).";
+}

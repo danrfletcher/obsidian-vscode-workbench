@@ -13,6 +13,9 @@ import { EXTENSION_DIR_NAME } from "../../src/terminal-host/terminal-at-extensio
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
 import { FAKE_CODE, isAlive, tempDir } from "../helpers";
 import { stateDb } from "../mirror-tree";
+import { fakeIndexedDB, fakeStorage } from "../fake-seed-page";
+import { removeOverlay, rulesOf } from "../overlay-runner";
+import { BROWSER_APP_SETTINGS, buildBrowserSeedScript } from "../../src/settings";
 import { HANG_SCRIPT, makeApp as makeBundle, makeReadOnly, makeWritable, treeDigest } from "../instance-helpers";
 
 const PLUGIN_DIR = ".obsidian/plugins/obsidian-vscode-workbench";
@@ -515,6 +518,50 @@ describe("the copy of the instance's settings (G16, G17)", () => {
     for (const key of ["files.watcherExclude", "search.exclude"]) expect(machine[key]).toMatchObject({ "**/.obsidian": true, "**/Attachments": true });
     await plugin.restartServer();
     expect(plugin.userDataCopy()!.id).not.toBe(firstId); // a new start is a new copy, applied again
+  });
+
+  it("GP1: an instance whose settings.json and keybindings.json turn each hidden part back on cannot win: the seed keeps the plugin's values on every load (same copy id, three loads)", async () => {
+    bothMicrosoft();
+    const u = userDir("Code - Insiders");
+    fs.writeFileSync(
+      path.join(u, "settings.json"),
+      '{\n  "workbench.statusBar.visible": true,\n  "zenMode.centerLayout": true,\n  "workbench.editor.showTabs": "multiple",\n  "breadcrumbs.enabled": true,\n  "workbench.activityBar.location": "default",\n  "editor.fontSize": 15,\n}\n',
+    );
+    // keybindings that undo ours: take our chord for the side bar, and one of their own
+    const theirs = '[\n  { "key": "ctrl+alt+shift+1", "command": "workbench.action.toggleSidebarVisibility" },\n  { "key": "cmd+b", "command": "workbench.action.toggleSidebarVisibility" },\n]\n';
+    fs.writeFileSync(path.join(u, "keybindings.json"), theirs);
+    await load();
+    await plugin.openSpikeFile();
+    const copy = plugin.userDataCopy()!;
+    expect(copy.settings).toMatchObject({ "workbench.statusBar.visible": true, "zenMode.centerLayout": true }); // the copy carries them: it is the seed that must win
+
+    // What CodeView.loadWorkbench runs in the webview, from the host's own methods, against one browser profile, three times.
+    const fake = fakeIndexedDB();
+    const storage = fakeStorage();
+    const hiding = plugin.chromeHiding();
+    const script = buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...plugin.workbenchOverlay() }, plugin.userDataCopy(), hiding.keybindings, hiding.unbind);
+    const run = () => (new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${script}`) as (...a: unknown[]) => Promise<string>)(fake.indexedDB, storage, TextEncoder, TextDecoder);
+    const file = (name: string) => new TextDecoder().decode(fake.stores.get("vscode-userdata-store")!.get(`/User/${name}`) as Uint8Array);
+    let firstKeybindings = "";
+    for (let load = 1; load <= 3; load++) {
+      expect(await run(), `load ${load}`).toBe("seeded");
+      const settings = JSON.parse(file("settings.json")) as Record<string, unknown>;
+      expect(settings, `load ${load}`).toMatchObject(plugin.workbenchOverlay());
+      expect(settings["workbench.statusBar.visible"], `load ${load}`).toBe(false);
+      expect(settings["zenMode.centerLayout"], `load ${load}`).toBe(false);
+      expect(settings["workbench.editor.showTabs"], `load ${load}`).toBe("none");
+      expect(settings["breadcrumbs.enabled"], `load ${load}`).toBe(false);
+      expect(settings["editor.fontSize"], `load ${load}`).toBe(15); // theirs otherwise
+      // keybindings: the user's text kept byte for byte, ours after it, once, and the copied rules that bring a bar back unbound last
+      const text = file("keybindings.json");
+      expect(removeOverlay(text), `load ${load}`).toBe(theirs);
+      const rules = rulesOf(text);
+      expect(rules.filter((r) => r.key === "cmd+b").map((r) => r.command), `load ${load}`).toEqual(["workbench.action.toggleSidebarVisibility", "-workbench.action.toggleSidebarVisibility", ""]);
+      expect(rules.filter((r) => r.key === "ctrl+alt+shift+1").map((r) => r.command), `load ${load}`).toEqual(["workbench.action.toggleSidebarVisibility", "workbench.action.closeSidebar", ""]);
+      expect(rules.slice(2, 2 + hiding.keybindings.length), `load ${load}`).toEqual(hiding.keybindings);
+      if (load === 1) firstKeybindings = file("keybindings.json");
+      else expect(file("keybindings.json"), `load ${load}`).toBe(firstKeybindings);
+    }
   });
 
   it("a copy of the instance that is not the default: the stable build's folder, not Insiders'", async () => {

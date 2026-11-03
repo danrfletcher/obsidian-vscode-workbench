@@ -85,4 +85,60 @@ describe("README", () => {
       expect(text).not.toMatch(/\*\*Shell|shell path|shellPath|\$SHELL|\/bin\/zsh/i);
     });
   });
+
+  it("the Hidden chrome bullet says the Code tab shows the editor only and that the full workbench is not available (GP1, F6)", () => {
+    const bullet = readme.split("\n").find((l) => l.startsWith("- **Hidden chrome.**"));
+    expect(bullet, "a Hidden chrome bullet").toBeDefined();
+    for (const needle of ["Explorer", "Open Editors", "tab strip", "breadcrumbs", "activity bar", "status bar", "title bar", "panel", "side bar", "secondary side bar", "The full workbench is not available", "best effort", "never stops a tab from opening"]) {
+      expect(bullet, needle).toContain(needle);
+    }
+  });
+
+  describe("Working in a Code tab: the lost views, the keys, the popups and the iframe embed (PR-6)", () => {
+    const text = section("## Working in a Code tab") ?? "";
+
+    it("names the views that are gone from the tab", () => {
+      expect(text).not.toBe("");
+      for (const needle of ["Source Control", "Run and Debug", "Testing", "Extensions", "Problems", "Output", "Debug Console", "integrated terminal panel", "any view an extension adds to the side bar, secondary side bar or panel"]) {
+        expect(text, needle).toContain(needle);
+      }
+    });
+
+    it("says extensions still run in the editor and that the terminal drawer replaces VS Code's terminal", () => {
+      for (const needle of ["Extensions still run in the editor", "squiggles", "hovers", "completions", "formatting", "Cmd+Shift+P", "The terminal drawer", "replaces VS Code's own terminal panel"]) {
+        expect(text, needle).toContain(needle);
+      }
+    });
+
+    it("says what the keys do and that a file opened from the editor is a new Obsidian tab", () => {
+      for (const needle of ["Cmd+B and Cmd+J do nothing in a tab", "Cmd+W closes the Obsidian tab", "Cmd+Shift+P and Cmd+P open as overlays", "opens as a new Obsidian tab"]) {
+        expect(text, needle).toContain(needle);
+      }
+    });
+
+    it("says VS Code's popups still appear, that a part that cannot be hidden shows again, and that there is no setting for the full workbench", () => {
+      for (const needle of ["VS Code's own popups (save conflicts, Workspace Trust, extension notifications) still appear", "that part shows again and the tab still works", "There is no setting to bring the full workbench back"]) {
+        expect(text, needle).toContain(needle);
+      }
+    });
+
+    it("says what the iframe embed gets, keeps the webview as the default, and makes no mobile claim", () => {
+      for (const needle of ["The webview is the default", "gets no page script", "no hotkey bridge", "no script-based hiding"]) {
+        expect(text, needle).toContain(needle);
+      }
+      expect(text).not.toMatch(/\bmobile\b/i);
+    });
+
+    it("documents no hiding setting and no retry behaviour (F7), and mentions no tab strip as shown", () => {
+      expect(text).not.toMatch(/hiding[^.\n]*\bretr(y|ies)\b|\bretr(y|ies)\b[^.\n]*hiding/i);
+      expect(text).not.toMatch(/`(hideChrome|hiding|showWorkbench|layout)[A-Za-z]*`/);
+      expect(text).not.toMatch(/tab strip (is|stays|remains) (shown|visible)|shows? (the|a) (VS Code )?tab strip/i);
+    });
+  });
+
+  it("no longer says the chrome is visible or lists the side bar as shown", () => {
+    expect(readme).not.toMatch(/chrome:\s*visible/i);
+    expect(readme).not.toMatch(/side bar[^.\n]*(stays|remains|is|still)\s+(visible|shown)/i);
+    expect(readme).not.toMatch(/\bF11\b/);
+  });
 });

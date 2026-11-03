@@ -12,6 +12,11 @@
 //                downloading the server, please retry: ..."
 //   download-error-log  like offline, but each attempt also logs an error-level line about the download
 //   slow-download  a real, slow download: FAKE_CODE_DOWNLOAD_REQUESTS=n requests answer 202, "Downloading server" is logged once
+//   workbench    answer a request with a page that has the parts of the VS Code workbench under their real class names
+//                (fake-workbench-page.mjs, imported only in these two modes: other tests copy this file alone), built a moment after
+//                load, that applies the browser profile's settings and keybindings and a saved layout. The file to open is the
+//                first entry of the URL's `payload`, as the Code tab builds it
+//   workbench-renamed  the same page with every class name of every part changed, as after a VS Code update that renamed them
 //   hang         never listen
 // FAKE_CODE_DOWNLOAD_REQUESTS=n makes the first n requests answer 202 (server still downloading).
 // FAKE_CODE_SHELL_PORT=p makes the server start a terminal the way the real one's pty host does: a shell in its own
@@ -127,6 +132,17 @@ if (mode === "hang") {
         console.log(`[${stamp()}] info Downloading server ${commit}`);
       }
       res.writeHead(202).end("downloading");
+      return;
+    }
+    if (mode === "workbench" || mode === "workbench-renamed") {
+      let files = [];
+      try {
+        const payload = JSON.parse(url.searchParams.get("payload") ?? "[]");
+        if (typeof payload?.[0]?.[1] === "string") files = [payload[0][1]];
+      } catch {
+        // no usable payload: a page with no file
+      }
+      import("./fake-workbench-page.mjs").then(({ fakeWorkbenchHtml }) => res.writeHead(200, { "content-type": "text/html" }).end(fakeWorkbenchHtml({ renamed: mode === "workbench-renamed", files })));
       return;
     }
     res.writeHead(302, { location: "/" }).end();
