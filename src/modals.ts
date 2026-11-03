@@ -150,6 +150,12 @@ export interface CloseDirtyRequest {
   state: "dirty" | "unreadable";
   /** A save was tried and the editor still holds unsaved changes. */
   failed?: boolean;
+  /**
+   * Why the editor is "unreadable" when the cause is a file opened from this tab's editor and kept open behind the tab's file:
+   * "unsaved" it is known to hold unsaved edits (the save prompt was cancelled, PR-5 R8); "unknown" it may.
+   * Absent: the editor is not ready.
+   */
+  otherEditor?: "unsaved" | "unknown";
 }
 
 /**
@@ -162,7 +168,11 @@ export function promptCloseDirty(app: App, req: CloseDirtyRequest): Promise<"sav
   let choices: Array<Choice<"save" | "discard" | "cancel">>;
   if (req.state === "unreadable") {
     lines = [
-      `The editor for ${req.file} is not ready, so Obsidian cannot tell whether it has unsaved changes.`,
+      req.otherEditor === "unsaved"
+        ? `A file you opened from the editor in ${req.file}'s tab has unsaved changes, and they are kept in this tab behind ${req.file}. Obsidian cannot save them from here.`
+        : req.otherEditor === "unknown"
+          ? `A file you opened from the editor in ${req.file}'s tab is still open behind it, so Obsidian cannot tell whether it has unsaved changes.`
+          : `The editor for ${req.file} is not ready, so Obsidian cannot tell whether it has unsaved changes.`,
       "Close the tab anyway (unsaved changes would be lost), or keep it open?",
     ];
     choices = [

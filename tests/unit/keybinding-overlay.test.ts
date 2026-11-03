@@ -34,6 +34,8 @@ const REMOVALS: Rule[] = [
   { key: "ctrl+\\", command: "-workbench.action.splitEditor" },
   { key: "cmd+k cmd+\\", command: "-workbench.action.splitEditorOrthogonal" },
   { key: "ctrl+k ctrl+\\", command: "-workbench.action.splitEditorOrthogonal" },
+  { key: "cmd+k cmd+shift+\\", command: "-workbench.action.splitEditorInGroup" },
+  { key: "ctrl+k ctrl+shift+\\", command: "-workbench.action.splitEditorInGroup" },
 ];
 const OURS: Rule[] = [...CLOSE_CHORDS, ...REMOVALS];
 
@@ -139,6 +141,48 @@ describe("the user's text and the overlay (E9)", () => {
     expect(again.match(/\/\/ >>> /g)).toHaveLength(1);
     expect(again.match(/\/\/ <<< /g)).toHaveLength(1);
     expect(applyOverlay(again)).toBe(again);
+  });
+
+  describe("a block whose end line the user deleted (PR-3 R3)", () => {
+    const BEGIN_ONLY = (rules: Rule[]) => `${OVERLAY_BEGIN}\n${rules.map((r) => "  " + JSON.stringify(r)).join(",\n")},\n`;
+
+    it("an orphan begin line never reaches forward to the end line of the block written after it: the user's rules between the two survive every load", () => {
+      const USER_BETWEEN: Rule = { key: "ctrl+alt+u", command: "editor.action.formatDocument" };
+      // [ user rule, orphan BEGIN (END deleted), the user's later rule ] : the first load writes a fresh block after them
+      const orphan = `[\n  ${JSON.stringify(MINE)},\n${BEGIN_ONLY(OURS)}  // my own note, between the orphan line and the end of the file\n  ${JSON.stringify(USER_BETWEEN)}\n]\n`;
+      const first = applyOverlay(orphan);
+      expect(rulesOf(first)).toEqual(expect.arrayContaining([MINE, USER_BETWEEN]));
+      expect(first.match(/\/\/ <<< /g)).toHaveLength(1);
+      const second = applyOverlay(first);
+      expect(rulesOf(second)).toEqual(expect.arrayContaining([MINE, USER_BETWEEN])); // the old code cut it out here
+      expect(rulesOf(second).filter((r) => r.key === USER_BETWEEN.key)).toHaveLength(1);
+      expect(second).toContain("// my own note, between the orphan line and the end of the file"); // the old pairing cut the text between the orphan and the new end line
+      expect(applyOverlay(second)).toBe(second);
+      // and the user's rules are still there with the block cut out
+      expect(rulesOf(removeOverlay(second))).toEqual(expect.arrayContaining([MINE, USER_BETWEEN]));
+    });
+
+    it("an end line with no begin line before it is left alone", () => {
+      const text = `[\n  ${JSON.stringify(MINE)}\n  ${OVERLAY_END}\n]\n`;
+      expect(removeOverlay(text)).toBe(text);
+    });
+  });
+
+  describe("entries an earlier version of the overlay wrote (PR-3 R6)", () => {
+    it("a chord of the plugin's own namespace (ctrl+alt+shift + digit) left in the block by another chord list is cut out with it, not kept as the user's", () => {
+      const OLD_CHORD: Rule = { key: "ctrl+alt+shift+7", command: "workbench.action.someCommandAnOlderVersionBound" };
+      const stale = `[\n${OVERLAY_BEGIN}\n  ${JSON.stringify(OLD_CHORD)},\n  ${JSON.stringify({ key: "ctrl+alt+shift+6", command: "x.old", when: "editorFocus" })}\n${OVERLAY_END}\n]\n`;
+      const out = applyOverlay(stale);
+      expect(rulesOf(out)).toEqual(OURS);
+      expect(rulesOf(out).some((r) => r.command === OLD_CHORD.command)).toBe(false);
+      expect(rulesOf(removeOverlay(stale))).toEqual([]);
+    });
+
+    it("a rule the user's own keybinding editor added to the block is still kept (a chord of theirs outside the plugin's namespace)", () => {
+      const first = applyOverlay(null);
+      const edited = insertLikeVsCode(first, ADDED);
+      expect(rulesOf(removeOverlay(applyOverlay(edited)))).toEqual([ADDED]);
+    });
   });
 
   // VS Code's keybinding editor (jsonc-parser setProperty(text, [-1], rule)) writes a new rule, and the entry a 'Remove keybinding'

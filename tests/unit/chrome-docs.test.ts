@@ -5,7 +5,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { CHROME_SURFACES, visibleChrome, type ChromeSurfaceName } from "../../src/chrome-settings";
+import { CHROME_SURFACES, DIRTY_TITLE_SETTINGS, visibleChrome, type ChromeSurfaceName } from "../../src/chrome-settings";
 import { parseDecision } from "../decision";
 import { REPO_ROOT } from "../helpers";
 
@@ -65,5 +65,28 @@ describe("docs/spike-decision.md and CHROME_SURFACES", () => {
     const row = decisionText.split("\n").find((l) => l.startsWith("| `chrome: hidden`")) ?? "";
     expect(row).not.toBe("");
     for (const s of CHROME_SURFACES.filter((x) => x.measured !== "visible")) expect(row, s.surface).toContain(README_NAME[s.surface]);
+  });
+});
+
+describe("README and the unsaved-edits signal", () => {
+  const closing = readme.split("\n").find((l) => l.startsWith("- **Closing with unsaved edits.**")) ?? "";
+  const keys = readme.split("\n").find((l) => l.startsWith("- **Keys and other files in a Code tab.**")) ?? "";
+
+  it("the Closing bullet names the window.title case DIRTY_SCRIPT cannot catch (src/dirty-script.ts says the README does), and that the plugin writes ${dirty} itself", () => {
+    expect(closing).not.toBe("");
+    expect(closing).toContain(".vscode/settings.json");
+    expect(closing).toContain("`window.title`");
+    expect(closing).toContain("${dirty}");
+    expect(String(DIRTY_TITLE_SETTINGS["window.title"])).toContain("${dirty}");
+  });
+
+  it("the Closing bullet says what a tab that may hold another editor loses until it is reloaded", () => {
+    for (const effect of ["never reads clean", "renamed file is not reloaded", "does not close the tab", "idle"]) expect(closing, effect).toContain(effect);
+  });
+
+  it("the Keys bullet says a file opens at the top when editor.lineNumbers is off", () => {
+    expect(keys).toContain("at the definition's line");
+    expect(keys).toContain("`editor.lineNumbers` off");
+    expect(keys).toContain("top of the file");
   });
 });

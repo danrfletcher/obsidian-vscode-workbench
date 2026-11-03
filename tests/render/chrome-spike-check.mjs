@@ -49,6 +49,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   BREADCRUMBS_OFF, CLOSE_ACTIVE_CHORD, CLOSE_OTHERS_CHORD, DISABLE_ENTRIES, EDITOR_NOW, FLASH_RECORDER, GOTO_LINE_SYNTHETIC, LAYOUT_DUMP, LAYOUT_SEED, MEASURE, OTHER, PAGE_CLOSE_SCRIPT, PAGE_CSS_SCRIPT, PART_NAMES, READY, S2_WATCH, TABS_NONE, USER_CLOSE_CHORDS, ZEN,
 } from "./chrome-spike-scripts.mjs";
+import { classifyMarketplaceRequests } from "./marketplace-requests.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const CODE = process.env.CODE_CLI ?? "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code";
@@ -230,6 +231,7 @@ const serverTree = () => [...new Set(started.flatMap((p) => [p, ...descendants(p
 // --- the browser -------------------------------------------------------------------------------------
 const KNOWN_HOSTS = new Set(["127.0.0.1", "main.vscode-cdn.net", "marketplace.visualstudio.com"]);
 const hostsSeen = new Set();
+const requestsSeen = []; // every request of every page: { method, url }, so F4 can match the marketplace path, not only the host
 const consoleLog = []; // every console line of every page, with a timestamp
 
 async function browser(name, opts = {}) {
@@ -284,6 +286,7 @@ async function browser(name, opts = {}) {
   });
   on("Network.requestWillBeSent", (p) => {
     try { const h = new URL(p.request.url).hostname; if (h) hostsSeen.add(h); } catch { /* data: urls and the like */ }
+    requestsSeen.push({ method: p.request.method, url: p.request.url });
   });
   const key = async (k, code, vk, modifiers = 0) => {
     for (const type of ["rawKeyDown", "keyUp"]) await send("Input.dispatchKeyEvent", { type, key: k, code, windowsVirtualKeyCode: vk, modifiers });
@@ -1132,6 +1135,11 @@ results.hostsSeen = [...hostsSeen].sort();
 check(nonLoopback.length === 0, "F4: lsof -i on the server tree shows loopback listeners only", nonLoopback.slice(0, 3).join(" | "));
 const newHosts = [...hostsSeen].filter((h) => h && !KNOWN_HOSTS.has(h));
 check(newHosts.length === 0, "F4: Chrome saw no host beyond 127.0.0.1, main.vscode-cdn.net and the one marketplace query", `hosts: ${[...hostsSeen].join(", ")}${newHosts.length ? `; NEW: ${newHosts.join(", ")}` : ""}`);
+// The host list above lets any marketplace request through; the known set allows only the one extensionquery POST, so match
+// the method and path and count the requests (the per-extension `.../latest` lookups the seeded settings switch off must not return).
+const market = classifyMarketplaceRequests(requestsSeen);
+results.f4.marketplace = market;
+check(market.unexpected.length === 0, "F4: the only marketplace request is POST /_apis/public/gallery/extensionquery (the per-extension latest lookups stay off)", `extensionquery POSTs: ${market.queries}${market.unexpected.length ? `; UNEXPECTED: ${market.unexpected.slice(0, 5).join(", ")}` : ""}`);
 const realAfter = Object.fromEntries(REAL_FILES.map((f) => [f, sum(f)]));
 const changedReal = REAL_FILES.filter((f) => realBefore[f] !== realAfter[f]);
 results.f1 = { checked: REAL_FILES.map((f) => [f, realBefore[f] === "absent" ? "absent" : realBefore[f].slice(0, 12)]), changed: changedReal };

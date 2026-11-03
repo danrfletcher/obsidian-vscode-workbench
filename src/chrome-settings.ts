@@ -125,6 +125,9 @@ export const CHROME_SURFACES: readonly ChromeSurface[] = [
  * as a floating card with a 4 px margin on each outer side (`workbench.experimental.modernUI`, on by default; the card classes
  * `floating-editor-outer-*`), so with every part hidden the editor still measured 8 px narrower than the pane. Off, the editor's
  * width equals the webview's (`npm run check:workbench` measures it at four sizes). A user's own copy of this key loses to it.
+ * Measured on VS Code 1.143.1 (stable) and on 1.145.0-insider (the installed Insiders build); 1.144.0 was not available to measure.
+ * The key is experimental: if a VS Code build renames or promotes it, it is ignored silently, the 4 px margin comes back, and only
+ * `npm run check:workbench` (the editor-fills-the-pane measurement) notices, not `npm test`. Re-run it after a VS Code update.
  */
 export const EDITOR_FILL_SETTINGS: Readonly<Record<string, unknown>> = { "workbench.experimental.modernUI": false };
 
@@ -250,6 +253,9 @@ export const DISABLED_CHORDS: readonly { command: string; keys: readonly string[
   // script joins the groups again if one appears; these are the chords (Cmd+\ and Cmd+K Cmd+\).
   { command: "workbench.action.splitEditor", keys: ["cmd+\\", "ctrl+\\"] },
   { command: "workbench.action.splitEditorOrthogonal", keys: ["cmd+k cmd+\\", "ctrl+k ctrl+\\"] },
+  // Splits the one editor inside its own group (a second pane in the same editor-group-container), which the join-groups script
+  // cannot see. Cmd+K Cmd+Shift+\ is its default chord (VS Code 1.145.0's workbench bundle).
+  { command: "workbench.action.splitEditorInGroup", keys: ["cmd+k cmd+shift+\\", "ctrl+k ctrl+shift+\\"] },
 ];
 
 /**

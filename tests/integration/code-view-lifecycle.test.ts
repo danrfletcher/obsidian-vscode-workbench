@@ -150,7 +150,9 @@ function world(
     },
     restartServer: async () => undefined,
     userDataCopy: () => null,
-    ...(opts.chromeHiding ? { chromeHiding: opts.chromeHiding } : {}),
+    // A host like the plugin's: it gives the chrome-hiding script and opens files from the editor, so the page is watched and a clean title is trusted (PR-5 R10).
+    chromeHiding: opts.chromeHiding ?? (() => ({ keybindings: [], script: "0" })),
+    openFromEditor: async () => undefined,
     ...(opts.trust
       ? {
           trustVaultFolder: () => opts.trust?.enabled() ?? false,

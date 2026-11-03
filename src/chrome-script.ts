@@ -11,10 +11,11 @@
  * the panel's own hide button is clicked instead of its chord; the dialog is left for the user to answer (F8).
  *
  * It also keeps the tab to its one file: once the first editor shows, it closes every other editor the profile restored
- * (E6). It does not move keyboard focus: the Code tab focuses the webview itself when the page is ready (CodeView.focusWhenReady).
+ * (E6). If a restored editor holds unsaved (hot-exit) edits, VS Code's own Save / Don't Save prompt appears as the tab opens: nothing
+ * is discarded without the user's answer, and the script leaves that prompt alone (tests/unit/chrome-script.test.ts). It does not move keyboard focus: the Code tab focuses the webview itself when the page is ready (CodeView.focusWhenReady).
  *
  * Best effort (F3, F7): if VS Code renames a part's class, `shown()` never matches and the script presses nothing, so the
- * chrome shows as in 0.1.0 and nothing throws. Not a retry layer: one observer, a fixed budget of presses so a command that
+ * chrome shows as in 0.1.0 and nothing throws. Not a retry layer: one observer, a fixed budget of presses per part so a command that
  * does not hide its part cannot loop.
  */
 import { CLOSE_OTHER_EDITORS, closeRoutes, type KeybindingEntry } from "./chrome-settings";
@@ -22,11 +23,18 @@ import { CLOSE_OTHER_EDITORS, closeRoutes, type KeybindingEntry } from "./chrome
 /** What the script answers when it has been installed. Anything else the Code tab gets back (timeout, unsupported, error:...) is logged. */
 export const CHROME_SCRIPT_INSTALLED = "installed";
 
-/** The most chord presses one page load may make, so a command that never hides its part cannot spin. */
+/**
+ * The most presses the script may make for ONE part in a row, so a command that never hides its part cannot spin. A part's count
+ * starts again whenever the script sees that part hidden, so a long-lived tab in which many reveals are undone never runs out: the
+ * budget is spent only on a part that stays on screen after the press.
+ */
 export const CHROME_PRESS_BUDGET = 200;
 
 /** The selector of the editor the script waits for, then closes the other editors. */
 export const EDITOR_SELECTOR = ".part.editor .monaco-editor[data-uri]";
+
+/** The editor part: DOM changes inside it (typing, cursor blink, scrolling) cannot bring a hidden part back, so the observer skips them. */
+export const EDITOR_PART_SELECTOR = ".part.editor";
 
 /** VS Code's modal dialog (the Workspace Trust prompt, the save prompt). While it is up it stops every key event at itself, so no chord gets through. */
 export const MODAL_SELECTOR = ".monaco-dialog-modal-block";
@@ -47,7 +55,10 @@ export function buildChromeHideScript(): string {
   const others = ${JSON.stringify(others)};
   const editorSelector = ${JSON.stringify(EDITOR_SELECTOR)};
   const modalSelector = ${JSON.stringify(MODAL_SELECTOR)};
-  let budget = ${CHROME_PRESS_BUDGET};
+  const editorPartSelector = ${JSON.stringify(EDITOR_PART_SELECTOR)};
+  const spent = new Map();
+  const left = (id) => ${CHROME_PRESS_BUDGET} - (spent.get(id) || 0);
+  const spend = (id) => spent.set(id, (spent.get(id) || 0) + 1);
   let editorDone = false;
   let queued = false;
   window.__vscwChrome = true;
@@ -57,9 +68,9 @@ export function buildChromeHideScript(): string {
     const r = e.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   };
-  const press = (c) => {
-    if (budget <= 0) return;
-    budget--;
+  const press = (c, id) => {
+    if (left(id) <= 0) return;
+    spend(id);
     const o = { key: c.key, code: c.code, keyCode: c.keyCode, which: c.keyCode, ctrlKey: true, altKey: true, shiftKey: true, bubbles: true, cancelable: true };
     const target = document.activeElement || document.body;
     for (const t of ["keydown", "keyup"]) target.dispatchEvent(new KeyboardEvent(t, o));
@@ -69,20 +80,28 @@ export function buildChromeHideScript(): string {
   // with no button waits; the dialog going away changes the page, and the sweep then presses its chord.
   const click = (p) => {
     const b = p.button && document.querySelector(p.button);
-    if (!b || budget <= 0) return;
-    budget--;
+    if (!b || left(p.selector) <= 0) return;
+    spend(p.selector);
     b.click();
   };
   const sweep = () => {
     const modal = !!document.querySelector(modalSelector);
-    for (const p of parts) if (shown(p.selector)) { if (modal) click(p); else press(p); }
+    for (const p of parts) {
+      if (!shown(p.selector)) { spent.delete(p.selector); continue; } // closed: the next reveal has its whole budget
+      if (modal) click(p); else press(p, p.selector);
+    }
     if (!editorDone && shown(editorSelector)) {
       editorDone = true;
-      press(others);
+      press(others, editorSelector);
     }
   };
   const later = typeof requestAnimationFrame === "function" ? requestAnimationFrame : (f) => Promise.resolve().then(f);
-  new MutationObserver(() => {
+  // Typing, the cursor blink and scrolling churn the DOM inside the editor part many times a second, and none of it can bring a part
+  // back, so once the first editor has been dealt with a batch of changes that all sit inside the editor part is skipped: the sweep
+  // (four selector lookups and their layout reads) runs for changes elsewhere, which is where a part or a dialog appears.
+  const insideEditor = (n) => { const e = n && n.nodeType === 1 ? n : n && n.parentElement; return !!(e && e.closest && e.closest(editorPartSelector)); };
+  new MutationObserver((records) => {
+    if (editorDone && records.every((r) => insideEditor(r.target))) return;
     if (queued) return;
     queued = true;
     // Best effort: a page that is going away (or a layout the script does not understand) must not surface as an error.

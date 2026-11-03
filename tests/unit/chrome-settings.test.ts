@@ -116,6 +116,7 @@ describe("chrome settings (G5, GP1)", () => {
       { command: "workbench.action.toggleAuxiliaryBar", keys: ["cmd+alt+b", "ctrl+alt+b"] },
       { command: "workbench.action.splitEditor", keys: ["cmd+\\", "ctrl+\\"] },
       { command: "workbench.action.splitEditorOrthogonal", keys: ["cmd+k cmd+\\", "ctrl+k ctrl+\\"] },
+      { command: "workbench.action.splitEditorInGroup", keys: ["cmd+k cmd+shift+\\", "ctrl+k ctrl+shift+\\"] },
     ]);
   });
 

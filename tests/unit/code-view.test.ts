@@ -33,6 +33,9 @@ function makeView(host: Partial<CodeViewHost> = {}) {
   return { view, full, el: (view as unknown as { contentEl: FakeEl }).contentEl };
 }
 
+/** What the plugin's own host gives a tab besides the basics: the chrome-hiding script and the open-from-editor hand-off. Without them nothing watches the page, so a clean title is not trusted (PR-5 R10). */
+const pluginHost = (): Partial<CodeViewHost> => ({ chromeHiding: () => ({ keybindings: [], script: "0" }), openFromEditor: (async () => undefined) as never });
+
 beforeEach(() => {
   vi.stubGlobal("document", { createElement: (t: string) => new FakeEl(t) });
 });
@@ -224,7 +227,7 @@ describe("CodeView: one tab per file and the open guard", () => {
   });
 
   it("gives the old claim back when the tab moves to another file", async () => {
-    const { view, full } = makeView({ releaseFile: vi.fn() });
+    const { view, full } = makeView({ ...pluginHost(), releaseFile: vi.fn() });
     await view.setState({ file: "a.py" }, {} as never);
     await view.setState({ file: "b.py" }, {} as never);
     expect(full.releaseFile).toHaveBeenCalledWith("a.py", view.leaf);
@@ -480,7 +483,7 @@ describe("the trust seed in loadWorkbench (G5, G6, E3, GP3)", () => {
 
   it("reads the setting at every load: the toggle applies at the next tab load", async () => {
     let enabled = true;
-    const { view, el } = makeView(on({ trustVaultFolder: () => enabled }));
+    const { view, el } = makeView({ ...pluginHost(), ...on({ trustVaultFolder: () => enabled }) });
     await view.setState({ file: "a.py" }, {} as never);
     expect(el.children[0].executed).toHaveLength(2);
     enabled = false;
@@ -811,7 +814,7 @@ describe("CodeView: the chrome-hiding script (GP1)", () => {
   it("a load that was replaced before its workbench page was ready logs nothing for the old element", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     stubWebviews(async () => "timeout");
-    const { view, el } = makeView({ chromeHiding: hiding });
+    const { view, el } = makeView({ ...pluginHost(), chromeHiding: hiding });
     await view.setState({ file: "a.py" }, {} as never);
     const first = el.children[0];
     await view.setState({ file: "b.py" }, {} as never);
@@ -876,7 +879,7 @@ describe("CodeView: the chrome-hiding script (GP1)", () => {
 
     it("a load that was replaced does not take focus; the replacing load does", async () => {
       const focused = focusStub();
-      const { view, el } = makeView({ isActiveTab: () => true, chromeHiding: hiding });
+      const { view, el } = makeView({ ...pluginHost(), isActiveTab: () => true, chromeHiding: hiding });
       await view.setState({ file: "a.py" }, {} as never);
       const first = el.children[0];
       await view.setState({ file: "b.py" }, {} as never);
@@ -964,6 +967,49 @@ describe("CodeView: a file opened from the editor becomes its own tab (PR-4)", (
     const a = await loaded();
     const b = await loaded();
     expect(a.nonce).not.toBe(b.nonce);
+  });
+
+  describe("a workbench page that reloads itself (PR-2 R4, PR-4 R7)", () => {
+    it("runs the chrome script and the open-from-editor script again on the next dom-ready, with the same nonce, and says so", async () => {
+      const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+      const t = await loaded();
+      const chromeRuns = () => t.wv.executed.filter((c) => c === hiding().script).length;
+      const openRuns = () => t.wv.executed.filter((c) => c.includes("__vscwOpen")).length;
+      expect([chromeRuns(), openRuns()]).toEqual([1, 1]);
+      t.wv.fire("dom-ready"); // the page reloaded itself: a new document, none of the first load's scripts
+      await settle();
+      expect([chromeRuns(), openRuns()]).toEqual([2, 2]);
+      expect(nonceOf(t.wv)).toBe(t.nonce); // the console listener is the one from the first load, so the nonce must be the same
+      expect(t.wv.executed.filter((c) => c.includes("__vscwOpen")).every((c) => c.includes(t.nonce))).toBe(true);
+      expect(info.mock.calls.flat().join(" ")).toContain("reloaded itself");
+      t.wv.fire("dom-ready");
+      await settle();
+      expect([chromeRuns(), openRuns()]).toEqual([3, 3]);
+      // and a report after the reload is still taken
+      report(t.wv, t.nonce, { uri: HELPER, line: 2 });
+      await vi.waitFor(() => expect(t.calls).toHaveLength(1));
+      info.mockRestore();
+    });
+
+    it("runs nothing on a view that was closed or whose webview was replaced", async () => {
+      const t = await loaded();
+      const before = t.wv.executed.length;
+      await t.view.onClose();
+      t.wv.fire("dom-ready");
+      await settle();
+      expect(t.wv.executed).toHaveLength(before);
+    });
+
+    it("a reinstall that fails is logged, as on the first load", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const t = await loaded();
+      const run = t.wv.executeJavaScript.bind(t.wv);
+      t.wv.executeJavaScript = (code: string) => (code === hiding().script ? Promise.reject(new Error("Blocked")) : run(code));
+      t.wv.fire("dom-ready");
+      await settle();
+      expect(warn.mock.calls.flat().join(" ")).toContain("the chrome-hiding script did not run (error:Blocked)");
+      warn.mockRestore();
+    });
   });
 
   it("a file reported by the page is put away in this tab and handed to the host as a vault file at its line; the tab keeps its own file", async () => {
@@ -1109,6 +1155,23 @@ describe("CodeView: a file opened from the editor becomes its own tab (PR-4)", (
     info.mockRestore();
   });
 
+  it("PR-4 R8: the user is told, with a notice naming both files, where the edits of the opened file are", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const editsKeptInTab = vi.fn();
+    const t = await loaded({ editsKeptInTab });
+    t.restoreResult.value = RESTORE_SWITCHED;
+    report(t.wv, t.nonce, { uri: HELPER, line: 5 });
+    await vi.waitFor(() => expect(t.calls).toHaveLength(1));
+    expect(editsKeptInTab).toHaveBeenCalledTimes(1);
+    expect(editsKeptInTab).toHaveBeenCalledWith("a.py", "lib/helper x.js");
+    // a restore that went through says nothing
+    const quiet = vi.fn();
+    const u = await loaded({ editsKeptInTab: quiet });
+    report(u.wv, u.nonce, { uri: HELPER, line: 5 });
+    await vi.waitFor(() => expect(u.calls).toHaveLength(1));
+    expect(quiet).not.toHaveBeenCalled();
+  });
+
   describe("R1: a page that may hold another editor behind the tab's file never reads clean", () => {
     /** The window title the tab's DIRTY_SCRIPT reads: the active editor is the tab's own file, so the title carries no dirty mark. */
     const titleReads = (wv: FakeEl, dirty: boolean) => {
@@ -1117,8 +1180,8 @@ describe("CodeView: a file opened from the editor becomes its own tab (PR-4)", (
     };
     const quiet = () => [vi.spyOn(console, "warn").mockImplementation(() => undefined), vi.spyOn(console, "info").mockImplementation(() => undefined)];
     const choices = () => {
-      const asked: Array<{ file: string; state: string }> = [];
-      const confirmClose = vi.fn(async (req: { file: string; state: string }) => (asked.push({ file: req.file, state: req.state }), "cancel" as const));
+      const asked: Array<{ file: string; state: string; otherEditor?: string }> = [];
+      const confirmClose = vi.fn(async (req: { file: string; state: string; otherEditor?: string }) => (asked.push({ file: req.file, state: req.state, ...(req.otherEditor ? { otherEditor: req.otherEditor } : {}) }), "cancel" as const));
       return { asked, confirmClose };
     };
 
@@ -1134,8 +1197,60 @@ describe("CodeView: a file opened from the editor becomes its own tab (PR-4)", (
       expect(await t.view.bufferState()).toBe("unreadable");
       expect(await t.view.isDirty()).toBe(true);
       await t.view.requestClose();
-      expect(c.asked).toEqual([{ file: "a.py", state: "unreadable" }]);
+      // the prompt is told why: the edits are known to sit in another editor of this tab (PR-5 R8), not "the editor is not ready"
+      expect(c.asked).toEqual([{ file: "a.py", state: "unreadable", otherEditor: "unsaved" }]);
       expect((t.view as unknown as { leaf: { detached: boolean } }).leaf.detached).toBe(false);
+    });
+
+    it("an editor the page may hold behind the tab's file, with no sign that it has edits, is asked about as 'unknown'; a page that is not ready as neither", async () => {
+      quiet();
+      const c = choices();
+      const t = await loaded({ confirmClose: c.confirmClose as never });
+      titleReads(t.wv, false);
+      t.restoreResult.value = "dialog stays";
+      report(t.wv, t.nonce, { uri: HELPER, line: 5 });
+      await vi.waitFor(() => expect(t.calls).toHaveLength(1));
+      await t.view.requestClose();
+      expect(c.asked).toEqual([{ file: "a.py", state: "unreadable", otherEditor: "unknown" }]);
+      // a page that cannot be asked at all (the read throws) is "the editor is not ready", whatever else is in it
+      const notReady = choices();
+      const u = await loaded({ confirmClose: notReady.confirmClose as never });
+      const run = u.wv.executeJavaScript.bind(u.wv);
+      u.wv.executeJavaScript = (code: string) => (code === DIRTY_SCRIPT ? Promise.reject(new Error("no title")) : run(code));
+      await u.view.requestClose();
+      expect(notReady.asked).toEqual([{ file: "a.py", state: "unreadable" }]);
+    });
+
+    describe("a page nothing watches (PR-5 R10): Go to Definition or Cmd+P opens the other file inside the tab, so a clean title is not trusted", () => {
+      const cases: Array<[string, Partial<CodeViewHost>]> = [
+        ["the host's chromeHiding throws", { chromeHiding: () => { throw new Error("no overlay"); } }],
+        ["the host gives no chrome-hiding script", { chromeHiding: undefined }],
+        ["the host has no openFromEditor", { openFromEditor: undefined }],
+      ];
+      for (const [name, host] of cases) {
+        it(`${name}: the page is unreadable when the title reads clean, dirty when it carries the mark, and closing asks`, async () => {
+          quiet();
+          const c = choices();
+          const t = await loaded({ ...host, confirmClose: c.confirmClose as never });
+          expect((t.view as unknown as { mayHoldOtherEditor: boolean }).mayHoldOtherEditor).toBe(true);
+          titleReads(t.wv, false);
+          expect(await t.view.bufferState()).toBe("unreadable");
+          expect(await t.view.isDirty()).toBe(true);
+          await t.view.requestClose();
+          expect(c.asked).toEqual([{ file: "a.py", state: "unreadable", otherEditor: "unknown" }]);
+          expect((t.view as unknown as { leaf: { detached: boolean } }).leaf.detached).toBe(false);
+          titleReads(t.wv, true);
+          expect(await t.view.bufferState()).toBe("dirty");
+        });
+      }
+
+      it("a host that gives both reads a clean title as clean", async () => {
+        quiet();
+        const t = await loaded();
+        titleReads(t.wv, false);
+        expect((t.view as unknown as { mayHoldOtherEditor: boolean }).mayHoldOtherEditor).toBe(false);
+        expect(await t.view.bufferState()).toBe("clean");
+      });
     });
 
     it("a title that does carry the dirty mark still reads dirty", async () => {
@@ -1207,7 +1322,7 @@ describe("CodeView: a file opened from the editor becomes its own tab (PR-4)", (
         expect(await t.view.bufferState()).toBe("unreadable");
         expect(await t.view.isDirty()).toBe(true);
         await t.view.requestClose();
-        expect(c.asked).toEqual([{ file: "a.py", state: "unreadable" }]);
+        expect(c.asked).toEqual([{ file: "a.py", state: "unreadable", otherEditor: "unknown" }]);
         expect((t.view as unknown as { leaf: { detached: boolean } }).leaf.detached).toBe(false);
         expect(t.calls).toEqual([]); // nothing was handed on and nothing was put away: it stays in the tab, as VS Code does
         expect(t.order).toEqual([]);
@@ -1422,7 +1537,7 @@ describe("CodeView: the cursor line (PR-4, GP3)", () => {
 describe("CodeView: a tab handed another file by Obsidian still holds one file (PR-4, GP2)", () => {
   it("a clean tab loads the new file alone: the old claim is given back, the page is replaced, and no page shows two files", async () => {
     const released: string[] = [];
-    const { view, el } = makeView({ releaseFile: (f) => void released.push(f) });
+    const { view, el } = makeView({ ...pluginHost(), releaseFile: (f) => void released.push(f) });
     await view.setState({ file: "a.py" }, {} as never);
     const first = el.children[0];
     await view.setState({ file: "b.py" }, {} as never);
@@ -1517,7 +1632,7 @@ describe("CodeView: a tab handed another file by Obsidian still holds one file (
 
   it("a tab with no unsaved edits is not asked at all", async () => {
     const asked: unknown[] = [];
-    const { view } = makeView({ confirmClose: async (r) => (asked.push(r), "cancel") });
+    const { view } = makeView({ ...pluginHost(), confirmClose: async (r) => (asked.push(r), "cancel") });
     await view.setState({ file: "a.py" }, {} as never);
     await view.setState({ file: "b.py" }, {} as never);
     expect(asked).toEqual([]);

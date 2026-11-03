@@ -54,7 +54,9 @@ export function workbenchOverlay(opts: { dark: boolean }): Record<string, unknow
 
 /**
  * The overlay of the terminal drawer's host page: its theme and the parts the Code tab hid before the editor-only tab. It does
- * not carry the Code tab's hiding settings (tab strip, breadcrumbs, Zen overrides: F2), so the drawer is exactly what it was.
+ * not carry the Code tab's hiding settings (tab strip, breadcrumbs, Zen overrides: F2) in its own per-load overlay. It is not
+ * untouched, though: `buildMachineSettings` writes the whole hiding set into the server-wide Machine file, the drawer's page is
+ * on the same server and does not override those keys, so it reads them too. That page is panel-only, so nothing shows.
  */
 export function terminalOverlay(opts: { dark: boolean }): Record<string, unknown> {
   return { ...themeSettings(opts.dark), ...legacyChromeSettings() };
