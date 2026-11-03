@@ -129,6 +129,14 @@ export const CHROME_SURFACES: readonly ChromeSurface[] = [
 export const EDITOR_FILL_SETTINGS: Readonly<Record<string, unknown>> = { "workbench.experimental.modernUI": false };
 
 /**
+ * Not a part either: the window title the plugin's unsaved-edit signal reads (PR-5; src/dirty-script.ts, docs/spike-chrome.md S5).
+ * With the tab strip hidden the title's leading "●" (`${dirty}`) is the only mark of an unsaved editor, so the plugin writes the
+ * template itself: a `window.title` copied from the user's own settings cannot drop the mark, and the overlay wins over it. The
+ * template is the default one without the folder name; it never reads empty (`${appName}` stays when no editor is open).
+ */
+export const DIRTY_TITLE_SETTINGS: Readonly<Record<string, unknown>> = { "window.title": "${dirty}${activeEditorShort}${separator}${appName}" };
+
+/**
  * The parts GP1 names, and the surface whose hiding takes each one away. Explorer and Open Editors are views inside the
  * side bar, so they go with it.
  */
@@ -145,9 +153,9 @@ export const GP1_PARTS: Readonly<Record<string, ChromeSurfaceName>> = {
   "secondary side bar": "secondarySideBar",
 };
 
-/** Every setting that hides a surface, and the ones that make the editor fill the pane. Idempotent: the same object content on every call. */
+/** Every setting that hides a surface, the ones that make the editor fill the pane, and the window title of the unsaved-edit signal. Idempotent: the same object content on every call. */
 export function chromeSettings(): Record<string, unknown> {
-  return Object.assign({}, ...CHROME_SURFACES.map((s) => s.setting), EDITOR_FILL_SETTINGS);
+  return Object.assign({}, ...CHROME_SURFACES.map((s) => s.setting), EDITOR_FILL_SETTINGS, DIRTY_TITLE_SETTINGS);
 }
 
 /** The surfaces no measured route hides. Empty: every part has one. */

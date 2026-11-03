@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GO_TO_LINE_DONE, buildGoToLineScript } from "../../src/goto-line-script";
-import { OPEN_INTERCEPT_INSTALLED, OPEN_REPORT_PREFIX, OPEN_SETTLE_MS, RESTORE_OPEN_SCRIPT, buildOpenInterceptScript, parseOpenReport } from "../../src/open-intercept-script";
+import { OPEN_INTERCEPT_INSTALLED, OPEN_REPORT_PREFIX, OPEN_SETTLE_MS, OTHER_EDITOR_PREFIX, RESTORE_OPEN_SCRIPT, buildOpenInterceptScript, isOtherEditorReport, parseOpenReport } from "../../src/open-intercept-script";
 
 // jsdom ships no types; a fresh page per test (see tests/unit/chrome-script.test.ts).
 interface JSDOM {
@@ -132,13 +132,42 @@ describe("the open-from-editor page script", () => {
     expect(logs).toEqual([]);
   });
 
-  it("only reports files of the workbench's remote file system: a settings page or an untitled file stays inside the tab", async () => {
+  it("only reports files of the workbench's remote file system as opens: a settings page or an untitled file stays inside the tab, nothing is pressed", async () => {
     showEditor(OWN, 3);
     install();
     for (const uri of ["vscode-userdata://127.0.0.1:5555/User/settings.json", "untitled:Untitled-1", "output:extension-output"]) {
       showEditor(uri, 1);
       await settle();
     }
+    expect(reports()).toEqual([]);
+    expect(presses).toEqual([]);
+  });
+
+  it("R7: an editor kept inside the tab is announced once per file shown (the tab cannot see it behind its own file), and again after the own file was back", async () => {
+    const other = () => logs.filter((l) => l.startsWith(`${OTHER_EDITOR_PREFIX}${NONCE}:`)).map((l) => JSON.parse(l.slice(`${OTHER_EDITOR_PREFIX}${NONCE}:`.length)).uri);
+    showEditor(OWN, 3);
+    install();
+    showEditor("untitled:Untitled-1", 1);
+    await settle();
+    setLine(2);
+    await settle();
+    expect(other()).toEqual(["untitled:Untitled-1"]);
+    expect(isOtherEditorReport(logs[0], NONCE)).toBe(true);
+    expect(isOtherEditorReport(logs[0], "other-nonce")).toBe(false);
+    expect(parseOpenReport(logs[0], NONCE)).toBeNull(); // not an open: the tab never hands it on or presses anything
+    showEditor(OWN, 3);
+    await settle();
+    showEditor("untitled:Untitled-1", 1);
+    await settle();
+    expect(other()).toEqual(["untitled:Untitled-1", "untitled:Untitled-1"]);
+    expect(presses).toEqual([]);
+  });
+
+  it("R7: the tab's own file shown again says nothing", async () => {
+    showEditor(OWN, 3);
+    install();
+    showEditor(OWN, 3);
+    await settle();
     expect(logs).toEqual([]);
   });
 

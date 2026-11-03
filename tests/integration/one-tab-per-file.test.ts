@@ -9,7 +9,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileSystemAdapter, Modal, Notice, Plugin, TFile, WorkspaceLeaf, type MockApp } from "../mocks/obsidian";
 import VSCodeWorkbenchPlugin from "../../src/main";
-import { CodeView } from "../../src/code-view";
+import { CodeView, DIRTY_SCRIPT } from "../../src/code-view";
 import { LicenceDeclinedError } from "../../src/licence";
 import { buildFileUri, targetOfUri } from "../../src/paths";
 import { FAKE_CODE, isAlive, tempDir } from "../helpers";
@@ -409,7 +409,7 @@ describe("the real CodeView (PR-4 R7)", () => {
       for (const fn of this.listeners[n]?.splice(0) ?? []) fn();
     }
     async executeJavaScript(code: string) {
-      return code.includes("tab.dirty") ? false : "seeded"; // DIRTY_SCRIPT: clean
+      return code === DIRTY_SCRIPT ? false : "seeded"; // clean
     }
     focused = 0;
     focus() {

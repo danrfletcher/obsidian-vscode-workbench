@@ -153,7 +153,14 @@ await build({
 });
 const load = (n) => import(pathToFileURL(path.join(work, `plugin/${n}.mjs`)).href);
 const settings = await load("settings");
-const { DIRTY_SCRIPT, fileDirtyScript } = await load("dirty-script");
+const { DIRTY_SCRIPT } = await load("dirty-script");
+// PR-1's S5 measured the per-file tab-strip reader that src/dirty-script.ts had before PR-5 removed it (the window title replaced it); the
+// spike keeps its own copy, as the control for the "tab strip is gone" rows. It is not part of the plugin.
+const fileDirtyScript = (name) => `((name) => {
+  const tabs = [...document.querySelectorAll(".monaco-workbench .tab")].filter((t) => t.getAttribute("data-resource-name") === name);
+  if (tabs.length === 0) return "none";
+  return tabs.some((t) => t.classList.contains("dirty")) ? "dirty" : "clean";
+})(${JSON.stringify(name)})`;
 const bridge = await load("hotkey-bridge");
 const paths = await load("paths");
 const { legacyChromeSettings } = await load("chrome-settings");

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceLeaf } from "../mocks/obsidian";
-import { CodeView, VIEW_TYPE_CODE, baseName, logChromeOutcome, logGoToLine, logSeedOutcome, logTrustOutcome, runInWebview, runScriptsInWebview, type CodeViewHost } from "../../src/code-view";
+import { CodeView, DIRTY_SCRIPT, VIEW_TYPE_CODE, baseName, logChromeOutcome, logGoToLine, logSeedOutcome, logTrustOutcome, runInWebview, runScriptsInWebview, type CodeViewHost } from "../../src/code-view";
 import { LicenceDeclinedError } from "../../src/licence";
 import { BROWSER_APP_SETTINGS, buildBrowserSeedScript } from "../../src/settings";
 import { FakeWebview as FakeEl } from "../helpers";
@@ -8,7 +8,7 @@ import { buildTrustSeedScript } from "../../src/trust/trust-seed";
 import { CHROME_SCRIPT_INSTALLED, buildChromeHideScript } from "../../src/chrome-script";
 import { chromeKeybindings } from "../../src/chrome-settings";
 import { GO_TO_LINE_DONE, buildGoToLineScript } from "../../src/goto-line-script";
-import { OPEN_REPORT_PREFIX, RESTORE_OPEN_SCRIPT, RESTORE_SWITCHED } from "../../src/open-intercept-script";
+import { OPEN_INTERCEPT_INSTALLED, OPEN_REPORT_PREFIX, OTHER_EDITOR_PREFIX, RESTORE_OPEN_SCRIPT, RESTORE_SWITCHED } from "../../src/open-intercept-script";
 import type { EditorTarget } from "../../src/paths";
 import { workbenchOverlay as workbenchOverlayFor } from "../../src/settings";
 
@@ -866,6 +866,10 @@ describe("CodeView: a file opened from the editor becomes its own tab (PR-4)", (
         void execute(code);
         return Promise.resolve(restoreResult.value);
       }
+      if (code.includes("__vscwOpen")) {
+        void execute(code); // recorded as run; the fake page answers like a page the script installed in
+        return Promise.resolve(OPEN_INTERCEPT_INSTALLED);
+      }
       return execute(code);
     };
     wv.fire("dom-ready");
@@ -1008,6 +1012,150 @@ describe("CodeView: a file opened from the editor becomes its own tab (PR-4)", (
     expect(t.el.children[0]).toBe(t.wv);
     warn.mockRestore();
     info.mockRestore();
+  });
+
+  describe("R1: a page that may hold another editor behind the tab's file never reads clean", () => {
+    /** The window title the tab's DIRTY_SCRIPT reads: the active editor is the tab's own file, so the title carries no dirty mark. */
+    const titleReads = (wv: FakeEl, dirty: boolean) => {
+      const run = wv.executeJavaScript.bind(wv);
+      wv.executeJavaScript = (code: string) => (code === DIRTY_SCRIPT ? Promise.resolve(dirty) : run(code));
+    };
+    const quiet = () => [vi.spyOn(console, "warn").mockImplementation(() => undefined), vi.spyOn(console, "info").mockImplementation(() => undefined)];
+    const choices = () => {
+      const asked: Array<{ file: string; state: string }> = [];
+      const confirmClose = vi.fn(async (req: { file: string; state: string }) => (asked.push({ file: req.file, state: req.state }), "cancel" as const));
+      return { asked, confirmClose };
+    };
+
+    it("a restore that answered 'switched': the title reads clean, but the tab is unreadable, isDirty() is true, and closing asks (Cancel keeps the tab)", async () => {
+      quiet();
+      const c = choices();
+      const t = await loaded({ confirmClose: c.confirmClose as never });
+      titleReads(t.wv, false);
+      expect(await t.view.bufferState()).toBe("clean"); // before: nothing else is in the page
+      t.restoreResult.value = RESTORE_SWITCHED;
+      report(t.wv, t.nonce, { uri: HELPER, line: 5 });
+      await vi.waitFor(() => expect(t.calls).toHaveLength(1)); // the other file was handed on and opened from disk
+      expect(await t.view.bufferState()).toBe("unreadable");
+      expect(await t.view.isDirty()).toBe(true);
+      await t.view.requestClose();
+      expect(c.asked).toEqual([{ file: "a.py", state: "unreadable" }]);
+      expect((t.view as unknown as { leaf: { detached: boolean } }).leaf.detached).toBe(false);
+    });
+
+    it("a title that does carry the dirty mark still reads dirty", async () => {
+      quiet();
+      const t = await loaded();
+      titleReads(t.wv, true);
+      t.restoreResult.value = RESTORE_SWITCHED;
+      report(t.wv, t.nonce, { uri: HELPER, line: 5 });
+      await vi.waitFor(() => expect(t.calls).toHaveLength(1));
+      expect(await t.view.bufferState()).toBe("dirty");
+    });
+
+    it.each(["no budget", "not installed", "blocked by a dialog", "dialog stays"])("a restore answered '%s' leaves the tab unreadable, not clean", async (answer) => {
+      quiet();
+      const t = await loaded();
+      titleReads(t.wv, false);
+      t.restoreResult.value = answer;
+      report(t.wv, t.nonce, { uri: HELPER, line: 5 });
+      await vi.waitFor(() => expect(t.calls).toHaveLength(1));
+      expect(await t.view.bufferState()).toBe("unreadable");
+      expect(await t.view.isDirty()).toBe(true);
+    });
+
+    it("a restore that throws leaves the tab unreadable, not clean", async () => {
+      quiet();
+      const t = await loaded();
+      const run = t.wv.executeJavaScript.bind(t.wv);
+      t.wv.executeJavaScript = (code: string) => (code === RESTORE_OPEN_SCRIPT ? Promise.reject(new Error("page gone")) : code === DIRTY_SCRIPT ? Promise.resolve(false) : run(code));
+      report(t.wv, t.nonce, { uri: HELPER, line: 5 });
+      await vi.waitFor(() => expect(t.calls).toHaveLength(1));
+      expect(await t.view.bufferState()).toBe("unreadable");
+    });
+
+    it("an open-from-editor script that did not install leaves the tab unreadable, not clean", async () => {
+      quiet();
+      const { view, el } = makeView({ chromeHiding: hiding, openFromEditor: vi.fn() as never });
+      await view.setState({ file: "a.py" }, {} as never);
+      const wv = el.children[0];
+      wv.executeResult = async () => "seeded"; // not "installed"
+      titleReads(wv, false);
+      wv.fire("dom-ready");
+      await settle();
+      expect(await view.bufferState()).toBe("unreadable");
+    });
+
+    it("a restore that was pressed leaves the tab clean: close goes ahead with no prompt", async () => {
+      quiet();
+      const c = choices();
+      const t = await loaded({ confirmClose: c.confirmClose as never });
+      titleReads(t.wv, false);
+      report(t.wv, t.nonce, { uri: HELPER, line: 5 });
+      await vi.waitFor(() => expect(t.calls).toHaveLength(1));
+      expect(await t.view.bufferState()).toBe("clean");
+      await t.view.requestClose();
+      expect(c.asked).toEqual([]);
+      expect((t.view as unknown as { leaf: { detached: boolean } }).leaf.detached).toBe(true);
+    });
+
+    describe("R7: an editor VS Code keeps inside the tab (untitled, user settings, another server's file)", () => {
+      const other = (wv: FakeEl, nonce: string, uri: string) => wv.emit("console-message", { message: `${OTHER_EDITOR_PREFIX}${nonce}:${JSON.stringify({ uri })}`, level: 0 });
+
+      it.each(["untitled:Untitled-1", "vscode-userdata://127.0.0.1:5555/User/settings.json"])("%s shown in the page: the title reads clean, but the tab is unreadable, isDirty() is true, and closing asks", async (uri) => {
+        quiet();
+        const c = choices();
+        const t = await loaded({ confirmClose: c.confirmClose as never });
+        titleReads(t.wv, false);
+        expect(await t.view.bufferState()).toBe("clean");
+        other(t.wv, t.nonce, uri);
+        expect(await t.view.bufferState()).toBe("unreadable");
+        expect(await t.view.isDirty()).toBe(true);
+        await t.view.requestClose();
+        expect(c.asked).toEqual([{ file: "a.py", state: "unreadable" }]);
+        expect((t.view as unknown as { leaf: { detached: boolean } }).leaf.detached).toBe(false);
+        expect(t.calls).toEqual([]); // nothing was handed on and nothing was put away: it stays in the tab, as VS Code does
+        expect(t.order).toEqual([]);
+      });
+
+      it("a vscode-remote file of another server (reported as an open, which the tab does not take) also marks the page", async () => {
+        quiet();
+        const t = await loaded();
+        titleReads(t.wv, false);
+        report(t.wv, t.nonce, { uri: "vscode-remote://127.0.0.1:9999/Users/dan/My%20Vault/lib/h.js", line: 3 });
+        await settle();
+        expect(t.calls).toEqual([]);
+        expect(await t.view.bufferState()).toBe("unreadable");
+      });
+
+      it("a dirty title is still dirty", async () => {
+        quiet();
+        const t = await loaded();
+        titleReads(t.wv, true);
+        other(t.wv, t.nonce, "untitled:Untitled-1");
+        expect(await t.view.bufferState()).toBe("dirty");
+      });
+
+      it("a notice with another nonce (an extension printing) marks nothing", async () => {
+        quiet();
+        const t = await loaded();
+        titleReads(t.wv, false);
+        other(t.wv, "x" + t.nonce, "untitled:Untitled-1");
+        expect(await t.view.bufferState()).toBe("clean");
+      });
+    });
+
+    it("a reload of the page clears it: the new page holds only the tab's file", async () => {
+      quiet();
+      const t = await loaded();
+      titleReads(t.wv, false);
+      t.restoreResult.value = RESTORE_SWITCHED;
+      report(t.wv, t.nonce, { uri: HELPER, line: 5 });
+      await vi.waitFor(() => expect(t.calls).toHaveLength(1));
+      expect(await t.view.bufferState()).toBe("unreadable");
+      await (t.view as unknown as { loadWorkbench(): Promise<void> }).loadWorkbench();
+      expect((t.view as unknown as { mayHoldOtherEditor: boolean }).mayHoldOtherEditor).toBe(false);
+    });
   });
 
   it("a restore that was pressed logs nothing about it", async () => {

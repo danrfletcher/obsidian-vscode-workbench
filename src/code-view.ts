@@ -2,13 +2,13 @@
 import { ItemView, type ViewStateResult, type WorkspaceLeaf } from "obsidian";
 import type { KeybindingEntry } from "./chrome-settings";
 import { CHROME_SCRIPT_INSTALLED } from "./chrome-script";
-import { DIRTY_SCRIPT, fileDirtyScript } from "./dirty-script";
+import { DIRTY_SCRIPT } from "./dirty-script";
 import { decide, resolveChoice, SETTLE_MS, SETTLE_POLL_MS, type AutoSave, type BufferState } from "./dirty-guard";
 import { LicenceDeclinedError } from "./licence";
 import type { CloseDirtyRequest } from "./modals";
 import { buildGoToLineScript, GO_TO_LINE_DONE, GO_TO_LINE_TOTAL_MS } from "./goto-line-script";
 import { fileKey } from "./open-file";
-import { buildOpenInterceptScript, OPEN_INTERCEPT_INSTALLED, parseOpenReport, RESTORE_OPEN_SCRIPT, RESTORE_SWITCHED, type OpenReport } from "./open-intercept-script";
+import { buildOpenInterceptScript, isOtherEditorReport, OPEN_INTERCEPT_INSTALLED, parseOpenReport, RESTORE_OPEN_SCRIPT, RESTORE_SWITCHED, type OpenReport } from "./open-intercept-script";
 import { authorityOf, buildFileUri, buildFileUrl, normalizeLine, targetOfUri, type EditorTarget } from "./paths";
 import type { CarryResult } from "./rename-carry";
 import type { RunningServer } from "./server";
@@ -328,6 +328,14 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
   /** The workbench page of the current load has reported dom-ready (the first dom-ready is the server's origin page). */
   private workbenchReady = false;
   /**
+   * The page of the current load may hold an editor besides the tab's own file (PR-5 R1). The window title that `bufferState`
+   * reads follows the ACTIVE editor only, so an unsaved editor behind the tab's file would read clean. Set when the open-from-editor
+   * script did not install, or when putting an opened editor away did not end in "pressed" (the unsaved editor stayed, the
+   * close was blocked, timed out or threw), or when the page shows an editor that stays in the tab (an untitled file, user
+   * settings, a file of another server: R7). While set, `bufferState` never answers "clean". Cleared when the page is loaded again.
+   */
+  private mayHoldOtherEditor = false;
+  /**
    * Set by a rename of the loaded file: the workbench's buffer stays bound to `from`, the path it was loaded from,
    * while the file is now at `to` (this.file, or the ineligible new name). A save writes the edits to `from`; they are
    * moved into the renamed file by `settleRename`. `baseline` is the renamed file's bytes when the rename was noticed.
@@ -515,37 +523,21 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
 
   /**
    * What the workbench in this tab holds: "dirty" or "clean" as the page reports, or "unreadable" when the
-   * page cannot be asked (not loaded yet, an iframe, the script fails or does not answer). A tab with no
-   * file has nothing to lose and is "clean".
+   * page cannot be asked (not loaded yet, an iframe, the script fails or does not answer, or the window title that
+   * carries the signal is not there: `DIRTY_SCRIPT` throws then). The page reports the tab's one file: the
+   * title's dirty mark follows the active editor, and a tab holds one file. A tab with no file has nothing to lose
+   * and is "clean". While the page may hold another editor behind the tab's file (`mayHoldOtherEditor`) the title
+   * cannot vouch for it, so a title that reads clean is "unreadable" instead (a dirty title is still "dirty").
    */
   async bufferState(): Promise<BufferState> {
     if (!this.file) return "clean";
     const f = this.frame as WebviewLike | null;
     if (!f || typeof f.executeJavaScript !== "function" || !this.domReady) return "unreadable";
     try {
-      return (await withTimeout(f.executeJavaScript(DIRTY_SCRIPT), READ_TIMEOUT_MS)) === true ? "dirty" : "clean";
+      if ((await withTimeout(f.executeJavaScript(DIRTY_SCRIPT), READ_TIMEOUT_MS)) === true) return "dirty";
+      return this.mayHoldOtherEditor ? "unreadable" : "clean";
     } catch {
       return "unreadable";
-    }
-  }
-
-  /**
-   * Like `bufferState`, but for the buffer of ONE file when other editors of the page may be unsaved too. The page-wide
-   * probe stays "dirty" while any editor is unsaved, which would hide a save of this file's own buffer. So when the page
-   * reads dirty, the tab of this file is asked: "clean" only when that tab is found and is not dirty. A tab that is
-   * not found (tab strip hidden by a setting, editor closed), an answer that makes no sense or a failed read keep the
-   * page-wide "dirty": never a guess towards clean.
-   */
-  private async fileState(path: string): Promise<BufferState> {
-    const page = await this.bufferState();
-    if (page !== "dirty") return page;
-    const f = this.frame as WebviewLike | null;
-    if (!f || typeof f.executeJavaScript !== "function") return page;
-    try {
-      const name = path.slice(path.lastIndexOf("/") + 1);
-      return (await withTimeout(f.executeJavaScript(fileDirtyScript(name)), READ_TIMEOUT_MS)) === "clean" ? "clean" : "dirty";
-    } catch {
-      return "dirty";
     }
   }
 
@@ -787,6 +779,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     this.crashed = false;
     this.stale = false;
     this.domReady = false;
+    this.mayHoldOtherEditor = false; // a new page holds only the tab's own file
     this.dropBridge();
     this.contentEl.empty();
     this.frame = null;
@@ -869,12 +862,16 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     const nonce = globalThis.crypto.randomUUID();
     el.addEventListener("console-message", (event: Event) => {
       if (this.frame !== el || this.closed) return;
-      const report = parseOpenReport((event as { message?: unknown } | undefined)?.message, nonce);
+      const message = (event as { message?: unknown } | undefined)?.message;
+      // An editor VS Code keeps inside the tab (untitled, settings, output): it may hold typed text behind the tab's file (R7).
+      if (isOtherEditorReport(message, nonce)) this.mayHoldOtherEditor = true;
+      const report = parseOpenReport(message, nonce);
       if (report) void this.openedFromEditor(el, authority, report);
     });
     void runInWebview(el as WebviewLike, buildOpenInterceptScript(nonce)).then((outcome) => {
       if (this.frame !== el) return;
       if (outcome !== OPEN_INTERCEPT_INSTALLED) {
+        this.mayHoldOtherEditor = true; // nothing puts an opened editor away, so one may sit behind the tab's file
         console.warn(`VS Code Workbench: the open-from-editor script did not install (${String(outcome)}); a file opened from this tab's editor opens inside the tab, as VS Code does.`);
       }
     });
@@ -882,13 +879,18 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
 
   private async openedFromEditor(el: HTMLElement, authority: string, report: OpenReport): Promise<void> {
     const target = targetOfUri(report.uri, authority, this.host.vaultRoot());
-    if (target.kind === "other") return; // not a file of this server: it opens inside the tab as VS Code does
+    if (target.kind === "other") {
+      // Not a file of this server (another authority, say): it opens inside the tab as VS Code does, and may hold typed text there.
+      if (this.frame === el) this.mayHoldOtherEditor = true;
+      return;
+    }
     // The tab's own file is not "another file" (a spelling of the same path): leave the editor alone.
     if (target.kind === "vault" && [this.file, this.shownFile].some((own) => own !== "" && fileKey(own) === fileKey(target.file))) return;
     try {
       const f = el as WebviewLike;
       if (typeof f.executeJavaScript === "function") {
         const restored = await withTimeout(f.executeJavaScript(RESTORE_OPEN_SCRIPT), 3000);
+        if (restored !== "pressed" && this.frame === el) this.mayHoldOtherEditor = true;
         if (restored === RESTORE_SWITCHED) {
           // The opened file already held unsaved edits in this tab, so VS Code would not close it without asking. The prompt was
           // cancelled and the tab shows its own file; the edits stay here (nothing was saved or discarded for the user).
@@ -898,6 +900,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
         }
       }
     } catch (e) {
+      if (this.frame === el) this.mayHoldOtherEditor = true;
       console.warn(`VS Code Workbench: could not put the opened editor away (${e instanceof Error ? e.message : String(e)}); this tab may show the other file too.`);
     }
     try {
@@ -1022,12 +1025,11 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
    * Look at the buffer and at the old path of a renamed file, and note whether the tab saved since the last look
    * (R8). A save is the buffer going from dirty to clean while the old path's file changed, because a save writes the
    * file before the buffer reads clean. Edits that are undone (clean again with no write by the tab) leave the file
-   * as it was, so a file put there by something else is never taken for the tab's save. The page-wide probe stays
-   * dirty while ANY editor of the page is unsaved (another file's edits, or a buffer the workbench restored), so the
-   * state is read for this file's own tab (`fileState`): a save of this buffer shows as dirty-to-clean even then.
-   * Only when that tab cannot be found does the page-wide answer stand, and a save is then not seen: it is not
-   * carried (it cannot be told from a write by something else), and settleRename tells the user that the text is in
-   * the old path. Nothing is lost or overwritten. Never throws.
+   * as it was, so a file put there by something else is never taken for the tab's save. The state is the tab's own
+   * (`bufferState`: the window title's dirty mark follows the tab's one file), so unsaved edits of another buffer in
+   * the page do not hide a save of this one. A state that cannot be read ("unreadable") is not counted as a save: it
+   * is not carried (it cannot be told from a write by something else), and settleRename tells the user that the text
+   * is in the old path. Nothing is lost or overwritten. Never throws.
    */
   observeMove(): Promise<void> {
     const look = this.observing.then(() => this.lookAtMove()).catch(() => undefined);
@@ -1044,7 +1046,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     if (!from) return;
     const stat = (): Promise<string | null> => this.statOld(from);
     const before = await stat();
-    const state = await this.fileState(from);
+    const state = await this.bufferState();
     if (state === "unreadable") {
       // The buffer was not seen, so a later dirty-to-clean change cannot be matched with the earlier look: it is not
       // counted as a save (R11). A save made in this gap is then reported as "not moved", never carried on a guess.
@@ -1120,9 +1122,8 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
    * (the load's end calls this again), while the tab is stopped or crashed (its next load uses the new
    * path), or while the buffer holds unsaved edits or cannot be read: a reload would drop them, so the
    * embed stays on the old buffer, and the move is applied once it is saved (checked when the tab is shown, and at every look of the move watch, so a save made inside the embed applies it within about a second),
-   * after the saved text has been carried from the old path into the renamed file. The reload waits for every
-   * editor of the page to be saved, but the carrying does not: a save of this file's own buffer is carried at once
-   * (`carryHeld`), even while another editor stays unsaved.
+   * after the saved text has been carried from the old path into the renamed file. A save that lands between the
+   * look that found the buffer unsaved and now is carried at once (`carryHeld`), without waiting for the reload.
    * Repeated renames end in one reload to the final path.
    */
   private async repoint(): Promise<void> {
@@ -1151,15 +1152,15 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
   }
 
   /**
-   * The page cannot be reloaded (some editor of it is unsaved), but this renamed file's own buffer may have been saved
+   * The reload is held back (the buffer reads unsaved), but this renamed file's own buffer may have been saved
    * meanwhile: its text sits in the old path, where it would stay until the reload. Carry it into the renamed file now.
    * The buffer is still bound to the old path, so the move is remembered again: a later save of it is carried too, and
-   * not left to recreate the old file. Does nothing unless a save was seen and this file's own tab reads clean.
+   * not left to recreate the old file. Does nothing unless a save was seen and the tab now reads clean.
    */
   private async carryHeld(): Promise<void> {
     const move = this.pendingMove;
     if (!move?.saved || this.closed || this.deleted) return;
-    if ((await this.fileState(move.from)) !== "clean") return;
+    if ((await this.bufferState()) !== "clean") return;
     const carried = await this.settleRename();
     if (carried && !this.closed && !this.deleted) this.notePendingMove(this.file);
   }

@@ -10,8 +10,11 @@
  * script reads the DOM and presses seeded chords.
  *
  * The first file the page shows is the tab's own: it never triggers a report (the file the tab was loaded with). Only
- * `vscode-remote:` files are reported; a settings page, an untitled file or an output channel opens inside the tab as VS Code
- * would. The report carries a nonce the Code tab made for this load, so a message printed by an extension is not taken for one.
+ * `vscode-remote:` files are reported as opens; a settings page, an untitled file or an output channel opens inside the tab as VS
+ * Code would. That editor can hold typed text and, with no tab strip, is easy to leave behind the tab's own file, so the script
+ * tells the Code tab about it with a second message (`OTHER_EDITOR_PREFIX`, once per file shown, no restore): the tab then never
+ * reads clean for the rest of the page load (PR-5 R7). Both messages carry a nonce the Code tab made for this load, so a message
+ * printed by an extension is not taken for one.
  *
  * It also keeps the tab to one editor group (E4): VS Code's own editor splits have no tab strip to be dragged from here, but the
  * palette's "Split Editor" still works, so a second visible group makes the script press the join-all-groups chord.
@@ -37,6 +40,13 @@ export const OPEN_SETTLE_MS = 250;
  */
 export const OPEN_PRESS_BUDGET = 100;
 
+/**
+ * A message `<OTHER_EDITOR_PREFIX><nonce>:<json>` says the editor shows a file that is not the tab's own and is not an open to hand
+ * on (any scheme but `vscode-remote:`: untitled, user settings, output). The tab keeps it, as VS Code does, and marks the page as
+ * possibly holding another editor.
+ */
+export const OTHER_EDITOR_PREFIX = "__vscw_other__";
+
 export interface OpenReport {
   uri: string;
   line: number | null;
@@ -53,6 +63,11 @@ export function parseOpenReport(message: unknown, nonce: string): OpenReport | n
   } catch {
     return null;
   }
+}
+
+/** Whether the console message is the script's "another editor is showing" notice for this nonce. */
+export function isOtherEditorReport(message: unknown, nonce: string): boolean {
+  return typeof message === "string" && message.startsWith(`${OTHER_EDITOR_PREFIX}${nonce}:`);
 }
 
 /**
@@ -74,6 +89,7 @@ export function buildOpenInterceptScript(nonce: string): string {
   return `(() => {
   if (window.__vscwOpen) return ${JSON.stringify(OPEN_INTERCEPT_INSTALLED)};
   const tag = ${JSON.stringify(`${OPEN_REPORT_PREFIX}${nonce}:`)};
+  const otherTag = ${JSON.stringify(`${OTHER_EDITOR_PREFIX}${nonce}:`)};
   const log = console.log.bind(console);
   const close = ${JSON.stringify(close)};
   const join = ${JSON.stringify(join)};
@@ -84,6 +100,7 @@ export function buildOpenInterceptScript(nonce: string): string {
   let budget = ${OPEN_PRESS_BUDGET};
   let own = null;
   let reported = null;
+  let otherReported = null;
   let pending = false;
   const shown = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   const press = (c, free) => {
@@ -114,8 +131,12 @@ export function buildOpenInterceptScript(nonce: string): string {
     const s = read();
     if (s.uri === null) return;
     if (own === null) { own = s.uri; return; }
-    if (s.uri === own) { reported = null; return; }
-    if (s.uri === reported || !s.uri.startsWith("vscode-remote:") || pending) return;
+    if (s.uri === own) { reported = null; otherReported = null; return; }
+    if (!s.uri.startsWith("vscode-remote:")) {
+      if (s.uri !== otherReported) { otherReported = s.uri; log(otherTag + JSON.stringify({ uri: s.uri })); }
+      return;
+    }
+    if (s.uri === reported || pending) return;
     pending = true;
     setTimeout(() => {
       pending = false;

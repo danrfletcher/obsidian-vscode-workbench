@@ -30,9 +30,11 @@ describe("chrome settings (G5, GP1)", () => {
     "zenMode.hideLineNumbers": false,
     // GP6: the floating-card layout's 4 px margin around the editor, off so the editor is as wide as the pane
     "workbench.experimental.modernUI": false,
+    // PR-5: with the tab strip hidden the title's leading "●" is the unsaved-edit signal (src/dirty-script.ts), so the template is ours
+    "window.title": "${dirty}${activeEditorShort}${separator}${appName}",
   };
 
-  it("carries every hiding setting, the four Zen overrides and the one that makes the editor fill the pane", () => {
+  it("carries every hiding setting, the four Zen overrides, the one that makes the editor fill the pane and the window title of the unsaved-edit signal", () => {
     expect(chromeSettings()).toEqual(EXPECTED);
   });
 
@@ -172,7 +174,7 @@ describe("chrome settings (G5, GP1)", () => {
     };
     expect(legacyChromeSettings()).toEqual(legacy);
     expect(terminalOverlay({ dark: true })).toEqual({ ...legacy, "workbench.colorTheme": "Dark Modern" });
-    for (const k of ["workbench.editor.showTabs", "breadcrumbs.enabled", "zenMode.centerLayout", "workbench.editor.editorActionsLocation"]) {
+    for (const k of ["workbench.editor.showTabs", "breadcrumbs.enabled", "zenMode.centerLayout", "workbench.editor.editorActionsLocation", "window.title"]) {
       expect(terminalOverlay({ dark: false }), k).not.toHaveProperty(k);
     }
   });

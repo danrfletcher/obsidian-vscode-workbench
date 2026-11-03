@@ -142,7 +142,7 @@ const settings = await import(pathToFileURL(path.join(work, "plugin/settings.mjs
 const pluginPaths = await import(pathToFileURL(path.join(work, "plugin/paths.mjs")).href);
 const trustSeed = await import(pathToFileURL(path.join(work, "plugin/trust-seed.mjs")).href);
 // The plugin's own unsaved-buffer probe (what delete, rename, idle stop and quit ask), run against the real workbench below.
-const { DIRTY_SCRIPT, fileDirtyScript } = await import(pathToFileURL(path.join(work, "plugin/dirty-script.mjs")).href);
+const { DIRTY_SCRIPT } = await import(pathToFileURL(path.join(work, "plugin/dirty-script.mjs")).href);
 
 // What the Code tab seeds and runs to hide the chrome (src/main.ts chromeHiding(), src/code-view.ts loadWorkbench), from the same code.
 const { chromeKeybindings, overlayKeybindings, unbindCommands, REVEALING_COMMANDS } = await import(pathToFileURL(path.join(work, "plugin/chrome-settings.mjs")).href);
@@ -367,7 +367,7 @@ const PAGE_STATE = `(() => {
     text: [...document.querySelectorAll('.monaco-editor .view-line')].map((e) => e.innerText.replace(/\\u00a0/g, ' ')).join('\\n'),
     toasts: txt('.notifications-toasts .notification-toast'),
     dialogs: txt('.monaco-dialog-box'),
-    // The tab strip is hidden by the plugin's settings, so the unsaved marker is read from the window title.
+    // The tab strip is hidden by the plugin's settings, so the unsaved marker is read from the window title (the signal DIRTY_SCRIPT reads).
     title: document.title,
     anyDialogVisible: [...document.querySelectorAll('.monaco-dialog-box')].some(visible),
   };
@@ -385,11 +385,10 @@ const notRendered = (what) => (neverPainted = true, check(false, `${what}: the p
 g4: {
   if (process.env.SKIP_G4 === "1" || process.env.ONLY_GP4 === "1" || process.env.ONLY_PR4 === "1") break g4; // SKIP_G4=1: only the G5/G6 block (a faster rerun while working on the hiding)
   // The web workbench saves by itself after a second unless auto-save is off; the checklist runs with it off (GP7).
-  // The plugin's Machine file now hides the tab strip (GP1), and the unsaved-buffer probes below read `.tab.dirty` and
-  // `data-resource-name` from it, so this block puts the tab strip back for its own server only. The Code tab itself has no
-  // tab strip until PR-5 replaces that signal (docs/spike-chrome.md S5); with it hidden the page-wide probe sees only the active
-  // editor's title dot and the per-file probe answers "none". The G5/G6 block below runs with the hiding on.
-  const srv = await startServer("g4", true, { "files.autoSave": "off", "workbench.editor.showTabs": "multiple" });
+  // The plugin's Machine file hides the tab strip (GP1) and writes `window.title` (DIRTY_TITLE_SETTINGS), so the unsaved-buffer probe
+  // below (DIRTY_SCRIPT, PR-5) reads the window title's leading dot, the one signal left with no tab strip. It names the ACTIVE editor only;
+  // a Code tab holds one file, so that is the tab's file.
+  const srv = await startServer("g4", true, { "files.autoSave": "off" });
   const b = await browser("g4", srv);
 
   // 1. clean buffer
@@ -422,26 +421,38 @@ g4: {
   check((await b.ev(DIRTY_SCRIPT)) === false, "G3: ...and reads clean once it is saved (Cmd+S in the tab)");
   check(fs.readFileSync(path.join(vault, "saved.txt"), "utf8").startsWith("SAVED saved line one"), "G3: ...with the typed text on disk");
 
-  // 1b2. the page-wide probe cannot see a save while ANOTHER editor is unsaved, so the rename watch asks the tab of
-  // the one file (PR-5 R4, T40, T41): with other.txt unsaved, saving mine.txt leaves DIRTY_SCRIPT true, but the tab
-  // script reads mine.txt clean, other.txt dirty, and a file with no tab as "none" (the caller then keeps the page-wide answer).
+  // 1b2. with a second file's buffer left unsaved (in the same page, behind the active editor), saving the first still reads clean for the
+  // first (PR-5 E5): the probe is the window title of the active editor, so it follows the file in front and not the rest of the page.
   await b.openFile("other.txt");
   await b.send("Input.insertText", { text: "OTHER " });
   await sleep(1.5);
+  check((await b.ev(DIRTY_SCRIPT)) === true, "G3: the second file typed and left unsaved reads dirty while it is in front");
   await b.openFile("mine.txt");
   await b.send("Input.insertText", { text: "MINE " });
   await sleep(1.5);
-  check((await b.ev(fileDirtyScript("mine.txt"))) === "dirty", "G3: the tab script reads a typed file's own tab as dirty");
+  check((await b.ev(DIRTY_SCRIPT)) === true, "G3: the first file typed reads dirty (title: " + JSON.stringify((await pageState(b)).title) + ")");
+  // Watch the signal through the save: it must not read clean before the text is on disk (two quick reads while a save is in flight).
+  const watch = await b.ev(`(() => { window.__w = []; const t0 = Date.now(); window.__t = setInterval(() => window.__w.push([Date.now() - t0, document.title.startsWith("\\u25cf")]), 15); return true; })()`);
   await b.key("s", "KeyS", 83, b.META);
-  await sleep(3);
-  check((await b.ev(DIRTY_SCRIPT)) === true, "G3: ...after saving mine.txt the page-wide probe still reads dirty (other.txt is unsaved)");
-  check((await b.ev(fileDirtyScript("mine.txt"))) === "clean", "G3: ...while the tab script reads the saved file's own tab as clean");
-  check((await b.ev(fileDirtyScript("other.txt"))) === "dirty", "G3: ...and the other file's tab as dirty");
-  check((await b.ev(fileDirtyScript("nothing-open.txt"))) === "none", "G3: ...and a file with no tab as none");
+  let firstCleanOnDisk = null;
+  for (let i = 0; i < 100 && firstCleanOnDisk === null; i++) {
+    if ((await b.ev(DIRTY_SCRIPT)) === false) firstCleanOnDisk = fs.readFileSync(path.join(vault, "mine.txt"), "utf8").startsWith("MINE ");
+    else await sleep(0.03);
+  }
+  await b.ev("clearInterval(window.__t); true");
+  const seen = await b.ev("window.__w");
+  console.log("G3: signal samples through the save (ms, dirty):", JSON.stringify((seen ?? []).filter((x, i, all) => i === 0 || x[1] !== all[i - 1][1])));
+  check(watch === true && firstCleanOnDisk === true, "G3: ...a save shows dirty, then clean, and the first clean read already has the text on disk (never clean before the file is written)");
+  await sleep(2);
+  check((await b.ev(DIRTY_SCRIPT)) === false, "G3: ...after saving the first file it reads clean although the second file's buffer is still unsaved");
   await b.openFile("other.txt");
+  check((await b.ev(DIRTY_SCRIPT)) === true, "G3: ...and the second file reads dirty again when it is in front");
   await b.key("s", "KeyS", 83, b.META);
   await sleep(3);
-  check((await b.ev(DIRTY_SCRIPT)) === false, "G3: ...and saving the other file leaves the page clean for the steps below");
+  check((await b.ev(DIRTY_SCRIPT)) === false, "G3: ...and saving the second file leaves the page clean for the steps below");
+  // E5 hot-exit / restored editor: a file opened and not typed in reads clean (nothing typed, nothing to lose).
+  await b.openFile("clean.txt");
+  check((await b.ev(DIRTY_SCRIPT)) === false, "G3: a file opened with nothing typed in it reads clean");
 
   // 1c. rename a file on disk under a typed buffer, then save in the workbench (PR-5 R4, T33). The held-back
   // repoint in src/code-view.ts relies on exactly this: the buffer stays bound to the OLD path, the probe still
