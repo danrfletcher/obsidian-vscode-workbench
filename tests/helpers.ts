@@ -70,6 +70,8 @@ export class FakeWebview {
   executeResult: () => Promise<unknown> = async () => "seeded";
   trustResult: () => Promise<unknown> = async () => "seeded";
   private listeners: Record<string, ((event?: unknown) => void)[]> = {};
+  /** The listeners added with `{ once: true }`: a real element drops those after one event and keeps the rest. */
+  private onceListeners = new Set<(event?: unknown) => void>();
   constructor(public tag: string) {}
   setAttribute(k: string, v: string) {
     this.attrs[k] = v;
@@ -78,15 +80,18 @@ export class FakeWebview {
       if (this.srcs.length === 1 && this.autoDomReady) setTimeout(() => this.fire("dom-ready"), 0);
     }
   }
-  addEventListener(name: string, fn: (event?: unknown) => void) {
+  addEventListener(name: string, fn: (event?: unknown) => void, options?: { once?: boolean }) {
     (this.listeners[name] ??= []).push(fn);
+    if (options?.once) this.onceListeners.add(fn);
   }
   /** An event that can come many times (a webview's `console-message`): every listener hears it and stays. */
   emit(name: string, event: unknown) {
     for (const fn of [...(this.listeners[name] ?? [])]) fn(event);
   }
   fire(name: string) {
-    for (const fn of this.listeners[name]?.splice(0) ?? []) fn();
+    const heard = [...(this.listeners[name] ?? [])];
+    this.listeners[name] = heard.filter((fn) => !this.onceListeners.has(fn));
+    for (const fn of heard) fn();
   }
   executeJavaScript(code: string) {
     this.executed.push(code);

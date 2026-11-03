@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GO_TO_LINE_DONE, buildGoToLineScript } from "../../src/goto-line-script";
-import { OPEN_INTERCEPT_INSTALLED, OPEN_REPORT_PREFIX, OPEN_SETTLE_MS, OTHER_EDITOR_PREFIX, RESTORE_OPEN_SCRIPT, buildOpenInterceptScript, isOtherEditorReport, parseOpenReport } from "../../src/open-intercept-script";
+import { OPEN_INTERCEPT_INSTALLED, OPEN_REPORT_PREFIX, OPEN_SETTLE_MS, OTHER_EDITOR_PREFIX, RESTORE_OPEN_SCRIPT, RESTORE_UNCHANGED, buildOpenInterceptScript, isOtherEditorReport, parseOpenReport } from "../../src/open-intercept-script";
 
 // jsdom ships no types; a fresh page per test (see tests/unit/chrome-script.test.ts).
 interface JSDOM {
@@ -289,6 +289,28 @@ describe("the open-from-editor page script", () => {
       expect(presses).toEqual([]);
       expect(prompt()).not.toBeNull();
     });
+
+    it("a close that changes nothing and raises no prompt is not reported as done: \"unchanged\" (PR-5 R10)", async () => {
+      showEditor(OWN, 3);
+      install();
+      showEditor(OTHER, 1);
+      await settle();
+      onClose = () => undefined; // the chord went nowhere
+      expect(await dom.window.eval(RESTORE_OPEN_SCRIPT)).toBe(RESTORE_UNCHANGED);
+      expect(presses).toEqual(["5"]);
+    }, 10_000);
+
+    it("a save prompt that arrives after the old one-second wait is still answered with Escape, not trusted as done (PR-4 R8)", async () => {
+      showEditor(OWN, 3);
+      install();
+      showEditor(OTHER, 1);
+      await settle();
+      onClose = () => void setTimeout(showSavePrompt, 1300); // VS Code asks late
+      onPrevious = () => showEditor(OWN, 3);
+      expect(await dom.window.eval(RESTORE_OPEN_SCRIPT)).toBe("switched");
+      expect(presses).toEqual(["5", "0"]);
+      expect(prompt()).toBeNull();
+    }, 10_000);
 
     it("a clean opened file is closed without the previous-editor chord", async () => {
       showEditor(OWN, 3);

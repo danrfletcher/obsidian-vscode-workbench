@@ -38,7 +38,13 @@ plugin to find a `code` CLI (`customCliPath`), and it prints no token.
 - **How the servers were obtained.** The 1.144.0 server was downloaded by the `code serve-web` launcher once and saved
   (`CLI_DATA_SAVE`). The launcher's download of 1.143.1 hung, so the 1.143.1 server was unpacked by hand from
   `vscode-server-darwin-arm64-web.zip` (the stable CDN download for that commit) into a `--cli-data-dir` laid out like the launcher's,
-  with `code-server` copied to the name `code-server-insiders` that this launcher starts. The zip's checksum was not recorded.
+  with `code-server` copied to the name `code-server-insiders` that this launcher starts. The checksum of the zip actually used
+  was not recorded at the time, so that run did not go through the stable launcher's own server path and cannot be tied to a
+  file. The CDN artifact for that commit was fetched again afterwards (2026-11-03,
+  `https://update.code.visualstudio.com/commit:e646868227c3e3a9e3f24277c8c7220be42c0be7/server-darwin-arm64-web/stable`, 212413431
+  bytes) and its sha256 is `56d9c1d94d114994f0584ccd93e6b8a152488076339795b94bc64f24ae6ad875`. That is the checksum of the
+  published file for this commit; it was not compared with the hand-unpacked copy. Re-running 1.143.1 through its own stable
+  launcher was not done here.
   Every full run below used these saved copies, with no download during the run.
 - The probe sends keys with `Input.dispatchKeyEvent` (Cmd, i.e. Meta, on this Mac) and reads state with `Runtime.evaluate` and console
   messages. It uses no `fetch` or WebSocket of its own and no port beyond the server's scratch port and Chrome's own DevTools port.
@@ -131,7 +137,7 @@ already holds saved layout state. That profile is R0, then "View: Toggle Seconda
 the palette (measured before any route: side bar 166x654, secondary side bar 162x654, panel 336x213, tab strip 334x32), with the route applied on top
 of its storage. Every other route is seeded with the plugin's own `buildBrowserSeedScript` (the route's
 settings and keybindings) and the Workspace Trust record the plugin writes, and then the tab's address is loaded again. "After reload" is
-`webview.reload()`. Every size is `getBoundingClientRect()`, as above. Evidence: `container-chrome-check.txt`, `.json` and `run.log` in
+`webview.reload()`. Every size is `getBoundingClientRect()`, as above. Evidence: `container-chrome-check.txt`, `container-chrome-check.txt.json` and `run.log` in
 `results/evidence/container-chrome-1.143.1/` (this run is the one measured on 2026-11-02 after the tester's round 1; the run before it is kept in `container-chrome-1.143.1-run3/`).
 
 | Part | Every route: fresh profile / after a reload / on a profile with saved layout | Best route |
@@ -189,7 +195,7 @@ Chrome on the host; S2 was not run in the container, which was only asked for S1
 | Question | Result on 1.143.1 and 1.144.0 | Result |
 |---|---|---|
 | Can Cmd+P quick open be caught? | Quick open from `a.js` to `c.txt` changed the open editor's URI; the page script reported both URIs through `console.log` (2 events). Mechanism: page script, console message only | YES |
-| Can Go to Definition be caught? | Yes, in a trusted workspace. F12 with the cursor on `helper` (`a.js` line 3, column 11), JS/TS language service, no extra extension: the open editor changed from `a.js` to `b.js`, the cursor went to line 5, and the page script's last event was `{uri: .../b.js, line: 5}`. In the latest run both builds reported four events: `a.js` line 1, `a.js` line 3, one transient event with no URI and no line (`{uri: null, line: null}`, while the editor was swapped), then `b.js` line 5. The tester's run on 1.144.0 reported three (no transient event), so the transient event is timing, not something to rely on; the events that are stable on both builds are the `a.js` events and the final `b.js` line 5. The first press worked (1 press, 1.5 s) on both builds. In an untrusted workspace: 10 presses over 61.3 s, still `a.js`, no change to report. Mechanism: the same page script as quick open; the line comes from the editor's cursor once the URI changes, not from the URI. The Python extension (Pylance) was not tried: the JS/TS provider answered, which is a definition provider going through the same editor service | YES |
+| Can Go to Definition be caught? | Yes, in a trusted workspace. F12 with the cursor on `helper` (`a.js` line 3, column 11), JS/TS language service, no extra extension: the open editor changed from `a.js` to `b.js`, the cursor went to line 5, and the page script's last event was `{uri: .../b.js, line: 5}`. The events differed in count between builds. The run on 1.143.1 reported four: `a.js` line 1, `a.js` line 3, one transient event with no URI and no line (`{uri: null, line: null}`, while the editor was swapped), then `b.js` line 5. A re-run of `check:chrome-spike` (S2) on the host on 1.144.0 reported three: `a.js` line 1, `a.js` line 3 and `b.js` line 5, with no transient event. So the transient event is timing, not something to rely on; the events that are stable on both builds are the `a.js` events and the final `b.js` line 5. The first press worked (1 press, 1.5 s) on both builds. In an untrusted workspace: 10 presses over 61.3 s, still `a.js`, no change to report. Mechanism: the same page script as quick open; the line comes from the editor's cursor once the URI changes, not from the URI. The Python extension (Pylance) was not tried: the JS/TS provider answered, which is a definition provider going through the same editor service | YES |
 | Does catching it need patching VS Code internals? | No for the route above. It reads the DOM and presses a seeded command chord. A hook that stops the open before it happens would need internals and was not tried | NO |
 | What does VS Code do with `showTabs: none` when another file opens? | It shows the new file and keeps the earlier editor open behind it in the same group: after quick open the group held `a.js`, `c.txt`; after more opens `a.js`, `link.md`, `b.js`. Identical with `enablePreview` false and true | YES |
 | How is a restored previous editor closed on load? | A profile that held `a.js` and `c.txt` and reloaded with `b.js` in the payload showed only `b.js` on both builds, even before any command; the seeded `workbench.action.closeOtherEditors` chord (`ctrl+alt+shift+4`) leaves exactly the active one when two are open (`c.txt`) | YES |
@@ -267,7 +273,7 @@ S5 chosen signal for PR-5: the window title's leading "●" in `document.title`,
 `a.js` and saving with Cmd+S, with the tab strip hidden three ways. Identical on both builds (in the latest runs both titles end "Visual Studio
 Code"; in the first full run the 1.144.0 title ended "Visual Studio Code - Insiders").
 
-| Question | Clean / typed / saved | Result |
+| Question | Clean / typed / saved, on 1.143.1 and 1.144.0 | Result |
 |---|---|---|
 | Window title "●" with `showTabs: none` (= `DIRTY_SCRIPT`) | false / true / false | CHOSEN |
 | `.tab.dirty` with `showTabs: none` (what `fileDirtyScript` reads) | 0 / 0 / 0; `fileDirtyScript` answers `none` in all three states | FALSE |
@@ -307,7 +313,7 @@ Outside the repo, in `/Users/danfletcher/.local/share/vector/tickets/warkworth-4
 
 - `host-s1-s3-s5-<build>/` and `host-s2-<build>-r4/`: `chrome-spike-<build>.json` (every measurement), `run.log` and the screenshots of the
   latest host runs on 1.143.1 and 1.144.0 (S1, S3 and S5 together; S2 re-run after its picture was moved to the right moment).
-- `container-chrome-1.143.1/`: the Obsidian Code tab run (`container-chrome-check.txt`, `.json`, `run.log`, two pictures);
+- `container-chrome-1.143.1/`: the Obsidian Code tab run (`container-chrome-check.txt`, `container-chrome-check.txt.json`, `run.log`, two pictures);
   `container-chrome-1.143.1-run3/` is the run before the tester's round 1, kept for the R5b comparison.
 - `PR-1-S<n>-<build>.png`: the pictures cited above (copies of the files in the run folders; the ones from earlier runs are in
   `earlier-run-pngs/`).

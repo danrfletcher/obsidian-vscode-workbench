@@ -58,8 +58,25 @@ describe("docs/spike-chrome.md", () => {
 
   it.each(VERSIONS)("records VS Code %s", (version) => {
     expect(text).toContain(version);
+    // Not a mention anywhere in the section: a table must claim the build in its own header (a column, or "Result on A and B"),
+    // so a table whose result was measured on one build cannot pass by naming the other in a sentence below it.
+    // S1 and S4 put each build in its own column of their first table; their other tables (the three-state S1 tables) are
+    // introduced in prose and the Code tab table is one build by design. S2, S3 and S5 have one result column for both builds.
     for (const q of ["S1", "S2", "S3", "S4", "S5"]) {
-      expect(table.get(q)!.some((r) => r.line.includes(version)) || sectionText(text, q).includes(version), `${q} does not mention ${version}`).toBe(true);
+      const headers = headerRows(text, q);
+      expect(headers.length, `${q} has no table`).toBeGreaterThan(0);
+      for (const h of q === "S1" || q === "S4" ? headers.slice(0, 1) : headers) expect(h.some((c) => c.includes(version)), `${q}: the table headed "${h.join(" | ")}" does not claim ${version}`).toBe(true);
+    }
+  });
+
+  it("does not let a result row name one build only (a row measured on one build is not a result for both)", () => {
+    // In a table whose header says "Result on 1.143.1 and 1.144.0" the result is for both builds. A data row of such a table that
+    // names exactly one of the two versions in its text says it was measured on that build alone, and must say so on the other too.
+    for (const q of ["S2", "S3", "S5"]) {
+      for (const r of table.get(q)!) {
+        const named = VERSIONS.filter((v) => r.line.includes(v));
+        expect(named.length === 0 || named.length === VERSIONS.length, `${q}: "${r.cells[0]}" names only ${named.join(", ")}`).toBe(true);
+      }
     }
   });
 
@@ -154,6 +171,19 @@ describe("docs/spike-chrome.md", () => {
     expect(text).not.toMatch(/cannot view images/i);
   });
 });
+
+/** The header row (cells) of every table in one `## S<n>` section: the row just before a separator row. */
+function headerRows(text: string, q: string): string[][] {
+  const lines = sectionText(text, q).split("\n");
+  const out: string[][] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i].split("|").slice(1, -1).map((c) => c.trim());
+    if (lines[i].startsWith("|") && cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c)) && lines[i - 1].startsWith("|")) {
+      out.push(lines[i - 1].split("|").slice(1, -1).map((c) => c.trim()));
+    }
+  }
+  return out;
+}
 
 /** The text of one `## S<n>` section. */
 function sectionText(text: string, q: string): string {

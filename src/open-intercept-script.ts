@@ -76,9 +76,14 @@ export function isOtherEditorReport(message: unknown, nonce: string): boolean {
  * "switched" the opened editor held unsaved edits, so the prompt was cancelled and the previous editor was shown instead (the edits stay);
  * "blocked by a dialog" another modal dialog was already up, so nothing was pressed;
  * "dialog stays" the save prompt did not go away when cancelled, so the tab may still show the other file;
+ * "unchanged" the chord was pressed, but within the wait (`RESTORE_WAIT_STEPS` x 20 ms) the opened editor neither went away nor
+ *             raised a prompt: the close did nothing, or a prompt may still come, so the tab must not trust it as done;
  * "no budget" / "not installed" as before.
  */
 export const RESTORE_SWITCHED = "switched";
+export const RESTORE_UNCHANGED = "unchanged";
+/** How many 20 ms steps restore() waits for the opened editor to go away or a prompt to show (2 s). */
+export const RESTORE_WAIT_STEPS = 100;
 
 /** The script that puts the opened editor away; run in the page by the Code tab after it has handed the file on. */
 export const RESTORE_OPEN_SCRIPT = `(() => { const o = window.__vscwOpen; return o ? o.restore() : "not installed"; })()`;
@@ -120,6 +125,7 @@ export function buildOpenInterceptScript(nonce: string): string {
     const target = document.activeElement || document.body;
     for (const t of ["keydown", "keyup"]) target.dispatchEvent(new KeyboardEvent(t, o));
   };
+  // The line is read from the gutter: with editor.lineNumbers off there is none, the line is null and the file opens at the top (README).
   const read = () => {
     const ed = [...document.querySelectorAll(editorSelector)].find(shown);
     const al = ed ? ed.querySelector(".line-numbers.active-line-number") : null;
@@ -150,7 +156,7 @@ export function buildOpenInterceptScript(nonce: string): string {
     if (modal()) return "blocked by a dialog";
     const opened = read().uri;
     const pressed = press(close, true);
-    for (let i = 0; i < 50; i++) {
+    for (let i = 0; i < ${RESTORE_WAIT_STEPS}; i++) {
       await wait(20);
       if (modal()) {
         escape();
@@ -159,9 +165,9 @@ export function buildOpenInterceptScript(nonce: string): string {
         press(show, true);
         return ${JSON.stringify(RESTORE_SWITCHED)};
       }
-      if (read().uri !== opened) break;
+      if (read().uri !== opened) return pressed;
     }
-    return pressed;
+    return ${JSON.stringify(RESTORE_UNCHANGED)}; // no prompt and no change: the close did nothing (yet), so do not report it as done
   };
   window.__vscwOpen = { restore };
   let queued = false;

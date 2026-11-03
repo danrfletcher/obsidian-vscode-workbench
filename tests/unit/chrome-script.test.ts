@@ -218,6 +218,86 @@ describe("the chrome page script", () => {
     expect(presses).toEqual(["4", "3"]); // the panel only: no second close-others
   });
 
+  describe("the editor part's own churn (typing, cursor blink, scrolling) does not run the sweep", () => {
+    const addEditor = () => {
+      const ed = document.createElement("div");
+      ed.className = "part editor";
+      const monaco = document.createElement("div");
+      monaco.className = "monaco-editor";
+      monaco.setAttribute("data-uri", "vscode-remote://x/a.py");
+      const line = document.createElement("div");
+      monaco.appendChild(line);
+      ed.appendChild(monaco);
+      document.body.appendChild(ed);
+      sizes[EDITOR_SELECTOR] = 400;
+      return { ed, line };
+    };
+
+    it("skips changes that all sit inside the editor part once the first editor is dealt with, and still sweeps for changes elsewhere", async () => {
+      const { line } = addEditor();
+      run();
+      expect(presses).toEqual(["4"]); // the first editor: close the others, once
+      // A part element added outside the editor part is a change the sweep must see.
+      addPart(PARTS.panel, 100);
+      await settle();
+      expect(presses).toEqual(["4", "3"]);
+      presses.length = 0;
+      const sideBar = addPart(PARTS.sideBar, 0);
+      await settle();
+      sizes[PARTS.sideBar] = 200; // now shown, but no DOM change says so yet
+      expect(sideBar.isConnected).toBe(true);
+      line.setAttribute("class", "view-line blink");
+      line.appendChild(document.createElement("span"));
+      await settle();
+      expect(presses).toEqual([]); // inside the editor part only: no sweep, so the side bar was not looked at
+      document.body.setAttribute("class", "something-outside-the-editor");
+      await settle();
+      expect(presses).toEqual(["1"]); // a change outside the editor part sweeps again
+    });
+
+    it("sweeps for editor-part changes before the first editor has been dealt with (the editor appearing is what it waits for)", async () => {
+      run();
+      addEditor();
+      await settle();
+      expect(presses).toEqual(["4"]);
+    });
+  });
+
+  describe("E6: the profile restored an editor with unsaved (hot-exit) edits", () => {
+    it("presses close-other-editors once; VS Code's own Save prompt then appears and the script leaves it for the user", async () => {
+      const prompt: { el: HTMLElement | null } = { el: null };
+      let clicks = 0;
+      document.addEventListener("keydown", (e) => {
+        if (!(e.ctrlKey && e.altKey && e.shiftKey) || e.key !== "4") return;
+        // what the workbench does for closeOtherEditors with a dirty editor to close: it asks, and closes nothing yet
+        const dialog = document.createElement("div");
+        prompt.el = dialog;
+        dialog.className = "monaco-dialog-modal-block dimmed";
+        const save = document.createElement("a");
+        save.className = "monaco-button";
+        save.addEventListener("click", () => clicks++);
+        dialog.appendChild(save);
+        document.body.appendChild(dialog);
+      });
+      run();
+      const ed = document.createElement("div");
+      ed.className = "part editor";
+      const monaco = document.createElement("div");
+      monaco.className = "monaco-editor";
+      monaco.setAttribute("data-uri", "vscode-remote://x/new.py");
+      ed.appendChild(monaco);
+      document.body.appendChild(ed);
+      sizes[EDITOR_SELECTOR] = 400;
+      await settle();
+      expect(presses).toEqual(["4"]);
+      expect(prompt.el).not.toBeNull();
+      expect(document.body.contains(prompt.el)).toBe(true); // the prompt is still up: the script did not answer it
+      expect(clicks).toBe(0); // and clicked nothing in it
+      await settle();
+      expect(presses).toEqual(["4"]); // no second close-others while the prompt is up
+    });
+  });
+
   it("gives up after its budget when a command does not hide its part, instead of spinning", async () => {
     obey = false;
     const panel = addPart(PARTS.panel, 100);
@@ -229,6 +309,37 @@ describe("the chrome page script", () => {
     await settle();
     expect(presses).toHaveLength(CHROME_PRESS_BUDGET);
   });
+
+  it("the budget is per part and starts again when the part is seen closed: a long-lived tab keeps undoing reveals past the budget (PR-3 R4)", async () => {
+    const panel = addPart(PARTS.panel, 0);
+    run();
+    const reveals = CHROME_PRESS_BUDGET + 40;
+    for (let i = 0; i < reveals; i++) {
+      sizes[PARTS.panel] = 100; // a palette reveal
+      panel.setAttribute("class", `part panel shown${i}`);
+      await new Promise((r) => setTimeout(r, 6)); // longer than a frame: the press closes it (obey)
+      panel.setAttribute("class", `part panel closed${i}`); // the workbench's own change when a part closes: the sweep sees it closed
+      await new Promise((r) => setTimeout(r, 6));
+    }
+    expect(presses).toHaveLength(reveals);
+    expect(presses.every((k) => k === "3")).toBe(true);
+  }, 20_000);
+
+  it("a part that never closes spends only its own budget: another part is still undone", async () => {
+    obey = false;
+    const panel = addPart(PARTS.panel, 100);
+    run();
+    for (let i = 0; i < CHROME_PRESS_BUDGET + 20; i++) {
+      panel.setAttribute("class", `part panel c${i}`);
+      await new Promise((r) => setTimeout(r, 6));
+    }
+    const before = presses.filter((k) => k === "3").length;
+    expect(before).toBe(CHROME_PRESS_BUDGET);
+    obey = true;
+    addPart(PARTS.sideBar, 150);
+    await settle();
+    expect(presses.filter((k) => k === "1")).toEqual(["1"]);
+  }, 20_000);
 
   it("does nothing and throws nothing when VS Code's class names are not the ones expected (F3): the part just shows", async () => {
     const renamed = document.createElement("div");

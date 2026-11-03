@@ -99,10 +99,10 @@ describe("auto-save from the instance's settings", () => {
 // the window title's leading "●" is the signal. The rule table above did not move; only the signal the script reads did (PR-5).
 describe("the dirty script on a workbench page with no tab strip (S5)", () => {
   /** The shape measured on VS Code 1.143.1 and 1.144.0 with `workbench.editor.showTabs: none`: an editor, no `.tab`. */
-  function page(title: string, workbench = true): Document {
+  function page(title: string, workbench = true, editor = true): Document {
     const html = `<!doctype html><title>${title}</title>
       ${workbench ? `<div class="monaco-workbench"><div class="part editor"><div class="editor-group-container">
-        <div class="monaco-editor" data-uri="vscode-remote://127.0.0.1:1/vault/a.js"><textarea class="inputarea"></textarea></div>
+        ${editor ? `<div class="monaco-editor" data-uri="vscode-remote://127.0.0.1:1/vault/a.js"><textarea class="inputarea"></textarea></div>` : ""}
       </div></div></div>` : ""}`;
     return new DOMParser().parseFromString(html, "text/html");
   }
@@ -118,7 +118,12 @@ describe("the dirty script on a workbench page with no tab strip (S5)", () => {
   });
 
   it("reads a page with nothing open as clean", () => {
-    expect(dirtyOf(page("Visual Studio Code"))).toBe(false);
+    expect(dirtyOf(page("Visual Studio Code", true, false))).toBe(false); // no editor on screen: the bare app name is the right title
+  });
+
+  it("does not answer clean for an editor on screen under a title of the wrong shape (a workspace window.title without the template)", () => {
+    expect(() => dirtyOf(page("a.js"))).toThrow(/shape/);
+    expect(() => dirtyOf(page("Visual Studio Code"))).toThrow(/shape/);
   });
 
   it("does not answer clean when the title is empty or the workbench is not in the page: it throws, and the tab reads unreadable", () => {

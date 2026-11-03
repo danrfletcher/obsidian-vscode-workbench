@@ -75,6 +75,9 @@ function makeView() {
     admitFile: async () => true,
     releaseFile: () => undefined,
     openInSystemApp: () => undefined,
+    // A host like the plugin's: it gives the chrome-hiding script and opens files from the editor, so a clean title is trusted (PR-5 R10).
+    chromeHiding: () => ({ keybindings: [], script: "0" }),
+    openFromEditor: async () => undefined,
   };
   const leaf = new WorkspaceLeaf();
   const view = new CodeView(leaf as never, host);
@@ -268,11 +271,12 @@ describe("unsaved buffer detection", () => {
   // The script is run against stand-in pages shaped like the chosen signal (docs/spike-chrome.md S5): a workbench whose window title
   // carries "●" while the active editor is dirty. There is no VS Code tab strip in any of them.
   const MARK = "\u25cf";
-  const run = (page: { title: string; workbench?: boolean; dirtyTab?: boolean }) => {
+  const run = (page: { title: string; workbench?: boolean; dirtyTab?: boolean; editor?: boolean }) => {
     const doc = {
       title: page.title,
       querySelector: (sel: string) => {
         if (sel.includes(".tab")) return page.dirtyTab ? {} : null; // an old tab marker: ignored by the script
+        if (sel.includes("data-uri")) return page.editor ? {} : null; // an editor on screen
         return sel === ".monaco-workbench" && page.workbench !== false ? {} : null;
       },
     };
@@ -290,6 +294,29 @@ describe("unsaved buffer detection", () => {
     ["a tab marked dirty in the page but a clean title: the old tab signal is not read", { title: "a.py \u2014 Visual Studio Code", dirtyTab: true }, false],
   ])("the dirty script says %s -> %s", (_n, page, expected) => {
     expect(run(page)).toBe(expected);
+  });
+
+  // PR-5 R2/R3: with an editor on screen a title that does not have the shape of the plugin's own template (name, separator, app name) is
+  // not trusted to be clean: a workspace `window.title` that wins over the plugin's, or a VS Code update that builds the title another way.
+  it.each([
+    ["the plugin's template, em dash (macOS)", "a.py \u2014 Visual Studio Code"],
+    ["the plugin's template, hyphen (other platforms)", "a.py - Visual Studio Code"],
+    ["the Insiders app name", "a.py \u2014 Visual Studio Code - Insiders"],
+  ])("an editor on screen and a title of the right shape (%s) reads clean", (_n, title) => {
+    expect(run({ title, editor: true })).toBe(false);
+  });
+
+  it.each([
+    ["a workspace window.title of just the file name", "a.py"],
+    ["the app name alone while an editor is on screen", "Visual Studio Code"],
+    ["a title whose dirty mark moved", `a.py ${MARK} Visual Studio Code`],
+  ])("an editor on screen and a title of the wrong shape (%s) throws, so the tab reads unreadable and not clean", (_n, title) => {
+    expect(() => run({ title, editor: true })).toThrow(/shape/);
+  });
+
+  it("a dirty title is dirty whatever its shape, and no editor on screen needs no shape", () => {
+    expect(run({ title: `${MARK} a.py`, editor: true })).toBe(true);
+    expect(run({ title: "a.py", editor: false })).toBe(false);
   });
 
   it("two files with one name in different folders cannot be mixed up: the title of the active editor decides, whichever folder it is in", () => {

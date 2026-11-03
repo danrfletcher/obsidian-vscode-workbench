@@ -78,17 +78,23 @@ export const KEYBINDING_OVERLAY_JS = String.raw`const OVERLAY_PREFIX = "// >>> o
     if (rule === null || typeof rule !== "object" || Array.isArray(rule)) return false;
     if (written.has(canon(rule))) return true;
     const keys = Object.keys(rule);
+    // The plugin's own chord namespace (ctrl+alt+shift plus one digit, src/chrome-settings.ts): a later version may bind such a chord to
+    // another command or drop it, and the old entry would otherwise be taken for the user's and pile up outside the block for good.
+    if (typeof rule.key === "string" && /^ctrl\+alt\+shift\+\d$/.test(rule.key) && typeof rule.command === "string" && keys.every((k) => k === "key" || k === "command" || k === "when")) return true;
     return rule.command === UNBOUND_COMMAND && typeof rule.key === "string" && keys.every((k) => k === "key" || k === "command" || (k === "when" && typeof rule.when === "string"));
   };
+  // A block is a BEGIN line and the next END line. An END is paired with the LAST BEGIN before it, so a BEGIN whose END line the user
+  // deleted stays an orphan comment: it can never reach forward to the END of the block written after it and cut the user's own rules
+  // that sit between the two.
   const removeOverlay = (text, chords) => {
     const written = new Set((chords || []).map(canon));
     let out = text;
     let from = 0;
     for (;;) {
-      const b = out.indexOf(OVERLAY_PREFIX, from);
-      if (b < 0) return out;
-      const e = out.indexOf(OVERLAY_END, b);
+      const e = out.indexOf(OVERLAY_END, from);
       if (e < 0) return out;
+      const b = out.lastIndexOf(OVERLAY_PREFIX, e);
+      if (b < from) { from = e + OVERLAY_END.length; continue; } // an END with no BEGIN before it: not a block
       let end = e + OVERLAY_END.length;
       if (out[end] === "\r" && out[end + 1] === "\n") end += 2;
       else if (out[end] === "\n") end += 1;

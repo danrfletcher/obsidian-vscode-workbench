@@ -586,14 +586,31 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     });
   }
 
-  /** Obsidian's usual open for a file that is not a Code tab's (a note, canvas, base, image or PDF), in a new tab. */
+  /** Obsidian's usual open for a file that is not a Code tab's (a note, canvas, base, image or PDF): the tab that already shows it is focused, else a new tab. */
   private async openInObsidian(file: string): Promise<void> {
     const found = this.findVaultFile(file);
     if (!found) {
       new Notice(`VS Code Workbench: ${fileName(file)} is not in this vault, so Obsidian cannot open it.`, 10000);
       return;
     }
+    // One tab per file, as for Code tabs: reaching the same note again (a repeated Go to Definition) focuses the tab it is in.
+    const shown = this.leafShowing(found);
+    if (shown) {
+      await this.app.workspace.revealLeaf(shown);
+      (this.app.workspace as unknown as { setActiveLeaf?: (l: WorkspaceLeaf, o?: { focus: boolean }) => void }).setActiveLeaf?.(shown, { focus: true });
+      return;
+    }
     await this.app.workspace.getLeaf("tab").openFile(found, { active: true });
+  }
+
+  /** The leaf of Obsidian's own view (not a Code tab) that shows `file`, if there is one. */
+  private leafShowing(file: TFile): WorkspaceLeaf | null {
+    let shown: WorkspaceLeaf | null = null;
+    this.app.workspace.iterateAllLeaves?.((leaf) => {
+      if (shown || leaf.view instanceof CodeView) return;
+      if ((leaf.view as { file?: { path?: string } } | null | undefined)?.file?.path === file.path) shown = leaf;
+    });
+    return shown;
   }
 
   readBaseline(file: string): Promise<Buffer | null> {
@@ -612,6 +629,13 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   editsNotMoved(from: string, to: string): void {
     new Notice(
       `VS Code Workbench: ${baseName(to)} was renamed while it had unsaved edits, and ${from} holds a file the plugin cannot tie to this tab's save. Nothing was moved or overwritten: anything you saved from this tab is in ${from}, so copy it out from there.`,
+      15000,
+    );
+  }
+
+  editsKeptInTab(own: string, opened: string): void {
+    new Notice(
+      `VS Code Workbench: ${opened ? baseName(opened) : "the file you opened"} has unsaved edits in the tab for ${baseName(own)}, behind that file. The new tab opens it from disk, without those edits. Save or discard them in the first tab before you close it.`,
       15000,
     );
   }

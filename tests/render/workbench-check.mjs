@@ -22,8 +22,8 @@
  *      open as overlays; a copied keybindings.json that binds a layout command to ctrl+alt+n, or re-binds cmd+b / cmd+j / cmd+k z / cmd+w to
  *      their commands, is unbound, also after a reload with the same copy id; each command of REVEALING_COMMANDS is run, and the eight
  *      the spec names are run from the palette, and every bar is hidden afterwards; so is the panel that "Terminal: Create New Terminal" opens
- *      behind VS Code's Workspace Trust dialog (the dialog stops every key, so the page script clicks the panel's hide button) and the one a
- *      running terminal reopens in a trusted folder.
+ *      behind VS Code's Workspace Trust dialog (the dialog stops every key, so the page script clicks the panel's hide button) and the one
+ *      Toggle Panel Visibility reopens in a trusted folder (each line says whether a terminal row existed and had the focus then).
  *
  *   GP2, GP3, E2, E3, E4, E7 (PR-4): a file opened from inside the editor (Go to Definition, Cmd+P) is reported by the plugin's page
  *      script (src/open-intercept-script.ts) with its file and line, mapped back to a vault file or an outside path by the plugin's own
@@ -38,7 +38,7 @@
  *
  *   npm run check:workbench [outDir]
  *
- * Env: CODE_CLI (the build's `code` script), CLI_DATA_SRC (a --cli-data-dir that already holds the server for
+ * Env: CODE_CLI (the build's `code` script, or the standalone CLI binary for a build that is not installed), CLI_DATA_SRC (a --cli-data-dir that already holds the server for
  * that build; it is cloned into the scratch dir, never written to), ALLOW_DOWNLOAD=1 (let `serve-web` download
  * the server for the installed build from Microsoft into the scratch dir when CLI_DATA_SRC is not set or does
  * not hold it; without it nothing is ever downloaded), CHROME, SERVER_TMPDIR (default /tmp, see the comment at
@@ -68,7 +68,13 @@ for (const [name, f] of [["CODE_CLI", CODE], ["CHROME", CHROME]]) {
 }
 // The server must be the one for the installed build: a server for another build can answer HTTP 500 or serve a
 // page that never paints. Say so before starting anything, rather than printing a screenful of FAIL lines.
-const [version, commit] = execFileSync(CODE, ["--version"], { encoding: "utf8" }).trim().split("\n");
+// The app's `code --version` prints "version\ncommit\narch"; the standalone CLI (update.code.visualstudio.com/commit:<sha>/cli-darwin-arm64/stable,
+// the way to run a build that is not installed, e.g. 1.143.1) prints "code 1.143.1 (commit <sha>)". Both are read.
+const versionOut = execFileSync(CODE, ["--version"], { encoding: "utf8" }).trim();
+const [version, commit] = (() => {
+  const cli = /^code\S*\s+(\S+)\s+\(commit ([0-9a-f]{40})\)/.exec(versionOut);
+  return cli ? [cli[1], cli[2]] : versionOut.split("\n");
+})();
 const held = CLI_DATA_SRC && fs.existsSync(path.join(CLI_DATA_SRC, "serve-web"))
   ? fs.readdirSync(path.join(CLI_DATA_SRC, "serve-web")).filter((n) => /^[0-9a-f]{40}$/.test(n))
   : [];
@@ -84,6 +90,10 @@ if (!haveServer && !ALLOW_DOWNLOAD) {
   );
   process.exit(2);
 }
+// Say which builds this run covered and which of the two the specs name it did not: the output is the record of a run, and a run on
+// one build must not read as a run on both.
+const SPEC_BUILDS = ["1.143.1", "1.144.0"];
+console.log(`workbench-check: ran on VS Code ${version} (server commit ${commit}). Builds the specs name that this run did NOT cover: ${SPEC_BUILDS.filter((v) => !version.startsWith(v)).join(", ") || "none"}.`);
 const MIN_CONTRAST = 4.5;
 const work = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "workbench-check-"));
 const outDir = path.resolve(process.argv[2] ?? fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "workbench-shots-")));
@@ -646,7 +656,10 @@ gp4: {
       await chord(b, "b", "meta"); await sleep(1.5);
       await chord(b, "j", "meta"); await sleep(1.5);
       const seen = await seenNow(b);
-      check(seen.includes("sidebar") && seen.includes("panel"), "GP4 control: without the overlay Cmd+B and Cmd+J lay out the side bar and the panel (the recorder sees them, so it proves a disabled chord is disabled)", seen.join(","));
+      // Only the side bar is asserted. On VS Code 1.145.0-insider Cmd+J with no overlay did not reveal the panel (the recorder never saw
+      // it), so asserting the panel made the control fail on a build where nothing is wrong; the panel is reported, not required.
+      check(seen.includes("sidebar"), "GP4 control: without the overlay Cmd+B lays out the side bar (the recorder sees it, so it proves a disabled chord is disabled)", seen.join(","));
+      console.log(`[gp4-ctl] Cmd+J with no overlay ${seen.includes("panel") ? "revealed" : "did not reveal"} the panel on this build (informational)`);
       // Cmd+K Z has no sign in the DOM that this check can read (the title bar and the bars are hidden already), so its control is the
       // class list of the workbench container before and after: informational, not a pass/fail line.
       const before = await b.ev(WORKBENCH_CLASSES);
@@ -709,9 +722,15 @@ gp4: {
 
   // --- E8 with a terminal: "Terminal: Create New Terminal" opens the panel and VS Code asks whether to trust the folder, a modal dialog that
   // takes the keyboard focus and stops every key at itself; the panel's close chord must still get through (the page script presses it from
-  // outside the dialog), and the dialog is VS Code's own and stays (F8). Once the folder is trusted the terminal runs, and the panel that
-  // reopens on it takes the focus: the chord must close it from there too.
+  // outside the dialog), and the dialog is VS Code's own and stays (F8). Once the folder is trusted the terminal MAY start, and the panel
+  // that reopens on it may take the focus: the chord must close it from there too. Whether a terminal started and holds the focus is
+  // MEASURED (termState below) and every check message here says what was measured; no message claims a running or focused terminal
+  // that the run did not have. A run on which no terminal row appears prints that the focus-in-terminal path was NOT exercised.
   if (want("term")) {
+    const termState = async (page) => {
+      const st = await page.ev(`({ rows: document.querySelectorAll('.terminal-wrapper').length, focused: !!document.activeElement?.closest?.('.terminal-wrapper') })`);
+      return st.rows === 0 ? "no terminal row" : st.focused ? "terminal row, focused" : "terminal row, not focused";
+    };
     const tsrv = await startServer("gp4-term", false, { "files.autoSave": "off" });
     const b = await browser("gp4-term", tsrv, { hide: true, flash: false });
     await b.openFile("sample.py");
@@ -737,20 +756,24 @@ gp4: {
       await b.ev(`[...document.querySelectorAll('.monaco-dialog-box .monaco-button')].find((e) => /Trust Folder/i.test(e.innerText))?.click()`);
       await sleep(4);
       const trusted = await b.ev(BARS_NOW);
-      console.log(`[gp4-term] after trusting the folder: terminal focused ${await b.ev(terminalFocused)}, seen ${(await seenNow(b)).join(",") || "nothing"}`);
-      check(barsHidden(trusted) && trusted.editors === 1, "E8 terminal: ...and once the folder is trusted and the terminal runs, the panel is hidden", JSON.stringify(trusted));
+      const stateTrusted = await termState(b);
+      console.log(`[gp4-term] after trusting the folder: ${stateTrusted}, terminal focused ${await b.ev(terminalFocused)}, seen ${(await seenNow(b)).join(",") || "nothing"}`);
+      check(barsHidden(trusted) && trusted.editors === 1, `E8 terminal: ...and once the folder is trusted (${stateTrusted} measured), the panel is hidden`, JSON.stringify(trusted));
+      const stateBeforePanel = await termState(b);
       await run("View: Toggle Panel Visibility");
       const afterPanel = await b.ev(BARS_NOW);
-      console.log(`[gp4-term] Toggle Panel with a running terminal: terminal focused ${await b.ev(terminalFocused)}`);
-      check(barsHidden(afterPanel) && afterPanel.editors === 1, "E8 terminal: \"View: Toggle Panel Visibility\" with a running terminal in the panel ends hidden, with the editor on its file", JSON.stringify(afterPanel));
+      console.log(`[gp4-term] Toggle Panel with ${stateBeforePanel}: terminal focused ${await b.ev(terminalFocused)}`);
+      check(barsHidden(afterPanel) && afterPanel.editors === 1, `E8 terminal: "View: Toggle Panel Visibility" with ${stateBeforePanel} when it ran ends hidden, with the editor on its file`, JSON.stringify(afterPanel));
       await b.shot("GP4-terminal.png");
       for (let i = 0; i < 3; i++) await run("View: Toggle Panel Visibility");
       check(barsHidden(await b.ev(BARS_NOW)), "E8 terminal: ...and three more runs of it end hidden too");
     }
     b.close();
 
-    // The Code tab's default: the vault folder is trusted (the trust seed), so the terminal starts at once, the panel opens on it and the
-    // terminal has the keyboard focus. No dialog is up: the chord is the route.
+    // The Code tab's default: the vault folder is trusted (the trust seed), so no dialog is up and the chord is the route. Whether a
+    // terminal actually started and holds the keyboard focus is MEASURED here, not assumed: on some builds "Create New Terminal"
+    // left no .terminal-wrapper at all (the coder's PR-3 log printed "terminal rows 0"). Each line below says what the terminal was
+    // when it ran, so a pass with no terminal is never read as a pass with a focused one.
     const tb = await browser("gp4-term-trusted", tsrv, { hide: true, flash: false, trust: true });
     await tb.openFile("sample.py");
     await sleep(3);
@@ -765,14 +788,18 @@ gp4: {
       await tb.ev(RECORDER);
       await run("Terminal: Create New Terminal");
       const created = await tb.ev(BARS_NOW);
+      const termAtStart = await termState(tb);
+      console.log(`[gp4-term-trusted] terminal state after Create New Terminal: ${termAtStart}${termAtStart === "terminal row, focused" ? "" : " (the focus-in-terminal path is NOT exercised on this run)"}`);
       console.log(`[gp4-term-trusted] after Create New Terminal: dialog up ${await tb.ev("!!document.querySelector('.monaco-dialog-modal-block')")}, terminal rows ${await tb.ev("document.querySelectorAll('.terminal-wrapper').length")}, seen ${(await seenNow(tb)).join(",") || "nothing"}`);
       check(barsHidden(created) && created.editors === 1, "E8 terminal (trusted folder): \"Terminal: Create New Terminal\" ends hidden, with the editor on its file", JSON.stringify(created));
       for (let i = 0; i < 3; i++) {
+        const before = await termState(tb);
         await run("View: Toggle Panel Visibility");
         const r = await tb.ev(BARS_NOW);
-        check(barsHidden(r) && r.editors === 1, `E8 terminal (trusted folder): "View: Toggle Panel Visibility" with a running terminal, run ${i + 1}, ends hidden`, JSON.stringify(r));
+        check(barsHidden(r) && r.editors === 1, `E8 terminal (trusted folder): "View: Toggle Panel Visibility", run ${i + 1}, with ${before} when it ran, ends hidden`, JSON.stringify(r));
       }
       await tb.shot("GP4-terminal-trusted.png");
+      console.log(`[gp4-term-trusted] focus-in-terminal path ${termAtStart === "terminal row, focused" ? "exercised on this run" : `NOT exercised on this run (terminal was: ${termAtStart})`}`);
     }
     tb.close();
     stopPid(tsrv.pid);

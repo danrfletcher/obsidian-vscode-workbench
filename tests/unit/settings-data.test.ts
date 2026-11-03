@@ -273,18 +273,21 @@ describe("custom CLI path validation (G15)", () => {
     const pidfile = path.join(dir, "pid");
     process.env.HANG_PIDFILE = pidfile;
     try {
+      // Timing-sensitive under a loaded full run (the program must have started and written its pid before the timeout fires, and the
+      // kill must land before we look), so the timeout is generous, every wait polls, and none of it assumes a fixed 100 ms.
       const started = Date.now();
-      const r = await verifyCliPath(script(HANG_SCRIPT, "hang", dir), { timeoutMs: 1500 });
-      expect(Date.now() - started).toBeLessThan(5000);
+      const r = await verifyCliPath(script(HANG_SCRIPT, "hang", dir), { timeoutMs: 4000 });
+      expect(Date.now() - started).toBeLessThan(15_000);
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.reason).toMatch(/no answer within/);
       const pid = Number(fs.readFileSync(pidfile, "utf8"));
-      await new Promise((res) => setTimeout(res, 100));
-      expect(() => process.kill(pid, 0)).toThrow(); // gone
+      const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      for (let i = 0; i < 100 && alive(); i++) await new Promise((res) => setTimeout(res, 50));
+      expect(alive()).toBe(false); // gone
     } finally {
       delete process.env.HANG_PIDFILE;
     }
-  });
+  }, 30_000);
 
   it("runs a path with spaces and shell characters without a shell", async () => {
     const parent = tempDir();

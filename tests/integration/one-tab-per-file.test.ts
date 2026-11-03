@@ -865,3 +865,119 @@ describe("the real CodeView (PR-4 R7)", () => {
     });
   });
 });
+
+describe("a file opened from a Code tab's editor (PR-4 E3, E4, GP2)", () => {
+  /** Every call the plugin makes on the workspace, in order, with what it was given. */
+  let calls: string[];
+  let activeLeaf: WorkspaceLeaf | null;
+  let obsidianLeaves: Array<WorkspaceLeaf & { view?: unknown }>;
+  let opened: Array<{ file: string; options: unknown }>;
+  let viewStates: Array<{ mode: unknown; state: { type: string; state?: unknown; active?: boolean } }>;
+
+  /** The app of `makeApp`, with the workspace calls this section is about recorded. */
+  async function loadRecording(): Promise<void> {
+    await load();
+    const ws = app.workspace as unknown as Record<string, unknown>;
+    ws.getMostRecentLeaf = () => activeLeaf;
+    ws.setActiveLeaf = (l: WorkspaceLeaf, o: unknown) => {
+      activeLeaf = l;
+      calls.push(`setActiveLeaf:${(l as { name?: string }).name ?? "?"}:${JSON.stringify(o)}`);
+    };
+    ws.iterateAllLeaves = (cb: (l: WorkspaceLeaf) => void) => obsidianLeaves.forEach(cb);
+    ws.revealLeaf = async (l: WorkspaceLeaf) => void calls.push(`revealLeaf:${(l as { name?: string }).name ?? "?"}`);
+    ws.getLeaf = (mode?: unknown) => {
+      calls.push(`getLeaf:${String(mode)}`);
+      const l = new CodeLeaf() as CodeLeaf & { openFile?: (f: { path: string }, o: unknown) => Promise<void> };
+      const set = l.setViewState.bind(l);
+      l.setViewState = async (s) => {
+        viewStates.push({ mode, state: s as never });
+        await set(s);
+      };
+      l.openFile = async (f, options) => void opened.push({ file: f.path, options });
+      created.push(l);
+      return l;
+    };
+  }
+
+  const named = <T extends WorkspaceLeaf>(l: T, name: string): T => Object.assign(l, { name });
+
+  beforeEach(() => {
+    calls = [];
+    activeLeaf = null;
+    obsidianLeaves = [];
+    opened = [];
+    viewStates = [];
+  });
+
+  it("E4: a Code tab that is not the active one is made active BEFORE the new tab is made, so the new tab lands in its pane", async () => {
+    write("a.py");
+    write("lib/b.py");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    const other = named(new CodeLeaf(), "other");
+    activeLeaf = other; // the user is on another pane when the report arrives
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "lib/b.py" }, 7);
+    expect(calls.slice(0, 2)).toEqual(['setActiveLeaf:from:{"focus":false}', "getLeaf:tab"]);
+    expect(activeLeaf).toBe(from);
+  });
+
+  it("E4: when the Code tab is already the active one the active leaf is not touched", async () => {
+    write("lib/b.py");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    activeLeaf = from;
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "lib/b.py" }, 7);
+    expect(calls.filter((c) => c.startsWith("setActiveLeaf"))).toEqual([]);
+  });
+
+  it('GP2: the Code tab path asks for getLeaf("tab") and sets the view state active, at the reported line', async () => {
+    write("lib/b.py");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    activeLeaf = from;
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "lib/b.py" }, 7);
+    expect(viewStates).toHaveLength(1);
+    expect(viewStates[0].mode).toBe("tab");
+    expect(viewStates[0].state).toEqual({ type: VIEW, state: { file: "lib/b.py", line: 7 }, active: true });
+  });
+
+  it('GP2: the Obsidian path (a note) asks for getLeaf("tab") and opens the file active', async () => {
+    write("notes/n.md", "# n");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    activeLeaf = from;
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "notes/n.md" }, null);
+    expect(calls).toContain("getLeaf:tab");
+    expect(opened).toEqual([{ file: "notes/n.md", options: { active: true } }]);
+  });
+
+  it("a note that is already open in Obsidian is focused, not opened a second time (repeated Go to Definition into a note)", async () => {
+    write("notes/n.md", "# n");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    activeLeaf = from;
+    const noteLeaf = named(new WorkspaceLeaf(), "note") as WorkspaceLeaf & { view?: unknown };
+    noteLeaf.view = { file: { path: "notes/n.md" } };
+    const elsewhere = named(new WorkspaceLeaf(), "elsewhere") as WorkspaceLeaf & { view?: unknown };
+    elsewhere.view = { file: { path: "notes/other.md" } };
+    obsidianLeaves = [elsewhere, noteLeaf];
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "notes/n.md" }, null);
+    expect(opened).toEqual([]);
+    expect(calls).not.toContain("getLeaf:tab");
+    expect(calls).toContain("revealLeaf:note");
+    expect(activeLeaf).toBe(noteLeaf);
+    expect(live()).toHaveLength(0);
+  });
+
+  it("a note open only as a different file's tab does not count: it opens in a new tab", async () => {
+    write("notes/n.md", "# n");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    activeLeaf = from;
+    const elsewhere = named(new WorkspaceLeaf(), "elsewhere") as WorkspaceLeaf & { view?: unknown };
+    elsewhere.view = { file: { path: "notes/other.md" } };
+    obsidianLeaves = [elsewhere];
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "notes/n.md" }, null);
+    expect(opened).toEqual([{ file: "notes/n.md", options: { active: true } }]);
+  });
+});
