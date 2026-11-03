@@ -15,7 +15,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Modal, Notice, Plugin, Tasks } from "../mocks/obsidian";
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
-import { FAKE_CODE, isAlive, tempDir } from "../helpers";
+import { FAKE_CODE, isAlive, tempDir, openTerminal } from "../helpers";
 import { installFakeDocument, makeHostApp, type FakeDocument } from "../fake-host-page";
 
 const MAKE_FAKE_INSTANCES = path.resolve(__dirname, "../fixtures/make-fake-instances.sh");
@@ -106,7 +106,7 @@ async function load(): Promise<void> {
 
 /** Start, crash, restart from the banner, fail a restart, restart again, then quit: the whole story. */
 async function story(): Promise<void> {
-  plugin.showTerminalHost();
+  openTerminal(plugin);
   await host().settled();
   noteServer();
 
@@ -173,7 +173,7 @@ describe("F6 desktop VS Code's folders", () => {
 
   it("the terminal page's own profile is under the plugin's .server folder", async () => {
     await load();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host().settled();
     const server = path.join(vault, ".obsidian/plugins/obsidian-vscode-workbench/.server");
     expect(fs.existsSync(server)).toBe(true);

@@ -134,6 +134,8 @@ function world(
   const newTabs: string[] = [];
   const carried: Array<{ from: string; to: string; result: CarryResult }> = [];
   const notMoved: Array<{ from: string; to: string }> = [];
+  /** Every read of a file's baseline the tabs started (a rename looks at the old path once, in the background), so a test can wait for them. */
+  const baselineReads: Array<{ file: string; done: Promise<void> }> = [];
   const root = opts.root;
   const host: CodeViewHost = {
     vaultRoot: () => root ?? "/vault",
@@ -170,7 +172,11 @@ function world(
     // The real on-disk move (src/rename-carry.ts) against the temp vault, recording what it decided.
     ...(root
       ? {
-          readBaseline: (f: string) => readBaseline(root, f),
+          readBaseline: (f: string) => {
+            const read = readBaseline(root, f);
+            baselineReads.push({ file: f, done: read.then(() => undefined, () => undefined) });
+            return read;
+          },
           statSignature: (f: string) => statSignature(root, f),
           carryEdits: async (from: string, to: string, baseline: Buffer | null) => {
             const result = await carryEdits(root, from, to, baseline);
@@ -200,7 +206,13 @@ function world(
   const taken = (p: string) => {
     for (const v of views.values()) v.pathTaken(p);
   };
-  return { openTab, open, registry, sync, prompts, focused, newTabs, leaves, carried, notMoved, taken };
+  /** Resolves when every baseline read of `file` started so far has finished and the tab has acted on what it read. */
+  const baselineSettled = async (file: string) => {
+    await Promise.all(baselineReads.filter((r) => r.file === file).map((r) => r.done));
+    await new Promise((r) => setImmediate(r));
+  };
+  const hasBaselineRead = (file: string) => baselineReads.some((r) => r.file === file);
+  return { openTab, open, registry, sync, prompts, focused, newTabs, leaves, carried, notMoved, taken, baselineSettled, hasBaselineRead };
 }
 
 beforeEach(() => {
@@ -958,8 +970,10 @@ describe("vault events (G3, G4)", () => {
       w.sync.onRename("b.py", "a.py");
       // The tab's rename look reads the old path once, in the background (notePendingMove). A file written there before
       // that read finishes is seen by it, which is a different case from the one under test: wait until the tab has
-      // settled onto the renamed file, and only then put another file at the old path.
+      // settled onto the renamed file AND that read of the old path has finished, and only then put another file there.
       await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"));
+      await vi.waitFor(() => expect(w.hasBaselineRead("a.py")).toBe(true));
+      await w.baselineSettled("a.py");
       fs.writeFileSync(path.join(root, "a.py"), "new a\n");
       w.taken("a.py"); // what the plugin does when Obsidian reports the new file: the settled tab has nothing to say about it
       expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("old\n");

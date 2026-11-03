@@ -58,11 +58,14 @@ export interface TerminalHostDeps {
   licenceAccepted(): boolean;
   /** The licence modal (`LicenceGate.request`): resolves true only for an explicit Accept. Nothing downloads before that. */
   requestLicence(): Promise<boolean>;
-  /** The plugin's shared server start (`ensureServer`): one server, one licence modal and one start however many callers. */
+  /**
+   * The plugin's shared server start (`ensureServer`): one server, one licence modal and one start however many callers. The
+   * plugin asks it quietly: a failed start raises no Notice, because the page shows the reason itself, with Retry.
+   */
   ensureServer(): Promise<RunningServer>;
   /**
-   * The crash banner's Restart: the plugin's single-flight `restartServer`. It never asks (the server is not running), shows its
-   * own failure notice and rejects when the server cannot start; the host then shows the reason in the banner.
+   * The crash banner's Restart: the plugin's single-flight `restartServer`. It never asks (the server is not running) and rejects
+   * when the server cannot start, with no Notice (asked quietly); the host then shows the reason in the banner.
    */
   restartServer?(): Promise<void>;
   /** The token-free reason for a failed start (`describeFailure`). */
@@ -493,7 +496,7 @@ export class TerminalHostPage {
   /**
    * The crash banner's Restart. Two presses share one restart. The server's `running` event brings the page back (see
    * `serverRunning`); a restart that fails reaches the banner through `serverFailed`, so this only has to wait and swallow the
-   * rejection (its notice has been shown). It restarts nothing by itself: only a press gets here.
+   * rejection (the banner shows the reason; the quiet restart raised no Notice). It restarts nothing by itself: only a press gets here.
    */
   private async restartFromBanner(): Promise<void> {
     if (this.restarting || this.state.phase !== "crashed" || !this.deps.restartServer) return;
@@ -501,7 +504,7 @@ export class TerminalHostPage {
     try {
       await this.deps.restartServer();
     } catch {
-      /* the failure notice was shown and the banner carries the reason */
+      /* the banner carries the reason (serverFailed); no Notice repeats it */
     } finally {
       this.restarting = false;
     }

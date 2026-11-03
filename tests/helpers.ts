@@ -105,3 +105,16 @@ export class FakeWebview {
   }
   remove() {}
 }
+
+/**
+ * Open the terminal drawer the way the edge, the command and the hotkey do (through the drawer, which shows the host page and
+ * starts the server on the first open). The plugin has no other way to show the page.
+ */
+export function openTerminal(plugin: unknown): void {
+  (plugin as { drawer: { openDrawer(): void } }).drawer.openDrawer();
+}
+
+/** Close the terminal drawer, which hides the host page; the page stays mounted and alive. */
+export function closeTerminal(plugin: unknown): void {
+  (plugin as { drawer: { close(): void } }).drawer.close();
+}

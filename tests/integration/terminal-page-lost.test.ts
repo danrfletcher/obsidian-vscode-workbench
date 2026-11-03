@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Modal, Notice, Plugin } from "../mocks/obsidian";
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
 import { LOST_TEXT, RESTART_LOST_TEXT, TERMINAL_CRASH_TEXT, TERMINAL_RESTART_FAILED_TEXT } from "../../src/terminal-host/host-page";
-import { FAKE_CODE, isAlive, tempDir } from "../helpers";
+import { FAKE_CODE, isAlive, tempDir, openTerminal, closeTerminal } from "../helpers";
 import { installFakeDocument, makeHostApp, type FakeDocument } from "../fake-host-page";
 
 const PLUGIN_DIR = ".obsidian/plugins/obsidian-vscode-workbench";
@@ -35,7 +35,7 @@ const until = (fn: () => void, timeout = 8000) => vi.waitFor(fn, { timeout, inte
 
 /** A shown drawer with the page up. */
 async function showRunning(): Promise<void> {
-  plugin.showTerminalHost();
+  openTerminal(plugin);
   await host().settled();
   expect(host().view()).toBe("running");
 }
@@ -89,11 +89,11 @@ describe("the lost message is for a restart, not for a start", () => {
     expect(doc.webviews).toHaveLength(2);
     expect(doc.text()).not.toContain(RESTART_LOST_TEXT);
 
-    plugin.hideTerminalHost();
+    closeTerminal(plugin);
     await inner().manager.stop("idle");
     expect(host().view()).toBe("hidden");
     expect(doc.webviews).toHaveLength(2); // nothing starts for a hidden drawer
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await until(() => expect(host().view()).toBe("running"));
     expect(doc.webviews).toHaveLength(3);
     expect(doc.text()).not.toContain(RESTART_LOST_TEXT);
@@ -130,11 +130,11 @@ describe("the lost message is for a restart, not for a start", () => {
   it("a restart while the drawer is hidden: the page comes back at the new address and the message is there when the drawer opens", async () => {
     await load();
     await showRunning();
-    plugin.hideTerminalHost();
+    closeTerminal(plugin);
     await plugin.restartServer();
     await until(() => expect(doc.webviews).toHaveLength(2));
     await host().settled();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     expect(host().view()).toBe("lost");
     expect(doc.text()).toContain(RESTART_LOST_TEXT);
   });
@@ -167,10 +167,10 @@ describe("a crashed server (G13)", () => {
   it("the drawer hidden at the crash and opened afterwards shows the banner", async () => {
     await load();
     await showRunning();
-    plugin.hideTerminalHost();
+    closeTerminal(plugin);
     await crashServer();
     expect(host().view()).toBe("hidden");
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     expect(host().view()).toBe("crashed");
     expect(doc.text()).toContain(TERMINAL_CRASH_TEXT);
     expect(doc.button("Restart")).toBeDefined();
@@ -220,6 +220,7 @@ describe("a crashed server (G13)", () => {
     await until(() => expect(doc.text()).toContain(TERMINAL_RESTART_FAILED_TEXT));
     expect(host().view()).toBe("crashed");
     expect(doc.button("Restart")).toBeDefined();
+    expect(Notice.messages.filter((m) => !m.includes("downloading the VS Code server"))).toEqual([]); // the banner carries the reason; no Notice repeats it
     expect(doc.webviews).toHaveLength(1);
     expect(restart).toHaveBeenCalledTimes(1);
 
@@ -252,7 +253,7 @@ describe("a crashed server (G13)", () => {
 
   it("a server that crashes while a start of the page is still running leaves the banner, and nothing comes back by itself", async () => {
     await load();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     // the start is in flight: the server is being made
     await until(() => expect(inner().manager.state).toBe("running"));
     process.kill(serverPids()[0], "SIGKILL");

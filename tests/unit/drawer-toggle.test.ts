@@ -4,23 +4,23 @@
  * real terminal drawer (odd/even counts, blur and focus handoff, the G1 focus-back fallback to the active leaf).
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DrawerToggle, toggleState, type FocusHandle, type ShellProgress, type ToggleTarget } from "../../src/hotkey/drawer-toggle";
+import { DrawerToggle, toggleState, type FocusHandle, type PageProgress, type ToggleTarget } from "../../src/hotkey/drawer-toggle";
 import { resetPage } from "../page-helpers";
 import { HEADROOM } from "../../src/terminal/drawer-geometry";
 import { FocusReturn } from "../../src/terminal/focus-return";
 import { TerminalDrawer, type DrawerHost } from "../../src/terminal/terminal-drawer";
 import type { HostView } from "../../src/terminal-host/host-state";
 
-/** A drawer controller reduced to what the toggle drives; the first reveal makes one shell. */
+/** A drawer controller reduced to what the toggle drives; the first reveal starts the terminal page. */
 class FakeDrawer implements ToggleTarget {
   open = false;
   enabled = true;
   shells = 0;
   toggles = 0;
-  progress: ShellProgress = "none";
+  progress: PageProgress = "none";
   get isOpen() { return this.open; }
   hotkeyEnabled() { return this.enabled; }
-  shellProgress() { return this.progress; }
+  pageProgress() { return this.progress; }
   toggle() {
     this.toggles += 1;
     this.open = !this.open;
@@ -50,7 +50,7 @@ describe("toggle state machine against a mocked drawer", () => {
     expect(d.shells).toBe(1);
   });
 
-  it.each<[boolean, ShellProgress, string]>([
+  it.each<[boolean, PageProgress, string]>([
     [false, "none", "hidden"],
     [false, "running", "hidden"],
     [true, "none", "revealing"],

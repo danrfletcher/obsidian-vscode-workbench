@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Modal, Notice, Plugin, Tasks } from "../mocks/obsidian";
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
-import { FAKE_CODE, isAlive, tempDir } from "../helpers";
+import { FAKE_CODE, isAlive, tempDir, openTerminal } from "../helpers";
 import { installFakeDocument, makeHostApp, type FakeDocument } from "../fake-host-page";
 import type { FakeHostEl } from "../host-fakes";
 
@@ -73,7 +73,7 @@ async function loadWithPage(): Promise<void> {
   plugin = new VSCodeWorkbenchPlugin(makeHostApp(vault) as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, embed: "iframe", serverLicenceAccepted: true };
   await plugin.onload();
-  plugin.showTerminalHost();
+  openTerminal(plugin);
   await host().settled();
   expect(host().view()).toBe("running");
 }

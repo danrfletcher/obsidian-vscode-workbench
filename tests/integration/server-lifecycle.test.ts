@@ -15,6 +15,7 @@ import { describeFailure } from "../../src/failure-messages";
 import { ServerStartError, WorkbenchServer, type CodeBuild } from "../../src/server";
 import { IdleTimer } from "../../src/idle-timer";
 import { ServerManager } from "../../src/server-manager";
+import { readProcessTable } from "../../src/process-utils";
 import { hasLiveTerminalShell } from "../../src/terminal-keepalive";
 import { FAKE_CODE, isAlive, listenersOn, tempDir } from "../helpers";
 
@@ -27,6 +28,8 @@ let registry: ChildRegistry;
 let pidfile: PidFile;
 let managers: ServerManager[] = [];
 const extraPids: number[] = [];
+/** Process groups the test started (a fake server's), ended with SIGKILL after each test. */
+const extraGroups: number[] = [];
 
 function makeManager(over: { runtimeDir?: string; workspace?: string; healthIntervalMs?: number; env?: Record<string, string> } = {}): ServerManager {
   const m = new ServerManager({
@@ -77,6 +80,13 @@ afterEach(async () => {
   await Promise.all(managers.map((m) => m.stop("quit")));
   for (const pid of terminalShells()) if (isAlive(pid)) killGroup(pid);
   for (const pid of [...serverPids(), ...extraPids.splice(0)]) if (isAlive(pid)) process.kill(pid, "SIGKILL");
+  for (const group of extraGroups.splice(0)) {
+    try {
+      process.kill(-group, "SIGKILL");
+    } catch {
+      /* nothing left in it */
+    }
+  }
 });
 
 describe("a started server", () => {
@@ -202,6 +212,16 @@ describe("crash (kill -9)", () => {
     });
     const { servers, shells, setsid } = listed();
     extraPids.push(...setsid, ...shells);
+    // The `ignore` shell starts a new sleep whenever one is killed, so a sleep can be born after the crash cleanup has taken its shell's
+    // tree and then be re-parented to init for ten minutes. They all carry their server's process group (the shells are not detached), so the
+    // test ends that group, never by name.
+    const adoptGroupOf = (server: number) => {
+      const group = Number(execFileSync("ps", ["-o", "pgid=", "-p", String(server)], { encoding: "utf8" }).trim());
+      expect(group).toBeGreaterThan(1);
+      expect(group).not.toBe(process.pid);
+      extraGroups.push(group);
+    };
+    adoptGroupOf(servers[0]);
     for (const pid of shells) expect(isAlive(pid)).toBe(true);
 
     process.kill(servers[0], "SIGKILL");
@@ -218,6 +238,15 @@ describe("crash (kill -9)", () => {
     expect(m.state).toBe("running");
     expect(second.port).not.toBe(first.port);
     expect(second.token).not.toBe(first.token);
+
+    // the restarted server holds its own shells and its own setsid child: the test ends those too
+    await until(() => {
+      expect(listed().shells).toHaveLength(6);
+      expect(listed().setsid).toHaveLength(2);
+    });
+    const now = listed();
+    extraPids.push(...now.setsid, ...now.shells);
+    adoptGroupOf(now.servers[1]);
   });
 
   it("a server that stops answering while its process lingers is noticed by the health probe", async () => {
@@ -359,16 +388,16 @@ describe("start failures with real processes", () => {
 
 describe("G10 keep-alive with a real shell under the server", () => {
   /** The plugin's wiring: an idle clock on the manager whose shell input reads the real process table under the server's pid. */
-  function idleOn(m: ServerManager, idleMs: number): IdleTimer {
+  function idleOn(m: ServerManager, idleMs: number, over: { pollMs?: number; read?: () => Promise<string> } = {}): IdleTimer {
     const idle = new IdleTimer({
       visibleCodeTab: () => false,
       hasDirtyBuffer: () => false,
-      liveTerminalShell: () => hasLiveTerminalShell(m.serverInstance?.pid),
+      liveTerminalShell: () => hasLiveTerminalShell(m.serverInstance?.pid, over.read),
       onIdle: () => m.stop("idle"),
       idleMs,
-      // A process table read takes tens of ms. The poll must not tick inside the re-check at the moment the clock runs out
-      // (a newer evaluation supersedes it): 1000 ms + one read lands between two ticks of a 400 ms poll.
-      pollMs: 400,
+      // A process table read takes tens of ms. By default the poll does not tick inside the re-check at the moment the clock
+      // runs out: 1000 ms + one read lands between two ticks of a 400 ms poll. The race test below forces the tick into it.
+      pollMs: over.pollMs ?? 400,
     });
     idles.push(idle);
     m.onChange((state) => (state === "running" ? idle.start() : idle.stop()));
@@ -386,6 +415,24 @@ describe("G10 keep-alive with a real shell under the server", () => {
     idleOn(m, 1000);
     await m.ensureStarted();
     await until(() => expect(m.state).toBe("stopped-by-idle"));
+  });
+
+  it("a poll that lands inside the re-check at the moment the clock runs out (a real, slowed process table read) still stops at idleMs, not a second idleMs later", async () => {
+    const m = makeManager();
+    // Every read of the real process table takes 100 ms more (so 125-200 ms in all) and the poll ticks every 300 ms. The first read
+    // ends at about 150 ms, so the clock runs out at about 1150 ms and its re-check reads until about 1300 ms: the poll at 1200 ms
+    // lands inside it. (A poll faster than a read would starve every evaluation, which is not the case under test.)
+    const slowRead = async () => {
+      await new Promise((res) => setTimeout(res, 100));
+      return readProcessTable();
+    };
+    const idleMs = 1000;
+    idleOn(m, idleMs, { pollMs: 300, read: slowRead });
+    const t0 = Date.now();
+    await m.ensureStarted();
+    await until(() => expect(m.state).toBe("stopped-by-idle"));
+    // the stop lands at about 1300 ms; the old race left the server up and started a fresh idleMs countdown, a stop at 2300 ms or later
+    expect(Date.now() - t0).toBeLessThan(idleMs + 700);
   });
 
   it("with a live shell the state stays running well past idleMs; after the shell is killed it goes to stopped-by-idle", async () => {

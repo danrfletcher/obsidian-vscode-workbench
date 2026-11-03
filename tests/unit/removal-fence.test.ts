@@ -156,7 +156,11 @@ describe("names", () => {
   it("no setting, command or ribbon entry can bring back the old drawer: the plugin registers only the commands it should", () => {
     const main = code(fs.readFileSync(path.join(SRC, "main.ts"), "utf8"));
     const ids = [...main.matchAll(/id:\s*"([^"]+)"/g)].map((m) => m[1]);
-    for (const id of ids) expect(id, id).not.toMatch(/old|legacy|classic|builtin|xterm|pty/i);
+    // the exact list, written out: a new command (the old drawer's, or any other) has to be added here on purpose
+    expect(ids.sort()).toEqual(["open-spike-file", "toggle-terminal-drawer"]);
+    // and nothing outside main.ts registers one
+    const others = srcFiles.filter((f) => path.basename(f) !== "main.ts" && /\baddCommand\s*\(/.test(code(fs.readFileSync(f, "utf8"))));
+    expect(others.map((f) => path.relative(REPO_ROOT, f))).toEqual([]);
   });
 });
 

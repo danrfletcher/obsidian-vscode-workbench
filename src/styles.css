@@ -4,12 +4,20 @@
  * The open drawer takes its height from the main pane area only: the sidebars keep the full window height. The status
  * bar floats at the bottom right; it is lifted over the drawer only when the drawer reaches that corner. The variables
  * come from the drawer and its layout controller (terminal-drawer.ts, layout.ts) and are 0 while the drawer is closed.
+ *
+ * The note area stops above the open drawer. Obsidian gives its splits an explicit height of 100%, which a bottom margin
+ * alone does not shorten (the leaf kept running under the drawer), so the height is reduced too; the margin stays for a theme
+ * that sizes the split by stretching instead. Only the open drawer shortens it (the closed one leaves Obsidian's own sizing).
+ *
+ * Obsidian copies the main window's body classes and style variables to a pop-out window's body and marks that body
+ * `is-popout-window`. A pop-out holds no edge and no drawer, so none of these rules apply there.
  */
-body.vscw-drawer-on .workspace-split.mod-root {
+body.vscw-drawer-open:not(.is-popout-window) .workspace-split.mod-root {
+  height: calc(100% - var(--vscw-open-height, 0px));
   margin-bottom: var(--vscw-open-height, 0px);
 }
 
-body.vscw-drawer-on .status-bar {
+body.vscw-drawer-on:not(.is-popout-window) .status-bar {
   bottom: var(--vscw-status-lift, 0px);
 }
 

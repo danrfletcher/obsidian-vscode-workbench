@@ -22,7 +22,8 @@
 // FAKE_CODE_SHELL_PORT=p makes the server start a terminal the way the real one's pty host does: a shell in its own
 //   process group (the pty's session) with a child `python3 -m http.server p --bind 127.0.0.1`. The shell's pid is
 //   appended to FAKE_CODE_SHELL_PIDFILE. The shell is a descendant of the server and carries neither the server's
-//   token-file path nor "serve-web" on its command line, like a real shell under the pty host.
+//   token-file path nor "serve-web" on its command line, like a real shell under the pty host. FAKE_CODE_SHELL_NOHUP_PIDFILE=f adds
+//   a `nohup sleep 307 &` child of that shell, its pid appended to f.
 // FAKE_CODE_SHELLS=n makes the server hold n live terminal children, started the way a shell of the real server is: children of the
 //   server in its own process group, not detached. FAKE_CODE_SHELL_KINDS=a,b,c (default: all `sleep`) picks each child's kind, in
 //   order and repeating: `sleep` is a bare `sleep 600` (an idle shell), `fg` a shell with a foreground child (`sh -c 'sleep 600; true'`),
@@ -68,7 +69,11 @@ if (process.env.FAKE_CODE_SHELLS) {
 }
 if (process.env.FAKE_CODE_SHELL_PORT) {
   // `; true` keeps the shell alive as the parent (without it, sh -c would exec the last command in place).
-  const shell = spawn("sh", ["-c", `python3 -m http.server ${process.env.FAKE_CODE_SHELL_PORT} --bind 127.0.0.1; true`], { detached: true, stdio: "ignore", env: { ...process.env, FAKE_CODE_SHELL_PORT: "", FAKE_CODE_PIDFILE: "" } });
+  // FAKE_CODE_SHELL_NOHUP_PIDFILE=f: the shell first does `nohup sleep 307 & disown`-style work, so a nohup process is still a child of the
+  //   shell (the tree reaches it) and its pid is appended to f. Without it there is no such process.
+  const nohupFile = process.env.FAKE_CODE_SHELL_NOHUP_PIDFILE;
+  const nohup = nohupFile ? `nohup sleep 307 >/dev/null 2>&1 & echo $! >> '${nohupFile.replace(/'/g, "'\\''")}'; ` : "";
+  const shell = spawn("sh", ["-c", `${nohup}python3 -m http.server ${process.env.FAKE_CODE_SHELL_PORT} --bind 127.0.0.1; true`], { detached: true, stdio: "ignore", env: { ...process.env, FAKE_CODE_SHELL_PORT: "", FAKE_CODE_PIDFILE: "", FAKE_CODE_SHELL_NOHUP_PIDFILE: "" } });
   shell.unref();
   if (process.env.FAKE_CODE_SHELL_PIDFILE) fs.appendFileSync(process.env.FAKE_CODE_SHELL_PIDFILE, `${shell.pid}\n`);
 }

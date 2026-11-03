@@ -21,7 +21,8 @@ export default defineConfig({
     include: ["tests/**/*.test.ts"],
     coverage: {
       provider: "v8",
-      reporter: ["text"],
+      // skipFull: false lists every file, including those at 100% (the new terminal files are), so per-file coverage is reported
+      reporter: [["text", { skipFull: false }]],
       include: ["src/**/*.ts"],
     },
   },

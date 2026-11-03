@@ -8,8 +8,9 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileSystemAdapter, Modal, Notice, Plugin, TFile, WorkspaceLeaf, FakeNode, type MockApp } from "../mocks/obsidian";
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
+import { ServerStartError } from "../../src/server";
 import { LOST_TEXT, STARTING_TEXT } from "../../src/terminal-host/host-page";
-import { FAKE_CODE, isAlive, tempDir } from "../helpers";
+import { FAKE_CODE, isAlive, tempDir, openTerminal, closeTerminal } from "../helpers";
 import { FakeHostEl, FakeWorkbenchPage } from "../host-fakes";
 
 let vault: string;
@@ -77,6 +78,8 @@ async function onModal(then: () => void): Promise<void> {
 const inner = () => plugin as unknown as { manager: import("../../src/server-manager").ServerManager; data_: Record<string, unknown> };
 const host = () => (plugin as unknown as { terminalHost: import("../../src/terminal-host/host-page").TerminalHostPage | null }).terminalHost;
 const drawerText = () => body.visibleText();
+/** Notices about a failed start: every Notice but the download progress one. A start the page made shows its reason in the drawer only. */
+const failureNotices = () => Notice.messages.filter((m) => !m.includes("downloading the VS Code server"));
 const token = () => inner().manager.current!.token;
 
 beforeEach(() => {
@@ -155,7 +158,7 @@ describe("G2: reveal starts the server behind the licence modal", () => {
 
   it("with the licence already accepted there is no modal, and 'Starting...' is up until the page is ready", async () => {
     await load({}, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await vi.waitFor(() => expect(host()!.view()).toBe("starting"));
     expect(drawerText()).toBe(STARTING_TEXT);
     await host()!.settled();
@@ -208,7 +211,7 @@ describe("F2/GP1: the host page keeps its own overlay; the Code tab gets the chr
 describe("E2: licence declined", () => {
   it("Decline: drawer closed, one notice, no download, no process; the next reveal asks again", async () => {
     await load();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await onModal(() => press("Decline"));
     await host()!.settled();
     expect(host()!.view()).toBe("hidden");
@@ -219,7 +222,7 @@ describe("E2: licence declined", () => {
     expect(webviews).toHaveLength(0);
     expect(inner().data_.serverLicenceAccepted).not.toBe(true);
 
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await onModal(() => press(MODAL_ACCEPT));
     await host()!.settled();
     expect(Modal.opened).toHaveLength(2);
@@ -229,7 +232,7 @@ describe("E2: licence declined", () => {
 
   it("Escape counts as a decline", async () => {
     await load();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await onModal(() => lastModal().close());
     await host()!.settled();
     expect(host()!.view()).toBe("hidden");
@@ -243,7 +246,7 @@ describe("E1: a failed start keeps the drawer open with the reason and Retry", (
   it("missing binary: the missing-binary reason, then Retry after the install is back reaches the terminal", async () => {
     await load({}, { serverLicenceAccepted: true });
     inner().data_.codeCliPath = path.join(vault, "no-such-code");
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     expect(host()!.view()).toBe("error");
     expect(host()!.isVisible()).toBe(true);
@@ -262,11 +265,12 @@ describe("E1: a failed start keeps the drawer open with the reason and Retry", (
 
   it("an instance that fails its start (exit): the exit code and last line, with Retry", async () => {
     await load({ FAKE_CODE_MODE: "exit-plain" }, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     expect(host()!.view()).toBe("error");
     expect(drawerText()).toContain("The VS Code server exited with code 5. Last message: fatal: the fake server broke");
     expect(drawerText()).toContain("Retry");
+    expect(failureNotices()).toEqual([]); // the reason is in the drawer once, not also in a Notice
 
     delete process.env.FAKE_CODE_MODE;
     retryButton().click();
@@ -274,14 +278,88 @@ describe("E1: a failed start keeps the drawer open with the reason and Retry", (
     expect(host()!.view()).toBe("running");
   });
 
+  it("the server not ready in time (timeout): the seconds waited and the last message, with Retry, and the drawer stays open", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    // The real wait is 30 s (READY_TIMEOUT_MS): the start is made to end the way that wait ends, and everything after it is the real path.
+    const real = (plugin as unknown as { createServer(o: unknown): Promise<unknown> }).createServer;
+    let calls = 0;
+    (plugin as unknown as { createServer(o: unknown): Promise<unknown> }).createServer = async function (this: unknown, o: unknown) {
+      if (calls++ === 0) throw new ServerStartError("not ready", null, "warming up the extension host", { kind: "timeout", seconds: 30 });
+      return real.call(this, o);
+    };
+    openTerminal(plugin);
+    await host()!.settled();
+    expect(host()!.view()).toBe("error");
+    expect(host()!.isVisible()).toBe(true);
+    expect(drawerText()).toContain("The VS Code server was not ready after 30 s.");
+    expect(drawerText()).toContain("warming up the extension host");
+    expect(drawerText()).toContain("Retry");
+    expect(failureNotices()).toEqual([]);
+    expect(webviews).toHaveLength(0);
+
+    retryButton().click();
+    await host()!.settled();
+    expect(host()!.view()).toBe("running");
+    expect(webviews).toHaveLength(1);
+  });
+
+  it("a server that cannot listen on its port (port-bind): the port reason with Retry, and never the token", async () => {
+    await load({ FAKE_CODE_MODE: "exit-stdout" }, { serverLicenceAccepted: true });
+    openTerminal(plugin);
+    await host()!.settled();
+    expect(host()!.view()).toBe("error");
+    expect(drawerText()).toContain("could not listen on 127.0.0.1:");
+    expect(drawerText()).toContain("exit code 7");
+    expect(drawerText()).toContain("Retry");
+    expect(failureNotices()).toEqual([]);
+    expect(webviews).toHaveLength(0);
+    const tokenFile = path.join(vault, PLUGIN_DIR, ".server/connection-token");
+    expect(drawerText()).not.toContain(fs.readFileSync(tokenFile, "utf8"));
+  });
+
+  it("a server process that cannot be spawned (spawn): its reason with Retry", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    (plugin as unknown as { createServer(o: unknown): Promise<unknown> }).createServer = async () => {
+      throw new ServerStartError("spawn failed", null, "", { kind: "spawn" });
+    };
+    openTerminal(plugin);
+    await host()!.settled();
+    expect(host()!.view()).toBe("error");
+    expect(drawerText()).toContain("spawn failed");
+    expect(drawerText()).toContain("Retry");
+    expect(failureNotices()).toEqual([]);
+    expect(webviews).toHaveLength(0);
+  });
+
+  it("a start a Code tab made keeps its Notice (it has no page of its own to show the reason), and a Code tab joining the page's start brings the Notice back", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    const failing = () => {
+      (plugin as unknown as { createServer(o: unknown): Promise<unknown> }).createServer = async () => {
+        throw new ServerStartError("spawn failed", null, "", { kind: "spawn" });
+      };
+    };
+    failing();
+    await expect(plugin.ensureServer()).rejects.toThrow("spawn failed");
+    expect(failureNotices()).toHaveLength(1);
+    expect(failureNotices()[0]).toContain("spawn failed");
+
+    Notice.reset();
+    const quiet = plugin.ensureServer({ quiet: true });
+    const tab = plugin.ensureServer(); // joins the quiet start: someone who is not the page now needs the Notice
+    await expect(quiet).rejects.toThrow("spawn failed");
+    await expect(tab).rejects.toThrow("spawn failed");
+    expect(failureNotices()).toHaveLength(1); // one shared Notice, not one per caller
+  });
+
   it("offline on the first run: the offline-first-run wording with Retry, no old drawer as fallback", async () => {
     const partial = path.join(vault, PLUGIN_DIR, ".server/cli-data/serve-web", "d".repeat(40));
     await load({ FAKE_CODE_MODE: "offline", FAKE_CODE_PARTIAL_DIR: partial }, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     expect(host()!.view()).toBe("error");
     expect(drawerText()).toContain("could not be downloaded because the network is unreachable");
     expect(drawerText()).toContain("Retry");
+    expect(failureNotices()).toEqual([]);
     expect(inner().data_.serverLicenceAccepted).toBe(true);
     expect(plugin).not.toHaveProperty("terminal"); // no old drawer is built to fall back to
     expect(webviews).toHaveLength(0);
@@ -289,14 +367,14 @@ describe("E1: a failed start keeps the drawer open with the reason and Retry", (
 
   it("Retry while a start is running shares it: one process, one webview", async () => {
     await load({ FAKE_CODE_MODE: "exit-plain" }, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     delete process.env.FAKE_CODE_MODE;
     const failedStarts = serverPids().length; // the failed start spawned (and lost) one process
     const retry = retryButton();
     retry.click();
     retry.click();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     expect(serverPids()).toHaveLength(failedStarts + 1);
     expect(webviews).toHaveLength(1);
@@ -307,11 +385,11 @@ describe("E1: a failed start keeps the drawer open with the reason and Retry", (
 describe("E10 and G17: rapid reveals, hide during a start, and hide/show", () => {
   it("two rapid reveals give one modal, one server and one webview", async () => {
     await load();
-    plugin.showTerminalHost();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
+    openTerminal(plugin);
     await onModal(() => press(MODAL_ACCEPT));
     await host()!.settled();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     expect(Modal.opened).toHaveLength(1);
     expect(serverPids()).toHaveLength(1);
     expect(webviews).toHaveLength(1);
@@ -320,11 +398,11 @@ describe("E10 and G17: rapid reveals, hide during a start, and hide/show", () =>
 
   it("reveal while the modal is open, then hide and reveal again: one coherent state, one webview", async () => {
     await load();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await vi.waitFor(() => expect(Modal.opened).toHaveLength(1));
-    plugin.showTerminalHost();
-    plugin.hideTerminalHost();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
+    closeTerminal(plugin);
+    openTerminal(plugin);
     press(MODAL_ACCEPT);
     await host()!.settled();
     expect(Modal.opened).toHaveLength(1);
@@ -334,27 +412,27 @@ describe("E10 and G17: rapid reveals, hide during a start, and hide/show", () =>
 
   it("hide during 'Starting', show after it finished: the terminal, not a stale Starting", async () => {
     await load({}, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await vi.waitFor(() => expect(host()!.view()).toBe("starting"));
-    plugin.hideTerminalHost();
+    closeTerminal(plugin);
     await host()!.settled();
     expect(host()!.view()).toBe("hidden");
     expect(webviews).toHaveLength(1);
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     expect(host()!.view()).toBe("running");
     expect(drawerText()).not.toContain("Starting");
   });
 
   it("hide and show keep the same webview element in the same parent, with no reload", async () => {
     await load({}, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     const wv = webviews[0];
     const parent = wv.parent;
     const srcs = [...wv.srcs];
     for (let i = 0; i < 3; i++) {
-      plugin.hideTerminalHost();
-      plugin.showTerminalHost();
+      closeTerminal(plugin);
+      openTerminal(plugin);
     }
     expect(webviews).toEqual([wv]);
     expect(wv.parent).toBe(parent);
@@ -364,7 +442,7 @@ describe("E10 and G17: rapid reveals, hide during a start, and hide/show", () =>
 
   it("a reload under the page shows 'terminals lost'", async () => {
     await load({}, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     webviews[0].fire("dom-ready");
     expect(drawerText()).toContain(LOST_TEXT);
@@ -374,7 +452,7 @@ describe("E10 and G17: rapid reveals, hide during a start, and hide/show", () =>
 describe("unload", () => {
   it("during the licence modal: no webview, and Accept afterwards starts no server nobody owns", async () => {
     await load();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await vi.waitFor(() => expect(Modal.opened).toHaveLength(1));
     const unloading = plugin.onunload();
     press(MODAL_ACCEPT);
@@ -387,7 +465,7 @@ describe("unload", () => {
 
   it("during the server start: no webview is left behind and the server is stopped", async () => {
     await load({}, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await vi.waitFor(() => expect(host()!.view()).toBe("starting"));
     plugin.onunload();
     await new Promise((r) => setTimeout(r, 800));
@@ -398,7 +476,7 @@ describe("unload", () => {
 
   it("after a run: the webview and the container are removed", async () => {
     await load({}, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     plugin.onunload();
     expect(webviews[0].removed).toBe(true);
@@ -410,7 +488,7 @@ describe("F3: one server", () => {
   it("a Code tab and the host together are one serve-web process, and the host's origin is the Code tab server's baseUrl", async () => {
     await load({}, { serverLicenceAccepted: true });
     await plugin.openSpikeFile();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     expect(serverPids()).toHaveLength(1);
     expect(new URL(webviews[0].srcs[webviews[0].srcs.length - 1]).origin).toBe(inner().manager.current!.baseUrl);
@@ -419,7 +497,7 @@ describe("F3: one server", () => {
   it("the host's start with a Code tab already starting shares that start", async () => {
     await load({}, { serverLicenceAccepted: true });
     const opening = plugin.openSpikeFile();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await Promise.all([opening, host()!.settled()]);
     expect(serverPids()).toHaveLength(1);
     expect(host()!.view()).toBe("running");
@@ -431,7 +509,7 @@ describe("G5: the theme follows Obsidian without a reload", () => {
 
   it("a flip to dark re-themes the running page in place, with no new load", async () => {
     await load({}, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     const wv = webviews[0];
     const loads = wv.srcs.length;
@@ -446,7 +524,7 @@ describe("G5: the theme follows Obsidian without a reload", () => {
 
   it("a css-change that is not a light/dark flip sends the page nothing", async () => {
     await load({}, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     for (let i = 0; i < 5; i++) cssChange().cb();
     await new Promise((r) => setTimeout(r, 100));
@@ -458,15 +536,15 @@ describe("the connection token", () => {
   it("is in no drawer text, notice or log line across a start, a failure, a retry, a hide and a reload", async () => {
     const spies = (["log", "info", "warn", "debug", "error"] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}));
     await load({ FAKE_CODE_MODE: "exit-early" }, { serverLicenceAccepted: true });
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host()!.settled();
     expect(host()!.view()).toBe("error");
     expect(drawerText()).not.toMatch(/tkn=|secret [0-9a-f]{20}/);
     delete process.env.FAKE_CODE_MODE;
     body.find("button").find((b) => b.textContent === "Retry")!.click();
     await host()!.settled();
-    plugin.hideTerminalHost();
-    plugin.showTerminalHost();
+    closeTerminal(plugin);
+    openTerminal(plugin);
     webviews[0].fire("dom-ready");
     const tkn = token();
     expect(tkn.length).toBeGreaterThan(20);

@@ -41,6 +41,15 @@ describe("installTerminalAtExtension", () => {
     expect(contributed).toEqual([]);
   });
 
+  it("declares that it supports untrusted workspaces, so it still runs in Restricted Mode (the panel-only layout and the terminal at a folder depend on it)", () => {
+    expect(extensionManifest().capabilities).toEqual({ untrustedWorkspaces: { supported: true } });
+    // and the declaration is in the package.json the install actually wrote, which is what VS Code reads
+    installTerminalAtExtension(data);
+    const written = JSON.parse(fs.readFileSync(path.join(extensionDir(data), "package.json"), "utf8")) as { main?: string; capabilities?: unknown };
+    expect(written.main).toBe("./extension.js");
+    expect(written.capabilities).toEqual({ untrustedWorkspaces: { supported: true } });
+  });
+
   it("keeps the entries already in extensions.json and does not list itself twice on a second start", () => {
     fs.mkdirSync(path.join(data, "extensions"), { recursive: true });
     fs.writeFileSync(path.join(data, "extensions", "extensions.json"), JSON.stringify([{ identifier: { id: "ms-python.python" }, relativeLocation: "ms-python.python-1.0.0" }]));

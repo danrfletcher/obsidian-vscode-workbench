@@ -17,7 +17,7 @@ import { describePort } from "../../src/settings/extensions-section";
 import * as profileModule from "../../src/profile/mirrored-profile";
 import * as seedModule from "../../src/server/user-data-seed";
 import { PROFILES, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
-import { FAKE_CODE, isAlive, listenersOn, tempDir } from "../helpers";
+import { FAKE_CODE, isAlive, listenersOn, tempDir, openTerminal, closeTerminal } from "../helpers";
 import { FakeHostEl, FakeWorkbenchPage } from "../host-fakes";
 import { stateDb } from "../mirror-tree";
 
@@ -1765,7 +1765,7 @@ describe("terminal keep-alive wiring (G10)", () => {
       const evaluate = vi.spyOn(inner().idle, "evaluate");
       expect(host()).toBeNull();
 
-      plugin.showTerminalHost();
+      openTerminal(plugin);
       expect(host()).not.toBeNull();
       const afterCreate = evaluate.mock.calls.length;
       expect(afterCreate).toBeGreaterThanOrEqual(1); // created (and the start began)
@@ -1781,18 +1781,18 @@ describe("terminal keep-alive wiring (G10)", () => {
 
     it("hiding and showing the drawer does not re-read the idle inputs: drawer visibility makes no difference", async () => {
       await load({}, { serverLicenceAccepted: true });
-      plugin.showTerminalHost();
+      openTerminal(plugin);
       await host()!.settled();
       const evaluate = vi.spyOn(inner().idle, "evaluate");
-      plugin.hideTerminalHost();
-      plugin.showTerminalHost();
-      plugin.hideTerminalHost();
+      closeTerminal(plugin);
+      openTerminal(plugin);
+      closeTerminal(plugin);
       expect(evaluate).not.toHaveBeenCalled();
     });
 
     it("unload stops the timer: no countdown and no poller is left, and a late evaluation starts nothing", async () => {
       await load({}, { serverLicenceAccepted: true });
-      plugin.showTerminalHost();
+      openTerminal(plugin);
       await host()!.settled();
       inner().idle.stop();
       inner().idle.start();
