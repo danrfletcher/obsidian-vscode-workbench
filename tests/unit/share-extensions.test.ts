@@ -109,6 +109,8 @@ const ROWS: Row[] = [
   { name: "ids match case-insensitively (disabled list in upper case)", folders: [TCL, PY], listed: [["chakrounanas.turbo-console-log", TCL], ["ms-python.python", PY]], disabled: read(["MS-PYTHON.PYTHON"]), expected: [TCL] },
   { name: "two versions of one extension on disk: only the version the profile lists is linked", folders: ["ms-python.python-2025.1.0", PY], listed: [["ms-python.python", PY]], disabled: read([]), expected: [PY] },
   { name: "two versions on disk, the profile lists the older: the older is linked", folders: ["ms-python.python-2025.1.0", PY], listed: [["ms-python.python", "ms-python.python-2025.1.0"]], disabled: read([]), expected: ["ms-python.python-2025.1.0"] },
+  { name: "one id listed at two versions (two folders, both on disk): one folder, the first entry's", folders: ["ms-python.python-2025.1.0", PY], listed: [["ms-python.python", PY], ["ms-python.python", "ms-python.python-2025.1.0"]], disabled: read([]), expected: [PY] },
+  { name: "one id listed twice with different case counts as one id", folders: ["ms-python.python-2025.1.0", PY], listed: [["ms-python.python", "ms-python.python-2025.1.0"], ["MS-Python.Python", PY]], disabled: read([]), expected: ["ms-python.python-2025.1.0"] },
   { name: "the same folder listed twice is linked and written once", folders: [PY], listed: [["ms-python.python", PY], ["ms-python.python", PY]], disabled: read([]), expected: [PY] },
   { name: "an empty profile list: no links, extensions.json is []", folders: [TCL, PY], listed: [], disabled: read([]), expected: [] },
 ];

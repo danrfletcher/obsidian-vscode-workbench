@@ -108,6 +108,14 @@ describe("buildExtensionList: the five states from a real tree (links made by sh
     expect(await state({ trustSeedOn: false, trustOutcome: "no-trust-record" })).toBe("inactive"); // the user turned the seed off: not this list's call
   });
 
+  it("with the trust seed off an inactive row's reason says the tab may be in Restricted Mode; with it on it does not (PR-7 R2)", async () => {
+    const tree = makeTree({ logs: { exthost1: "2026-10-28 09:00:01.000 [info] Extension host started\n" } }); // a log that says nothing about the extension: inactive
+    const reason = async (trustSeedOn: boolean) => byId(rowsOf(await buildExtensionList(runningInput(tree, { trustSeedOn, trustOutcome: null }))), IDS.turbo).reason;
+    expect(await reason(false)).toContain("Restricted Mode");
+    expect(await reason(true)).toContain("not activated yet");
+    expect(await reason(true)).not.toContain("Restricted Mode");
+  });
+
   it("an extension whose folder is gone, or whose link dangles, is left out and the others still list (E5)", async () => {
     const tree = makeTree();
     const ext = path.join(tree.serverDataDir, "extensions");

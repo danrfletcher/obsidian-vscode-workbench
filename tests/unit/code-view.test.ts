@@ -359,13 +359,44 @@ describe("runScriptsInWebview", () => {
     expect(order).toEqual(["a", "b"]);
   });
 
-  it("a script that fails or never answers does not stop the next one", async () => {
+  it("a script that fails does not stop the next one", async () => {
     const el = new FakeEl("webview");
-    const answers: Array<() => Promise<unknown>> = [() => Promise.reject(new Error("rejected")), () => new Promise(() => undefined), async () => "ok"];
+    const answers: Array<() => Promise<unknown>> = [() => Promise.reject(new Error("rejected")), async () => "ok"];
     el.executeJavaScript = () => answers.shift()!();
-    const ready = runScriptsInWebview(el as never, ["a", "b", "c"], 30);
+    const ready = runScriptsInWebview(el as never, ["a", "b"], 1000);
     el.fire("dom-ready");
-    expect(await ready).toEqual(["error:rejected", "timeout", "ok"]);
+    expect(await ready).toEqual(["error:rejected", "ok"]);
+  });
+
+  it("timeoutMs is one budget for the whole sequence: a script that never answers uses it up, and the scripts after it are not run", async () => {
+    const el = new FakeEl("webview");
+    const answers: Array<() => Promise<unknown>> = [async () => "first", () => new Promise(() => undefined), async () => "never run"];
+    const started: string[] = [];
+    el.executeJavaScript = (code: string) => {
+      started.push(code);
+      return answers.shift()!();
+    };
+    const t0 = Date.now();
+    const ready = runScriptsInWebview(el as never, ["a", "b", "c"], 60);
+    el.fire("dom-ready");
+    expect(await ready).toEqual(["first", "timeout", "timeout"]);
+    expect(Date.now() - t0).toBeLessThan(150); // not 3 x 60 ms
+    expect(started).toEqual(["a", "b"]);
+  });
+
+  it("the wait for dom-ready counts against the same budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const el = new FakeEl("webview");
+      el.executeJavaScript = (code: string) => new Promise((resolve) => setTimeout(() => resolve(`done:${code}`), 40));
+      const ready = runScriptsInWebview(el as never, ["a", "b"], 100);
+      await vi.advanceTimersByTimeAsync(70);
+      el.fire("dom-ready"); // 70 ms of the 100 ms are gone
+      await vi.advanceTimersByTimeAsync(200);
+      expect(await ready).toEqual(["timeout", "timeout"]); // "a" needs 40 ms but only 30 are left
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a non-Error rejection is reported by its text, and a throw before a promise exists is an error outcome too", async () => {
@@ -574,7 +605,7 @@ describe("the trust seed in loadWorkbench (G5, G6, E3, GP3)", () => {
     expect(el.children[0].executed).toEqual([buildBrowserSeedScript()]);
     expect(el.children[0].srcs[1]).toContain("tkn=tok123");
     expect(warn.mock.calls.flat().join(" ")).toContain("file system root");
-    expect(noteTrustOutcome).toHaveBeenCalledWith("error:Error");
+    expect(noteTrustOutcome).toHaveBeenCalledWith("build-failed");
     warn.mockRestore();
   });
 

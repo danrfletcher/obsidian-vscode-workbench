@@ -208,9 +208,10 @@ await sleep(3);
 
 // --- one browser run ---------------------------------------------------------------------------------
 // `overlay`: seed the way the Code tab does, with the keybinding overlay (the GP7 runs below check which profile's keybinding reaches the tab, not the overlay)
-async function scenario(name, seedBrowser, copyArg = copy, extra = null, overlay = false) {
+// `browserProfile`: reuse the Chrome profile (and so the IndexedDB files) of an earlier run instead of a fresh one
+async function scenario(name, seedBrowser, copyArg = copy, extra = null, overlay = false, browserProfile = name) {
   const cdpPort = await freePort();
-  const chrome = spawn(CHROME, ["--headless=new", `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${path.join(work, "chrome-" + name)}`, "--no-first-run", "--disable-background-networking", "about:blank"], { stdio: "ignore" });
+  const chrome = spawn(CHROME, ["--headless=new", `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${path.join(work, "chrome-" + browserProfile)}`, "--no-first-run", "--disable-background-networking", "about:blank"], { stdio: "ignore" });
   started.push(chrome.pid);
   await sleep(5);
   const page = (await (await fetch(`http://127.0.0.1:${cdpPort}/json`)).json()).find((t) => t.type === "page");
@@ -353,11 +354,18 @@ check(!(gp7Fde.extra.idb.settings ?? "").includes(TRUST), "G12: no security.work
 check(!gp7Fde.extra.settingsJsonText.includes(TRUST), "G12: the tab's settings JSON has no security.workspace.trust. line (FDE Practice)");
 check(!(gp7Fde.extra.idb.keybindings ?? "").includes("toggleSidebarVisibility"), "GP7: nothing of Default's keybinding is in the IndexedDB keybindings.json");
 
-// Moving the association back: the next start's copy replaces the whole IndexedDB file (same browser profile is not reused here;
-// the seed script's replace-whole rule is covered by tests/unit/settings.test.ts).
+// Moving the association back: the next start's copy replaces the whole IndexedDB file. The tab is loaded again in the
+// browser profile the FDE Practice run used, so what is checked is the files that profile holds, not just the copy object.
+// The fixture's FDE Practice settings carry its name (settings(22, name)); neither it nor its keybinding may be left.
 associate("__default__profile__");
 const back = copyForMirroredProfile();
 check(back.name === "Default" && back.copy.settings["editor.fontSize"] === 14 && !JSON.stringify(back.copy.settings).includes("FDE Practice"), "GP7: association back on Default: the copy holds Default's values and nothing of FDE Practice");
+const gp7Back = await scenario("gp7-back", true, back.copy, profileExtra("gp7-back"), false, "gp7-fde");
+console.log("gp7 back on Default run:", JSON.stringify({ ...gp7Back, extra: undefined }));
+check(gp7Back.fontSize === "14px", "GP7 back on Default: the same browser profile now shows Default's editor.fontSize", gp7Back.fontSize);
+check(!(gp7Back.extra.idb.settings ?? "").includes("FDE Practice"), "GP7: nothing of FDE Practice remains in the IndexedDB /User/settings.json after the association moved back", gp7Back.extra.idb.settings);
+check(!gp7Back.extra.panelToggled, "GP7 back on Default: FDE Practice's keybinding (ctrl+alt+m) is gone");
+check(!(gp7Back.extra.idb.settings ?? "").includes(TRUST) && !gp7Back.extra.settingsJsonText.includes(TRUST), "G12: no security.workspace.trust. key after the move back");
 
 // F9: the fixture's other instances, and the chosen instance's own folder, are byte-identical. The association edits above
 // changed only storage.json in the chosen instance's folder, so that one is compared with its post-edit state.

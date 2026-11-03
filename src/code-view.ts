@@ -15,7 +15,7 @@ import type { RunningServer } from "./server";
 import type { ServerState } from "./server-manager";
 import { buildBrowserSeedScript, BROWSER_APP_SETTINGS, type UserDataCopy } from "./settings";
 import { buildThemeSwitchScript, type EmbedChannel, type ThemeSwitchMessage, type ThemeSwitchResult } from "./theme-map";
-import { MANUAL_TRUST_STEPS } from "./trust/trust-message";
+import { MANUAL_TRUST_STEPS, TRUST_BUILD_FAILED } from "./trust/trust-message";
 import { buildTrustSeedScript } from "./trust/trust-seed";
 import type { SyncTab } from "./vault-sync";
 
@@ -94,7 +94,7 @@ export interface CodeViewHost {
   trustVaultFolder?(): boolean;
   /** Ports of the servers still running, for the trust seed's keep-list. Absent or empty: the seed removes no record. */
   heldPorts?(): readonly number[];
-  /** What the trust seed answered for the tab that just loaded ("seeded", "version-mismatch", "timeout", ...). The settings tab reads it from the host. */
+  /** What the trust seed answered for the tab that just loaded ("seeded", "version-mismatch", "timeout", "build-failed", ...). The settings tab reads it from the host. */
   noteTrustOutcome?(outcome: string): void;
   /**
    * A tab made its embed (webview or iframe): let the hotkey bridge watch it. Returns the function that stops watching,
@@ -225,12 +225,17 @@ export function runInWebview(el: WebviewLike, script: string, timeoutMs = 8000):
 /**
  * Run `scripts` one after another in the page the webview has just loaded, all after the same `dom-ready` (that
  * event fires once per page, so a second `runInWebview` on the same page would wait for it in vain). Resolves
- * with one outcome per script, in order, each as `runInWebview` would give it; a script that fails or times out
- * does not stop the next one. If the page never reports `dom-ready`, every outcome is "timeout".
+ * with one outcome per script, in order, each as `runInWebview` would give it. `timeoutMs` is one budget for the
+ * whole sequence (the wait for `dom-ready` and every script), so a page that hangs holds the tab for at most that
+ * long. A script that fails does not stop the next one; once the budget is spent, the script that was running and
+ * every one after it answer "timeout", and none that has not started is run. If the page never reports
+ * `dom-ready`, every outcome is "timeout".
  */
 export async function runScriptsInWebview(el: WebviewLike, scripts: readonly string[], timeoutMs = 8000): Promise<unknown[]> {
+  const deadline = Date.now() + timeoutMs;
+  const remaining = () => Math.max(0, deadline - Date.now());
   const ready = await new Promise<boolean>((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeoutMs);
+    const timer = setTimeout(() => resolve(false), remaining());
     el.addEventListener(
       "dom-ready",
       () => {
@@ -245,9 +250,13 @@ export async function runScriptsInWebview(el: WebviewLike, scripts: readonly str
   if (typeof execute !== "function") return scripts.map(() => "unsupported");
   const outcomes: unknown[] = [];
   for (const script of scripts) {
+    if (remaining() === 0) {
+      outcomes.push("timeout"); // the budget is spent: this one is not started
+      continue;
+    }
     outcomes.push(
       await new Promise<unknown>((resolve) => {
-        const timer = setTimeout(() => resolve("timeout"), timeoutMs);
+        const timer = setTimeout(() => resolve("timeout"), remaining());
         Promise.resolve()
           .then(() => execute.call(el, script))
           .then(
@@ -711,7 +720,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
       });
     } catch (e) {
       console.warn(`VS Code Workbench: the trust seed was not built (${e instanceof Error ? e.message : String(e)}); the workbench opens in Restricted Mode. To trust the vault folder by hand, ${MANUAL_TRUST_STEPS}.`);
-      this.host.noteTrustOutcome?.(`error:${e instanceof Error ? e.name : "build"}`);
+      this.host.noteTrustOutcome?.(TRUST_BUILD_FAILED); // the page never ran anything, so this is not a page error ("error:...")
       return null;
     }
   }

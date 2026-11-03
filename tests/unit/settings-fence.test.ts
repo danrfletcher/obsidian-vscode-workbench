@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { writeMachineSettings } from "../../src/settings";
 import { LIST_FAILED, LIST_INTRO, LIST_LOADING, SERVER_NOT_RUNNING } from "../../src/settings/extensions-section";
-import { ACTIVE_REASON, DISABLED_REASON, INACTIVE_REASON, NO_LOG_NOTE, NO_REASON_IN_LOG, STATE_LABEL, UNTRUSTED_REASON } from "../../src/settings/extension-states";
+import { ACTIVE_REASON, DISABLED_REASON, INACTIVE_REASON, INACTIVE_TRUST_OFF_REASON, NO_LOG_NOTE, NO_REASON_IN_LOG, STATE_LABEL, UNTRUSTED_REASON } from "../../src/settings/extension-states";
 import { REPO_ROOT, tempDir } from "../helpers";
 
 const read = (rel: string) => fs.readFileSync(path.join(REPO_ROOT, rel), "utf8");
@@ -26,7 +26,7 @@ describe("F2: the section only reports", () => {
   });
 
   it("the words the list shows name no install, update, uninstall, enable, disable or marketplace action", () => {
-    const words = [LIST_INTRO, LIST_LOADING, LIST_FAILED, SERVER_NOT_RUNNING, DISABLED_REASON, UNTRUSTED_REASON, ACTIVE_REASON, INACTIVE_REASON, NO_LOG_NOTE, NO_REASON_IN_LOG, ...Object.values(STATE_LABEL)];
+    const words = [LIST_INTRO, LIST_LOADING, LIST_FAILED, SERVER_NOT_RUNNING, DISABLED_REASON, UNTRUSTED_REASON, ACTIVE_REASON, INACTIVE_REASON, INACTIVE_TRUST_OFF_REASON, NO_LOG_NOTE, NO_REASON_IN_LOG, ...Object.values(STATE_LABEL)];
     for (const w of words) {
       expect(w, w).not.toMatch(/\b(?:install|uninstall|update|enable|re-enable|marketplace|click|toggle|remove)\b/i);
       // "disabled in VS Code" is a state, not an action: nothing in the text tells the user to disable anything

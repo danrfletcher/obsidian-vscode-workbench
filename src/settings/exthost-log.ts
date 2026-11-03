@@ -6,7 +6,8 @@
  *
  * Lines look like `2026-10-27 22:08:38.379 [info] ExtensionService#_doActivateExtension <id>, startup: false, ...`
  * for an activation. A failure is an `[error]` line that names the extension's id; the reason is that line's
- * message, plus the line after it when the message ends in a colon (the error itself). Ids match
+ * message, plus the line after it when the message ends in a colon (the error itself). Across hosts the newest
+ * host that mentions an extension decides for it. Ids match
  * case-insensitively, and an id the caller did not give is ignored. Every reason is plain text, capped.
  */
 import * as fs from "node:fs/promises";
@@ -90,12 +91,14 @@ export function parseExtHostLog(text: string, ids: ReadonlySet<string>): ExtHost
   return facts;
 }
 
-/** Combine the facts of several hosts: a failure in any of them stands, else an activation in any. */
+/**
+ * Combine the facts of several hosts, given newest first: for each extension the newest host that says anything
+ * about it decides, so a failure in an earlier host (before a tab reload) does not outlive a clean activation in
+ * the newest one. Within one host the latest line decides (parseExtHostLog). A host that is silent about an
+ * extension leaves what an older host said.
+ */
 function merge(into: ExtHostFacts, from: ExtHostFacts): void {
-  for (const [id, fact] of from) {
-    const have = into.get(id);
-    if (have === undefined || (have.kind === "active" && fact.kind === "failed") || (have.kind === "failed" && have.reason === null && fact.kind === "failed")) into.set(id, fact);
-  }
+  for (const [id, fact] of from) if (!into.has(id)) into.set(id, fact);
 }
 
 /** The file access the reader needs; the real one reads, nothing more. */
