@@ -6,6 +6,12 @@
  * into a new folder of its own under the plugin's temp root, and `sqlite3 -readonly` is given the copy. The folder
  * is removed afterwards, whatever happened, and a cancelled read removes it too. Two reads at once use two folders.
  *
+ * The files are copied one after another while desktop VS Code may be writing or checkpointing them, and sqlite3
+ * ignores a `-wal` that does not belong to the database beside it (it would quietly read an older list). So the
+ * size and modification time of the three files are taken before and after the copies; if any changed, the copy is
+ * made again, once. If they change again, the read fails (a plain reason, no list) rather than answer from a copy
+ * that may not be one moment of the database.
+ *
  * `sqlite3` is started by name from `PATH` through `execFile` with an argument array: no shell, so no path or key
  * is ever parsed as shell text. A hung `sqlite3` is killed (SIGKILL) after `SQLITE_TIMEOUT_MS`.
  *
@@ -23,6 +29,9 @@ const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 /** A temp folder left by a killed Obsidian is removed once it is this old. */
 const STALE_TEMP_MS = 10 * 60 * 1000;
 const TEMP_PREFIX = "read-";
+const SIDECARS = ["-wal", "-shm"] as const;
+/** The copy is made at most this many times when the files change under it (the first try and one retry). */
+const COPY_ATTEMPTS = 2;
 
 // ---------------------------------------------------------------------------
 // The runner
@@ -134,6 +143,20 @@ function describeExit(code: number | null, stderr: string): { kind: FailureKind;
   return { kind: "unreadable", reason: code === null ? "sqlite3 could not be run" : `sqlite3 exited with code ${code}` };
 }
 
+/** Size and modification time of the database and its sidecars, as one string; "absent" for a file that is not there. */
+async function fingerprint(dbPath: string, io: MirrorFs): Promise<string> {
+  const parts: string[] = [];
+  for (const name of ["", ...SIDECARS]) {
+    try {
+      const st = await io.stat(dbPath + name);
+      parts.push(`${st.size}:${st.mtimeMs}`);
+    } catch {
+      parts.push("absent");
+    }
+  }
+  return parts.join("|");
+}
+
 /** Remove temp folders an earlier, killed run left behind. Never throws. */
 async function sweepStale(tmpRoot: string, io: MirrorFs): Promise<void> {
   try {
@@ -173,20 +196,27 @@ export async function readDisabledFromDb(dbPath: string, opts: ReadOptions): Pro
     }
     const copy = path.join(dir, "state.vscdb");
 
-    try {
-      await io.copyFile(dbPath, copy);
-    } catch (e) {
-      if (isMissing(e)) return { ok: true, ids: [], missing: true };
-      return { ok: false, kind: "unreadable", reason: `the database could not be copied (${errorCode(e) ?? "error"})` };
-    }
-    for (const suffix of ["-wal", "-shm"]) {
+    for (let attempt = 1; ; attempt++) {
+      const before = await fingerprint(dbPath, io);
       try {
-        await io.copyFile(dbPath + suffix, copy + suffix);
+        await io.copyFile(dbPath, copy);
       } catch (e) {
-        if (!isMissing(e)) return { ok: false, kind: "unreadable", reason: `the database's ${suffix} file could not be copied (${errorCode(e) ?? "error"})` };
+        if (isMissing(e)) return { ok: true, ids: [], missing: true };
+        return { ok: false, kind: "unreadable", reason: `the database could not be copied (${errorCode(e) ?? "error"})` };
       }
+      for (const suffix of SIDECARS) {
+        try {
+          await io.copyFile(dbPath + suffix, copy + suffix);
+        } catch (e) {
+          if (!isMissing(e)) return { ok: false, kind: "unreadable", reason: `the database's ${suffix} file could not be copied (${errorCode(e) ?? "error"})` };
+        }
+      }
+      if (opts.signal?.aborted) return cancelled;
+      if ((await fingerprint(dbPath, io)) === before) break;
+      if (attempt >= COPY_ATTEMPTS) return { ok: false, kind: "unreadable", reason: "the database kept changing while it was copied" };
+      // Start the next copy from nothing: a sidecar this copy made may be gone from the original by now.
+      for (const name of ["", ...SIDECARS]) await io.rm(copy + name, { force: true });
     }
-    if (opts.signal?.aborted) return cancelled;
 
     const outcome = await run(["-readonly", "-json", copy, SQL], { timeoutMs: opts.timeoutMs ?? SQLITE_TIMEOUT_MS, signal: opts.signal });
     switch (outcome.kind) {

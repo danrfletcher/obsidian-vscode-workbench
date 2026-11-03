@@ -137,7 +137,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private chordTimer: ReturnType<typeof setInterval> | null = null;
   private instances = new InstanceService();
   private cachedBefore: ReadonlySet<string> = new Set();
-  /** Why the last start did not use the stored stable port (null when it did, or none is stored). */
+  /** Why the running server did not use the stored stable port (null when it did, none is stored, or no server is running). */
   private portNote: string | null = null;
   /** The mirrored profile as the last read left it. Read at the first start, at Restart server and when a start's instance differs from the one it was read for; never on an idle restart on the same instance or when settings opens. */
   private profile: ProfileState = { status: "not-read" };
@@ -153,7 +153,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
    * on an idle restart.
    */
   private mirrorCache = new MirrorStateCache();
-  /** What the trust seed answered at the last Code tab load that ran it; shown in settings. In memory only: nothing about it is stored. */
+  /** What the trust seed answered at the last Code tab load that ran it, during the current server run; shown in settings. In memory only: nothing about it is stored, and it is cleared whenever the server is not running. */
   private lastTrustOutcome: string | null = null;
   /** Tests only: replaces the process table reader that the live-shell check uses (a fake clock cannot wait for a real `ps`). */
   private processTable: () => Promise<string> = readProcessTable;
@@ -190,6 +190,12 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.manager.onChange((state) => {
       if (state === "running") this.idle.start();
       else this.idle.stop();
+      // Both describe one run of the server (the port the start picked, the Code tab's trust seed): once it is not running they would
+      // describe a run that is over, so settings must not show them (the next start and the next tab load set them again).
+      if (state !== "running") {
+        this.portNote = null;
+        this.lastTrustOutcome = null;
+      }
       this.terminalFollowsServer(state);
     });
 
@@ -881,12 +887,12 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       this.copy = { id: randomBytes(8).toString("hex"), settings: withAutoSaveDefault(result.merged), keybindingsBase64: result.keybindingsBase64 };
     } catch {
       this.copy = null;
-      new Notice("VS Code Workbench: could not copy the instance's settings, so the editor starts without them.", 10000);
+      new Notice("VS Code Workbench: could not copy the settings and keybindings of the VS Code profile this vault uses, so the editor starts without them.", 10000);
     }
   }
 
   /**
-   * Read which profile desktop VS Code uses for the vault, once per Obsidian start and once per Restart server
+   * Read which profile desktop VS Code uses for the vault, once at the first server start after Obsidian starts and once per Restart server
    * (an idle restart on the same instance keeps the result, G2). A start on a different instance (or user-data
    * folder) than the one the result was read for reads again, so settings never shows another instance's profile
    * (E6, F9). It only reads, and a failure is a result shown in settings: the start goes on.

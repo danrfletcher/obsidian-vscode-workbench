@@ -776,6 +776,7 @@ describe("the \"Trust the vault folder\" toggle in the settings tab (G6, E3)", (
     ["version-mismatch", "is not in the format this plugin knows"],
     ["no-store", "has no place for the trust record"],
     ["error:SecurityError", "the page refused the write (SecurityError)"],
+    ["build-failed", "could not build the trust record for this vault folder, so nothing was written"],
     ["timeout", "did not answer in time"],
     ["unsupported", "cannot run scripts in the Code tab"],
   ])("a %s outcome from the host shows a message that names the manual Trust command", (outcome, reason) => {

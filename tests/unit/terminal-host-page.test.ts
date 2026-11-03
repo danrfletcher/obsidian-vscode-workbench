@@ -82,6 +82,24 @@ describe("starting and running (G2)", () => {
     expect(world.webviews()[0].executed.filter((c) => c.includes("vscode-web-state-db-global-shared"))).toEqual([]);
   });
 
+  it("a vault folder the trust seed refuses to name (the file system root) tells the host the seed was not built, and the page still loads", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const world = makeWorld({ accepted: true });
+      const noted: string[] = [];
+      world.deps.vaultRoot = () => "/";
+      world.deps.noteTrustOutcome = (outcome) => void noted.push(outcome);
+      const h = open(world);
+      h.show();
+      await h.settled();
+      expect(noted).toEqual(["build-failed"]);
+      expect(world.webviews()[0].executed.filter((c) => c.includes("vscode-web-state-db-global-shared"))).toEqual([]); // no trust script ran
+      expect(h.view()).toBe("running");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("a fresh page is left to the extension in it: no key and no click is sent, and it ends panel-only", async () => {
     const world = makeWorld({ accepted: true });
     const h = open(world);

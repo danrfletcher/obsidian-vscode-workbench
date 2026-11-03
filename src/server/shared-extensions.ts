@@ -130,18 +130,21 @@ export function readProfileExtensions(file: string | null, io: ProfileExtensions
 }
 
 /**
- * The extensions to share: the profile's list minus the disabled ones, one per folder. Nothing when the disabled
+ * The extensions to share: the profile's list minus the disabled ones, one per extension id (the first entry of an id
+ * wins, so a list that names one id at two versions links one folder) and never two entries on one folder. Nothing when the disabled
  * list could not be read at all (source "none": a list that may name extensions Dan switched off must not be guessed
  * at) or when the profile's list could not be read.
  */
 export function enabledExtensions(state: MirrorState | null): ProfileExtension[] {
   if (!state || state.disabled.source === "none" || !state.extensions.ok) return [];
   const disabled = new Set(state.disabled.disabled.map((d) => d.trim().toLowerCase()));
-  const seen = new Set<string>();
+  const seenIds = new Set<string>();
+  const seenFolders = new Set<string>();
   const out: ProfileExtension[] = [];
   for (const e of state.extensions.extensions) {
-    if (disabled.has(e.id) || seen.has(e.folder)) continue;
-    seen.add(e.folder);
+    if (disabled.has(e.id) || seenIds.has(e.id) || seenFolders.has(e.folder)) continue;
+    seenIds.add(e.id);
+    seenFolders.add(e.folder);
     out.push(e);
   }
   return out;

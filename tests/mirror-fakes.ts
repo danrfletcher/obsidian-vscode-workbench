@@ -101,9 +101,12 @@ export class MemFs implements MirrorFs {
     return [...names];
   }
 
-  async stat(file: string): Promise<{ mtimeMs: number }> {
+  async stat(file: string): Promise<{ mtimeMs: number; size: number }> {
     this.ops.push({ op: "stat", path: file });
-    return { mtimeMs: this.mtimes.get(file) ?? Date.now() };
+    const text = this.files.get(file);
+    if (text === undefined && !this.dirs.has(file)) throw err("ENOENT", file);
+    // A file keeps one modification time until a test sets another (so two stats of it agree); a folder is as new as now.
+    return { mtimeMs: this.mtimes.get(file) ?? (text === undefined ? Date.now() : 1), size: text?.length ?? 0 };
   }
 
   async writeFile(file: string, data: string): Promise<void> {

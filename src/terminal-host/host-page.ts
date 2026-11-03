@@ -13,7 +13,7 @@ import { LicenceDeclinedError } from "../licence";
 import { StartCancelledError, type RunningServer } from "../server";
 import { buildBrowserSeedScript, type UserDataCopy } from "../settings";
 import { buildThemeSwitchScript, themeSwitchMessage, ThemeSync } from "../theme-map";
-import { MANUAL_TRUST_STEPS } from "../trust/trust-message";
+import { MANUAL_TRUST_STEPS, TRUST_BUILD_FAILED } from "../trust/trust-message";
 import { buildTrustSeedScript } from "../trust/trust-seed";
 import { buildFileUri } from "../paths";
 import { INITIAL_HOST_STATE, hostView, reduceHost, type HostEffect, type HostEvent, type HostState, type HostView } from "./host-state";
@@ -417,7 +417,7 @@ export class TerminalHostPage {
       });
     } catch (e) {
       console.warn(`VS Code Workbench: the trust seed was not built for the terminal (${e instanceof Error ? e.name : "error"}); it opens in Restricted Mode. To trust the vault folder by hand, ${MANUAL_TRUST_STEPS}.`);
-      this.deps.noteTrustOutcome?.(`error:${e instanceof Error ? e.name : "build"}`);
+      this.deps.noteTrustOutcome?.(TRUST_BUILD_FAILED); // the page never ran anything: not a page error
       return null;
     }
   }

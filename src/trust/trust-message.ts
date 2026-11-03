@@ -12,8 +12,12 @@ export interface TrustMessage {
   text: string;
 }
 
-/** Why a seed that did not take failed, in plain words. `timeout` and `unsupported` come from the webview runner. */
+/** The outcome when the host could not build the seed script for this folder (for example a vault at the file system root): the page was never asked to run anything. */
+export const TRUST_BUILD_FAILED = "build-failed";
+
+/** Why a seed that did not take failed, in plain words. `timeout` and `unsupported` come from the webview runner; `build-failed` from the Code tab itself. */
 function reasonFor(outcome: string): string {
+  if (outcome === TRUST_BUILD_FAILED) return "the plugin could not build the trust record for this vault folder, so nothing was written";
   if (outcome === "version-mismatch") return "the trust record VS Code stored is not in the format this plugin knows";
   if (outcome === "no-store") return "VS Code's browser storage has no place for the trust record";
   if (outcome === "timeout") return "the workbench page did not answer in time";

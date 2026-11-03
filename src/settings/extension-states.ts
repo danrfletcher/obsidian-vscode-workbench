@@ -50,6 +50,11 @@ export interface StateFacts {
   disabled: boolean;
   /** The vault folder is not trusted, so the tab keeps the extension from running. */
   untrusted: boolean;
+  /**
+   * The user turned the trust seed off, so nothing marks any row untrusted and the tab may be in Restricted Mode.
+   * It only changes the reason line of an inactive extension (the likelier cause is then trust, not "not opened yet").
+   */
+  trustSeedOff?: boolean;
   log: LogFacts;
 }
 
@@ -89,6 +94,8 @@ export const DISABLED_REASON = "switched off in desktop VS Code, so the tab does
 export const UNTRUSTED_REASON = "the vault folder is not trusted, so the tab keeps it from running (see the trust setting above)";
 export const ACTIVE_REASON = "activated by the extension host";
 export const INACTIVE_REASON = "not activated yet; most extensions start when a file they handle is opened in the tab";
+/** The inactive reason while the trust seed is off: the tab may be in Restricted Mode, which keeps these extensions from running. */
+export const INACTIVE_TRUST_OFF_REASON = "not activated; the trust setting above is off, so the tab may be in Restricted Mode, which keeps extensions that need a trusted folder from running";
 
 /** Which state applies, by the fixed precedence, and the reason line for it. */
 export function resolveState(facts: StateFacts): ResolvedState {
@@ -115,7 +122,8 @@ function reasonFor(state: ExtensionState, f: StateFacts): string {
     case "active":
       return ACTIVE_REASON;
     case "inactive":
-      return f.log.found ? INACTIVE_REASON : NO_LOG_NOTE;
+      if (!f.log.found) return NO_LOG_NOTE;
+      return f.trustSeedOff ? INACTIVE_TRUST_OFF_REASON : INACTIVE_REASON;
   }
 }
 

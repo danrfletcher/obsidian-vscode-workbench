@@ -13,15 +13,24 @@ import { FileSystemAdapter, Modal, Notice, Plugin, Tasks, TFile, WorkspaceLeaf, 
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
 import { CodeView } from "../../src/code-view";
 import { IDLE_MS } from "../../src/idle-timer";
+import { describePort } from "../../src/settings/extensions-section";
 import * as profileModule from "../../src/profile/mirrored-profile";
+import * as seedModule from "../../src/server/user-data-seed";
 import { PROFILES, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
 import { FAKE_CODE, isAlive, listenersOn, tempDir } from "../helpers";
 import { FakeHostEl, FakeWorkbenchPage } from "../host-fakes";
+import { stateDb } from "../mirror-tree";
 
 // The real profile lookup, wrapped so a test can count how often a start asks for it (and make it throw).
 vi.mock("../../src/profile/mirrored-profile", async (importOriginal) => {
   const real = await importOriginal<typeof import("../../src/profile/mirrored-profile")>();
   return { ...real, profileForInstance: vi.fn(real.profileForInstance) };
+});
+
+// The real settings copy, wrapped so a test can make it throw.
+vi.mock("../../src/server/user-data-seed", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../../src/server/user-data-seed")>();
+  return { ...real, seedUserData: vi.fn(real.seedUserData) };
 });
 
 let vault: string;
@@ -818,6 +827,34 @@ describe("the stable port (extension spike)", () => {
     }
   });
 
+  it("the fallback note ends with the run it described: after the server stops (idle) settings no longer says 'Using port ...'", async () => {
+    const other = await occupy();
+    try {
+      await load({}, { serverLicenceAccepted: true, stablePort: other.port });
+      await plugin.openSpikeFile();
+      expect(status().note).toContain("Using port");
+      await inner().manager.stop("idle");
+      expect(inner().manager.state).toBe("stopped-by-idle");
+      expect(status()).toEqual({ stored: other.port, current: null, note: null });
+      expect(describePort(status()).text).toBe(`Stored port ${other.port}. No server is running; the next start tries this port first.`);
+    } finally {
+      await other.close();
+    }
+  });
+
+  it("the Code tab's trust outcome is not carried over a stop or a Restart server", async () => {
+    await load({}, { serverLicenceAccepted: true });
+    await plugin.openSpikeFile();
+    plugin.noteTrustOutcome("error:SecurityError");
+    expect(plugin.trustOutcome()).toBe("error:SecurityError");
+    await plugin.restartServer();
+    expect(inner().manager.state).toBe("running");
+    expect(plugin.trustOutcome()).toBeNull();
+    plugin.noteTrustOutcome("error:SecurityError");
+    await inner().manager.stop("idle");
+    expect(plugin.trustOutcome()).toBeNull();
+  });
+
   it.each([
     ["out of range", 70000],
     ["below 1024", 80],
@@ -1365,6 +1402,81 @@ describe("the mirrored profile is resolved at each server start and Restart serv
     expect(lookup).toHaveBeenCalledTimes(2);
   });
 
+  describe("the disabled lists a start reads reach the Disabled in VS Code row (PR-4, G14)", () => {
+    const userRoot = () => path.join(appSupport, "Code - Insiders");
+    /** Real state.vscdb files (system sqlite3) in the fake desktop VS Code folder: global, the custom profile, the vault's workspace, and another folder's workspace. */
+    function writeDisabled(lists: { global: string[]; profile: string[]; workspace: string[]; elsewhere: string[] }): void {
+      const make = (file: string, ids: string[]) => {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        stateDb(file, ...(ids.length ? ["--disabled", ids.join(",")] : []));
+      };
+      make(path.join(userRoot(), "User", "globalStorage", "state.vscdb"), lists.global);
+      make(path.join(userRoot(), "User", "profiles", PROFILES.custom.location, "globalStorage", "state.vscdb"), lists.profile);
+      for (const [hash, folder, ids] of [
+        ["aaaa0000aaaa0000aaaa0000aaaa0000", vault, lists.workspace],
+        ["bbbb1111bbbb1111bbbb1111bbbb1111", path.join(tempDir(), "Elsewhere"), lists.elsewhere],
+      ] as const) {
+        const dir = path.join(userRoot(), "User", "workspaceStorage", hash);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, "workspace.json"), JSON.stringify({ folder: vscodeFolderUri(folder) }));
+        make(path.join(dir, "state.vscdb"), [...ids]);
+      }
+    }
+    const lists = { global: ["g.one"], profile: ["p.one", "p.two"], workspace: ["w.one"], elsewhere: ["not.mine"] };
+
+    it("a real start in a custom profile reads the instance's global list, that profile's list and this vault's list, and settings says so", async () => {
+      associate(PROFILES.custom.location);
+      writeDisabled(lists);
+      await start();
+      expect(plugin.disabledLists()).toBeNull();
+      expect(settingsText()).toContain("Not read yet: the disabled lists are read when the server starts.");
+
+      await plugin.openSpikeFile();
+      expect(inner().manager.state).toBe("running");
+      expect(plugin.disabledLists()).toMatchObject({ source: "read", disabled: ["g.one", "p.one", "p.two", "w.one"], counts: { global: 1, profile: 2, workspace: 1 } });
+      expect(settingsText()).toContain("4 extensions disabled (global 1, profile 2, workspace 1)");
+      expect(settingsText()).not.toContain("not.mine");
+    });
+
+    it("a vault in the Default profile reads no profile list, whatever a custom profile's database holds", async () => {
+      associate("__default__profile__");
+      writeDisabled(lists);
+      await start();
+      await plugin.openSpikeFile();
+      expect(plugin.disabledLists()).toMatchObject({ source: "read", disabled: ["g.one", "w.one"], counts: { global: 1, profile: null, workspace: 1 } });
+      expect(settingsText()).toContain("2 extensions disabled (global 1, workspace 1)");
+    });
+
+    it("a Restart server reads the lists again and the row follows; an idle restart does not read them again", async () => {
+      associate(PROFILES.custom.location);
+      writeDisabled(lists);
+      await start();
+      await plugin.openSpikeFile();
+      expect(plugin.disabledLists()).toMatchObject({ disabled: ["g.one", "p.one", "p.two", "w.one"] });
+
+      writeDisabled({ ...lists, global: ["g.one", "g.two"] }); // changed in desktop VS Code
+      expect(plugin.disabledLists()).toMatchObject({ disabled: ["g.one", "p.one", "p.two", "w.one"] }); // never live
+      await inner().manager.stop("idle");
+      await plugin.openSpikeFile(); // an idle wake starts the server again
+      expect(inner().manager.state).toBe("running");
+      expect(plugin.disabledLists()).toMatchObject({ disabled: ["g.one", "p.one", "p.two", "w.one"] }); // not read again
+      expect(settingsText()).toContain("4 extensions disabled (global 1, profile 2, workspace 1)");
+      await plugin.restartServer();
+      expect(plugin.disabledLists()).toMatchObject({ source: "read", disabled: ["g.one", "g.two", "p.one", "p.two", "w.one"], counts: { global: 2 } });
+      expect(settingsText()).toContain("5 extensions disabled (global 2, profile 2, workspace 1)");
+    });
+
+    it("E6: an instance whose user-data folder cannot be told is mapped to no read, and the row says no extensions are shared and why", async () => {
+      await load({}, { serverLicenceAccepted: true }); // no configured folder; the fake CLI has no product.json
+      await plugin.openSpikeFile();
+      expect(inner().manager.state).toBe("running");
+      expect(plugin.disabledLists()).toMatchObject({ source: "none", disabled: [] });
+      const text = settingsText();
+      expect(text).toContain("No extensions are shared: desktop VS Code's state cannot be located (");
+      expect(text).toContain("the user-data folder of this custom VS Code cannot be told");
+    });
+  });
+
   it("is resolved once per start and once per Restart server; not on an idle restart, a settings reopen or a second tab", async () => {
     associate(PROFILES.custom.location);
     await start();
@@ -1472,7 +1584,7 @@ describe("the mirrored profile is resolved at each server start and Restart serv
     expect(Notice.messages.filter((m) => /profile/i.test(m))).toEqual([]);
   });
 
-  it("E10: a vault that still matches shows the vault URI that was tried, next to the fallback", async () => {
+  it("E10: a vault that still matches nothing shows the vault URI that was tried, next to the fallback", async () => {
     associate(null);
     await start();
     await plugin.openSpikeFile();
@@ -1500,6 +1612,19 @@ describe("the mirrored profile is resolved at each server start and Restart serv
     expect(inner().manager.state).toBe("running");
     expect(named()).toBe("Default");
     expect(settingsText()).toContain("the file is missing");
+  });
+
+  it("a copy of the profile's settings that fails never blocks the start: a notice names the profile's settings, and the tab gets no copy", async () => {
+    associate(PROFILES.custom.location);
+    vi.mocked(seedModule.seedUserData).mockImplementationOnce(() => {
+      throw new Error("boom: /secret/path");
+    });
+    await start();
+    await plugin.openSpikeFile();
+    expect(inner().manager.state).toBe("running");
+    expect(plugin.userDataCopy()).toBeNull();
+    expect(Notice.messages).toContain("VS Code Workbench: could not copy the settings and keybindings of the VS Code profile this vault uses, so the editor starts without them.");
+    expect(Notice.messages.join("\n")).not.toContain("/secret/path");
   });
 
   it("a lookup that throws never blocks the start: the state says the lookup failed", async () => {
