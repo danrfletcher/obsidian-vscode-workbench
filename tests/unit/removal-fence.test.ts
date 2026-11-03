@@ -234,6 +234,7 @@ const F1_ALLOWED: Record<string, string> = {
   "tests/render/container-chrome-check.py": "this slice: container tool that measures the chrome spike inside the Code tab's webview (python3 script: shebang and usage text)",
   "tests/render/chrome-spike-pack.mjs": "this slice: builds the pack for container-chrome-check.py; its comment says the container has python3 and no node",
   "tests/render/terminal-spike-check.mjs": "earlier slice: spike check that reads VS Code's own terminal input and runs python3 -m http.server",
+  "tests/render/obsidian-live-check.py": "this slice: live C2 and C12 check run in the Obsidian container (python3 script: shebang and the docker exec usage line)",
   "tests/fixtures/container_check_world.py": "earlier slice: fixture for the container check; `python3 -m http.server` is a process-table row",
   "tests/fixtures/fake-serve-web.mjs": "earlier slice: fake serve-web whose shell runs `python3 -m http.server` as a dev server",
 };

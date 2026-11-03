@@ -191,9 +191,38 @@ export interface KeybindingEntry {
  */
 export const CLOSE_OTHER_EDITORS: KeybindingEntry = { key: "ctrl+alt+shift+4", command: "workbench.action.closeOtherEditors" };
 
-/** The chords the page script presses: one close command per part with a close route, then close-other-editors. */
+/**
+ * Puts away the editor a file opened from inside the editor (Go to Definition, quick open, a link) just opened, so the tab shows
+ * its own file again at its own cursor (PR-4; spike S2: the first file comes back at the line it was left on). The file itself
+ * opens as a new Obsidian tab. This is the command Cmd+W normally runs, which is one of the disabled chords; this chord is ours.
+ */
+export const CLOSE_ACTIVE_EDITOR: KeybindingEntry = { key: "ctrl+alt+shift+5", command: "workbench.action.closeActiveEditor" };
+
+/**
+ * Shows the editor that was in front before the active one, without closing the active one (PR-4). The page script presses it when
+ * closing the opened editor is refused by VS Code's "Do you want to save" prompt (the file opened from the editor already holds
+ * unsaved edits in this tab): the prompt is cancelled and the tab shows its own file again, the edits kept.
+ */
+export const SHOW_PREVIOUS_EDITOR: KeybindingEntry = { key: "ctrl+alt+shift+0", command: "workbench.action.openPreviousRecentlyUsedEditorInGroup" };
+
+/**
+ * Merges the editor groups of a tab into one (PR-4, E4): the palette's "Split Editor" has no chord to disable, so the page script
+ * presses this when it finds a second group on screen. The tab then shows one editor group again.
+ */
+export const JOIN_ALL_GROUPS: KeybindingEntry = { key: "ctrl+alt+shift+8", command: "workbench.action.joinAllGroups" };
+
+/**
+ * Opens VS Code's Go to Line input (PR-4). A tab opened, or an open tab asked, to show a file at a line presses this and types
+ * `:<line>` (the default Ctrl+G is not used because a copied keybinding may have moved it).
+ */
+export const GO_TO_LINE: KeybindingEntry = { key: "ctrl+alt+shift+9", command: "workbench.action.gotoLine" };
+
+/**
+ * The chords the page scripts press: one close command per part with a close route, close-other-editors, and the four editor
+ * chords of PR-4 (put away an opened editor, show the previous editor instead, join split groups, go to a line).
+ */
 export function chromeKeybindings(): KeybindingEntry[] {
-  return [...closeRoutes().map(({ key, command }) => ({ key, command })), CLOSE_OTHER_EDITORS];
+  return [...closeRoutes().map(({ key, command }) => ({ key, command })), CLOSE_OTHER_EDITORS, CLOSE_ACTIVE_EDITOR, SHOW_PREVIOUS_EDITOR, JOIN_ALL_GROUPS, GO_TO_LINE];
 }
 
 /**
@@ -209,6 +238,10 @@ export const DISABLED_CHORDS: readonly { command: string; keys: readonly string[
   { command: "workbench.action.toggleZenMode", keys: ["cmd+k z", "ctrl+k z"] },
   { command: "workbench.action.closeActiveEditor", keys: ["cmd+w", "ctrl+w", "ctrl+f4"] },
   { command: "workbench.action.toggleAuxiliaryBar", keys: ["cmd+alt+b", "ctrl+alt+b"] },
+  // VS Code's own editor splits (PR-4, E4): a tab is one editor for one file. The palette's "Split Editor" has no chord, and the page
+  // script joins the groups again if one appears; these are the chords (Cmd+\ and Cmd+K Cmd+\).
+  { command: "workbench.action.splitEditor", keys: ["cmd+\\", "ctrl+\\"] },
+  { command: "workbench.action.splitEditorOrthogonal", keys: ["cmd+k cmd+\\", "ctrl+k ctrl+\\"] },
 ];
 
 /**

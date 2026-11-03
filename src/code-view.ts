@@ -6,8 +6,10 @@ import { DIRTY_SCRIPT, fileDirtyScript } from "./dirty-script";
 import { decide, resolveChoice, SETTLE_MS, SETTLE_POLL_MS, type AutoSave, type BufferState } from "./dirty-guard";
 import { LicenceDeclinedError } from "./licence";
 import type { CloseDirtyRequest } from "./modals";
+import { buildGoToLineScript, GO_TO_LINE_DONE, GO_TO_LINE_TOTAL_MS } from "./goto-line-script";
 import { fileKey } from "./open-file";
-import { buildFileUri, buildFileUrl } from "./paths";
+import { buildOpenInterceptScript, OPEN_INTERCEPT_INSTALLED, parseOpenReport, RESTORE_OPEN_SCRIPT, RESTORE_SWITCHED, type OpenReport } from "./open-intercept-script";
+import { authorityOf, buildFileUri, buildFileUrl, normalizeLine, targetOfUri, type EditorTarget } from "./paths";
 import type { CarryResult } from "./rename-carry";
 import type { RunningServer } from "./server";
 import type { ServerState } from "./server-manager";
@@ -103,6 +105,13 @@ export interface CodeViewHost {
   skipCloseGuard?(): boolean;
   /** Open a file in a new Code tab (the file a tab was asked to navigate to while its own unsaved edits were kept). */
   openInNewTab?(file: string): void;
+  /**
+   * A file was opened from inside the editor of `from` (Go to Definition, quick open, a link): open it as a new Obsidian tab beside
+   * `from`, in front, at `line` (null: the cursor stays where the file puts it), or focus the tab that already shows it, or, for a
+   * kind that is not a Code tab or a file outside the vault, do what Obsidian does for that kind. Absent: the tab does not watch for
+   * such opens and the file opens inside the tab as VS Code would (F3).
+   */
+  openFromEditor?(from: WorkspaceLeaf, target: EditorTarget, line: number | null): void | Promise<void>;
   /** The bytes of a vault file now (null if unreadable): taken when a rename leaves unsaved edits bound to the old path. */
   readBaseline?(file: string): Promise<Buffer | null>;
   /**
@@ -192,6 +201,8 @@ export const RESTART_FAILED_TEXT =
 
 interface CodeViewState {
   file?: string;
+  /** Not persisted (`getState` leaves it out): the line a tab opened for a file opened from the editor puts the cursor on. */
+  line?: unknown;
   [key: string]: unknown;
 }
 
@@ -255,6 +266,12 @@ export async function runScriptsInWebview(el: WebviewLike, scripts: readonly str
   return outcomes;
 }
 
+/** Say in the console when the cursor could not be put on a line; the tab is open at the file's own cursor then. */
+export function logGoToLine(outcome: unknown): void {
+  if (outcome === GO_TO_LINE_DONE) console.debug("VS Code Workbench: cursor moved to the requested line");
+  else console.warn(`VS Code Workbench: the cursor was not moved to the requested line (${String(outcome)}); the file is open at its own cursor.`);
+}
+
 /** Say in the console how the browser-profile seed went, so a seed that quietly stops working can be seen. */
 export function logSeedOutcome(outcome: unknown): void {
   if (outcome === "seeded") console.debug("VS Code Workbench: browser profile seeded");
@@ -306,6 +323,10 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
   private closed = false;
   private closing: Promise<void> | null = null;
   private repointing = false;
+  /** The line to put the cursor on once the workbench page has loaded (set by `setState` or `goToLine`), or null. Cleared when a load ends. */
+  private pendingLine: number | null = null;
+  /** The workbench page of the current load has reported dom-ready (the first dom-ready is the server's origin page). */
+  private workbenchReady = false;
   /**
    * Set by a rename of the loaded file: the workbench's buffer stays bound to `from`, the path it was loaded from,
    * while the file is now at `to` (this.file, or the ineligible new name). A save writes the edits to `from`; they are
@@ -385,6 +406,8 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
           return;
         }
         (this.leaf as unknown as { updateHeader?: () => void }).updateHeader?.();
+        const line = (state as CodeViewState).line;
+        this.pendingLine = line === undefined || line === null ? null : normalizeLine(line);
         await this.loadWorkbench();
       }
     }
@@ -811,6 +834,8 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
           // the script that closes the parts. Not awaited: a script that fails or times out is logged and changes nothing
           // else, and the load is finished (F3). The listener is added in the same tick as the navigation, before the event.
           if (hiding) void this.runChromeScript(el, hiding);
+          if (hiding && this.host.openFromEditor) this.watchOpens(el, authorityOf(server.baseUrl));
+          this.placeCursorOnLoad(el);
           this.focusWhenReady(el);
         }
       }
@@ -821,6 +846,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
       // main.ts has already shown the (token-free) reason. A tab is closed rather than left blank; only a
       // tab that was showing the crash banner (its page may hold text to copy) keeps its place and offers Restart.
       this.frame = null;
+      this.pendingLine = null; // a line asked for during a load that failed is not kept for the next one
       this.contentEl.empty();
       if (keepForRestart) {
         this.crashed = true;
@@ -832,6 +858,97 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
       this.loading = false;
       if (!this.closed) void this.afterLoad();
     }
+  }
+
+  /**
+   * A file opened from inside this tab's editor becomes an Obsidian tab of its own (PR-4). The page script reports the new file and
+   * line through the console; the report carries a nonce made for this load. The tab puts the opened editor away, so it shows its
+   * own file at its own cursor again, and hands the file to the host. It never navigates in place.
+   */
+  private watchOpens(el: HTMLElement, authority: string): void {
+    const nonce = globalThis.crypto.randomUUID();
+    el.addEventListener("console-message", (event: Event) => {
+      if (this.frame !== el || this.closed) return;
+      const report = parseOpenReport((event as { message?: unknown } | undefined)?.message, nonce);
+      if (report) void this.openedFromEditor(el, authority, report);
+    });
+    void runInWebview(el as WebviewLike, buildOpenInterceptScript(nonce)).then((outcome) => {
+      if (this.frame !== el) return;
+      if (outcome !== OPEN_INTERCEPT_INSTALLED) {
+        console.warn(`VS Code Workbench: the open-from-editor script did not install (${String(outcome)}); a file opened from this tab's editor opens inside the tab, as VS Code does.`);
+      }
+    });
+  }
+
+  private async openedFromEditor(el: HTMLElement, authority: string, report: OpenReport): Promise<void> {
+    const target = targetOfUri(report.uri, authority, this.host.vaultRoot());
+    if (target.kind === "other") return; // not a file of this server: it opens inside the tab as VS Code does
+    // The tab's own file is not "another file" (a spelling of the same path): leave the editor alone.
+    if (target.kind === "vault" && [this.file, this.shownFile].some((own) => own !== "" && fileKey(own) === fileKey(target.file))) return;
+    try {
+      const f = el as WebviewLike;
+      if (typeof f.executeJavaScript === "function") {
+        const restored = await withTimeout(f.executeJavaScript(RESTORE_OPEN_SCRIPT), 3000);
+        if (restored === RESTORE_SWITCHED) {
+          // The opened file already held unsaved edits in this tab, so VS Code would not close it without asking. The prompt was
+          // cancelled and the tab shows its own file; the edits stay here (nothing was saved or discarded for the user).
+          console.info("VS Code Workbench: the file opened from the editor has unsaved edits in this tab; they stay in this tab, which shows its own file again.");
+        } else if (restored !== "pressed") {
+          console.warn(`VS Code Workbench: the opened editor was not put away (${String(restored)}); this tab may show the other file too.`);
+        }
+      }
+    } catch (e) {
+      console.warn(`VS Code Workbench: could not put the opened editor away (${e instanceof Error ? e.message : String(e)}); this tab may show the other file too.`);
+    }
+    try {
+      await this.host.openFromEditor?.(this.leaf, target, report.line);
+    } catch (e) {
+      console.warn(`VS Code Workbench: a file opened from the editor was not opened as a tab (${e instanceof Error ? e.message : String(e)}).`);
+    }
+  }
+
+  /**
+   * The line asked for at load: once the workbench page (the second dom-ready this element reports) has loaded, the page script
+   * moves the cursor. A line asked for before that moment (`goToLine` on a tab still loading its page) waits in `pendingLine` and
+   * is taken here. Best effort; the tab is open either way.
+   */
+  private placeCursorOnLoad(el: HTMLElement): void {
+    this.workbenchReady = false;
+    el.addEventListener(
+      "dom-ready",
+      () => {
+        if (this.frame !== el || this.closed) return;
+        this.workbenchReady = true;
+        const line = this.pendingLine;
+        this.pendingLine = null;
+        if (line !== null) void this.runGoToLine(el as WebviewLike, line);
+      },
+      { once: true },
+    );
+  }
+
+  private async runGoToLine(f: WebviewLike, line: number): Promise<void> {
+    if (typeof f.executeJavaScript !== "function") return logGoToLine("unsupported");
+    try {
+      logGoToLine(await withTimeout(f.executeJavaScript(buildGoToLineScript(line)), GO_TO_LINE_TOTAL_MS));
+    } catch (e) {
+      logGoToLine(`error:${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /**
+   * Put this tab's cursor on `line` (an already-open tab that a file opened from the editor named again, E3; or a restored tab
+   * that has just been loaded). A tab whose workbench page has not loaded yet keeps the line for when it has. A line that is zero, negative or
+   * not a number is line 1, and one past the end of the file is the last line. No-op on an iframe, which cannot be scripted (F5).
+   */
+  async goToLine(line: unknown): Promise<void> {
+    const n = normalizeLine(line);
+    const f = this.frame as WebviewLike | null;
+    if (this.loading || !f || !this.workbenchReady) {
+      this.pendingLine = n;
+      return;
+    }
+    await this.runGoToLine(f, n);
   }
 
   // --- following the vault (G3) --------------------------------------------

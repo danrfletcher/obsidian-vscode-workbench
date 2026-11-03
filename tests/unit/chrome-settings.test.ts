@@ -80,7 +80,7 @@ describe("chrome settings (G5, GP1)", () => {
     });
   });
 
-  it("closes the side bar, secondary side bar and panel with the workbench's own commands, and toggles the activity bar and status bar, on six distinct seeded chords", () => {
+  it("closes the side bar, secondary side bar and panel with the workbench's own commands, and toggles the activity bar and status bar, then PR-4's four editor chords, on ten distinct seeded chords", () => {
     // literal: PR-1's chords (docs/spike-chrome.md R6a, S2) and PR-3's two toggles for the bars the settings hide (E8)
     expect(chromeKeybindings()).toEqual([
       { key: "ctrl+alt+shift+7", command: "workbench.action.toggleActivityBarVisibility" },
@@ -89,9 +89,14 @@ describe("chrome settings (G5, GP1)", () => {
       { key: "ctrl+alt+shift+1", command: "workbench.action.closeSidebar" },
       { key: "ctrl+alt+shift+3", command: "workbench.action.closePanel" },
       { key: "ctrl+alt+shift+4", command: "workbench.action.closeOtherEditors" },
+      // PR-4: put away the editor a file opened from the editor made, show the previous editor when that is refused, join split groups, go to a line
+      { key: "ctrl+alt+shift+5", command: "workbench.action.closeActiveEditor" },
+      { key: "ctrl+alt+shift+0", command: "workbench.action.openPreviousRecentlyUsedEditorInGroup" },
+      { key: "ctrl+alt+shift+8", command: "workbench.action.joinAllGroups" },
+      { key: "ctrl+alt+shift+9", command: "workbench.action.gotoLine" },
     ]);
     expect(closeRoutes().map((r) => r.surface)).toEqual(["activityBar", "statusBar", "secondarySideBar", "sideBar", "panel"]);
-    expect(new Set(chromeKeybindings().map((k) => k.key)).size).toBe(6);
+    expect(new Set(chromeKeybindings().map((k) => k.key)).size).toBe(10);
   });
 
   it("gives only the panel a hide button for the time a modal dialog swallows the chord, and the button never reaches the seeded keybindings", () => {
@@ -107,6 +112,8 @@ describe("chrome settings (G5, GP1)", () => {
       { command: "workbench.action.toggleZenMode", keys: ["cmd+k z", "ctrl+k z"] },
       { command: "workbench.action.closeActiveEditor", keys: ["cmd+w", "ctrl+w", "ctrl+f4"] },
       { command: "workbench.action.toggleAuxiliaryBar", keys: ["cmd+alt+b", "ctrl+alt+b"] },
+      { command: "workbench.action.splitEditor", keys: ["cmd+\\", "ctrl+\\"] },
+      { command: "workbench.action.splitEditorOrthogonal", keys: ["cmd+k cmd+\\", "ctrl+k ctrl+\\"] },
     ]);
   });
 
@@ -130,7 +137,7 @@ describe("chrome settings (G5, GP1)", () => {
 
   it("touches no extensions.* key and nothing that starts or stops the extension host (GP5)", () => {
     for (const k of Object.keys(chromeSettings())) expect(k, k).not.toMatch(/extension/i);
-    for (const c of chromeKeybindings()) expect(c.command, c.key).toMatch(/^workbench\.action\.(close(Sidebar|AuxiliaryBar|Panel|OtherEditors)|toggle(ActivityBarVisibility|StatusbarVisibility))$/);
+    for (const c of chromeKeybindings()) expect(c.command, c.key).toMatch(/^workbench\.action\.(close(Sidebar|AuxiliaryBar|Panel|OtherEditors|ActiveEditor)|openPreviousRecentlyUsedEditorInGroup|joinAllGroups|gotoLine|toggle(ActivityBarVisibility|StatusbarVisibility))$/);
   });
 
   it("changes no notification, trust or save-dialog setting (F8)", () => {

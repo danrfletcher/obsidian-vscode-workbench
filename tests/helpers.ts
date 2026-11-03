@@ -69,7 +69,7 @@ export class FakeWebview {
   autoDomReady = true;
   executeResult: () => Promise<unknown> = async () => "seeded";
   trustResult: () => Promise<unknown> = async () => "seeded";
-  private listeners: Record<string, (() => void)[]> = {};
+  private listeners: Record<string, ((event?: unknown) => void)[]> = {};
   constructor(public tag: string) {}
   setAttribute(k: string, v: string) {
     this.attrs[k] = v;
@@ -78,8 +78,12 @@ export class FakeWebview {
       if (this.srcs.length === 1 && this.autoDomReady) setTimeout(() => this.fire("dom-ready"), 0);
     }
   }
-  addEventListener(name: string, fn: () => void) {
+  addEventListener(name: string, fn: (event?: unknown) => void) {
     (this.listeners[name] ??= []).push(fn);
+  }
+  /** An event that can come many times (a webview's `console-message`): every listener hears it and stays. */
+  emit(name: string, event: unknown) {
+    for (const fn of [...(this.listeners[name] ?? [])]) fn(event);
   }
   fire(name: string) {
     for (const fn of this.listeners[name]?.splice(0) ?? []) fn();

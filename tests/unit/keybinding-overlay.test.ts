@@ -13,6 +13,10 @@ const CLOSE_CHORDS: Rule[] = [
   { key: "ctrl+alt+shift+1", command: "workbench.action.closeSidebar" },
   { key: "ctrl+alt+shift+3", command: "workbench.action.closePanel" },
   { key: "ctrl+alt+shift+4", command: "workbench.action.closeOtherEditors" },
+  { key: "ctrl+alt+shift+5", command: "workbench.action.closeActiveEditor" },
+  { key: "ctrl+alt+shift+0", command: "workbench.action.openPreviousRecentlyUsedEditorInGroup" },
+  { key: "ctrl+alt+shift+8", command: "workbench.action.joinAllGroups" },
+  { key: "ctrl+alt+shift+9", command: "workbench.action.gotoLine" },
 ];
 const REMOVALS: Rule[] = [
   { key: "cmd+b", command: "-workbench.action.toggleSidebarVisibility" },
@@ -26,6 +30,10 @@ const REMOVALS: Rule[] = [
   { key: "ctrl+f4", command: "-workbench.action.closeActiveEditor" },
   { key: "cmd+alt+b", command: "-workbench.action.toggleAuxiliaryBar" },
   { key: "ctrl+alt+b", command: "-workbench.action.toggleAuxiliaryBar" },
+  { key: "cmd+\\", command: "-workbench.action.splitEditor" },
+  { key: "ctrl+\\", command: "-workbench.action.splitEditor" },
+  { key: "cmd+k cmd+\\", command: "-workbench.action.splitEditorOrthogonal" },
+  { key: "ctrl+k ctrl+\\", command: "-workbench.action.splitEditorOrthogonal" },
 ];
 const OURS: Rule[] = [...CLOSE_CHORDS, ...REMOVALS];
 

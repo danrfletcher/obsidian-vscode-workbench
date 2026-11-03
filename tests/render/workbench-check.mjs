@@ -25,6 +25,13 @@
  *      behind VS Code's Workspace Trust dialog (the dialog stops every key, so the page script clicks the panel's hide button) and the one a
  *      running terminal reopens in a trusted folder.
  *
+ *   GP2, GP3, E2, E3, E4, E7 (PR-4): a file opened from inside the editor (Go to Definition, Cmd+P) is reported by the plugin's page
+ *      script (src/open-intercept-script.ts) with its file and line, mapped back to a vault file or an outside path by the plugin's own
+ *      rule (src/paths.ts targetOfUri, src/open-from-editor.ts planEditorOpen), and put away (the close-editor chord) so the first
+ *      tab shows its own file at its own cursor and scroll; the file the tab was loaded with is never reported; Split Editor from the
+ *      palette is undone (a control without the script shows two groups); a tab opened for a file is put on a line by the go-to-line
+ *      script (src/goto-line-script.ts), with a bad line clamped; and the VS Code tab strip is never laid out through all of it.
+ *
  * Not part of `npm test`: it needs a VS Code build with `serve-web`, a cached VS Code server for that build,
  * and Google Chrome. It starts `serve-web` on a free loopback port and headless Chrome on a free debugging
  * port, and stops what it started, by PID, at the end.
@@ -35,7 +42,7 @@
  * that build; it is cloned into the scratch dir, never written to), ALLOW_DOWNLOAD=1 (let `serve-web` download
  * the server for the installed build from Microsoft into the scratch dir when CLI_DATA_SRC is not set or does
  * not hold it; without it nothing is ever downloaded), CHROME, SERVER_TMPDIR (default /tmp, see the comment at
- * the spawn), SKIP_G4=1 (skip the G4 block), ONLY_GP4=1 (run only the GP4/E8/E9 block).
+ * the spawn), SKIP_G4=1 (skip the G4 block), ONLY_GP4=1 (run only the GP4/E8/E9 block), SKIP_PR4=1 (skip the PR-4 block), ONLY_PR4=1 (run only it).
  *
  * Exit codes: 0 all checks passed, 1 a check failed, 2 the check could not run (a missing tool, no server for
  * the installed build, a server that answers with an error, or a page that never painted).
@@ -128,7 +135,7 @@ function freePort() {
 
 // --- the plugin's own code ---------------------------------------------------------------------------
 await build({
-  entryPoints: { paths: path.join(root, "src/paths.ts"), "trust-seed": path.join(root, "src/trust/trust-seed.ts"), settings: path.join(root, "src/settings.ts"), "dirty-script": path.join(root, "src/dirty-script.ts"), "chrome-settings": path.join(root, "src/chrome-settings.ts"), "chrome-script": path.join(root, "src/chrome-script.ts") },
+  entryPoints: { paths: path.join(root, "src/paths.ts"), "trust-seed": path.join(root, "src/trust/trust-seed.ts"), settings: path.join(root, "src/settings.ts"), "dirty-script": path.join(root, "src/dirty-script.ts"), "chrome-settings": path.join(root, "src/chrome-settings.ts"), "chrome-script": path.join(root, "src/chrome-script.ts"), "open-intercept-script": path.join(root, "src/open-intercept-script.ts"), "goto-line-script": path.join(root, "src/goto-line-script.ts"), "open-from-editor": path.join(root, "src/open-from-editor.ts") },
   bundle: true, format: "esm", platform: "node", outdir: path.join(work, "plugin"), outExtension: { ".js": ".mjs" }, logLevel: "error",
 });
 const settings = await import(pathToFileURL(path.join(work, "plugin/settings.mjs")).href);
@@ -140,6 +147,10 @@ const { DIRTY_SCRIPT, fileDirtyScript } = await import(pathToFileURL(path.join(w
 // What the Code tab seeds and runs to hide the chrome (src/main.ts chromeHiding(), src/code-view.ts loadWorkbench), from the same code.
 const { chromeKeybindings, overlayKeybindings, unbindCommands, REVEALING_COMMANDS } = await import(pathToFileURL(path.join(work, "plugin/chrome-settings.mjs")).href);
 const { buildChromeHideScript } = await import(pathToFileURL(path.join(work, "plugin/chrome-script.mjs")).href);
+// What the Code tab runs to turn an open from the editor into a tab (PR-4), from the same code.
+const { buildOpenInterceptScript, parseOpenReport, RESTORE_OPEN_SCRIPT, OPEN_INTERCEPT_INSTALLED } = await import(pathToFileURL(path.join(work, "plugin/open-intercept-script.mjs")).href);
+const { buildGoToLineScript, GO_TO_LINE_DONE } = await import(pathToFileURL(path.join(work, "plugin/goto-line-script.mjs")).href);
+const { planEditorOpen } = await import(pathToFileURL(path.join(work, "plugin/open-from-editor.mjs")).href);
 
 // --- the fixtures ------------------------------------------------------------------------------------
 const vault = path.join(work, "vault");
@@ -226,7 +237,7 @@ const FLASH_PARTS = `(() => {
 })()`;
 
 // --- one browser -------------------------------------------------------------------------------------
-async function browser(name, srv, { hide = false, dark = false, copy = null, overlay = true, extraRules = null, script = true, flash: wantFlash = true, trust = false } = {}) {
+async function browser(name, srv, { hide = false, dark = false, copy = null, overlay = true, extraRules = null, script = true, flash: wantFlash = true, trust = false, file = null, intercept = null } = {}) {
   const cdpPort = await freePort();
   const chrome = spawn(CHROME, ["--headless=new", `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${path.join(work, "chrome-" + name)}`, "--no-first-run", "--disable-background-networking", "about:blank"], { stdio: "ignore" });
   started.push(chrome.pid);
@@ -236,8 +247,10 @@ async function browser(name, srv, { hide = false, dark = false, copy = null, ove
   await new Promise((r) => (ws.onopen = r));
   let id = 0;
   const pend = new Map();
+  const consoleLog = []; // what the page printed with console.*, in order (the plugin's open report is one of them)
   ws.onmessage = (m) => {
     const d = JSON.parse(m.data);
+    if (d.method === "Runtime.consoleAPICalled") consoleLog.push(d.params.args.map((a) => a.value ?? a.description ?? "").join(" "));
     if (d.id && pend.has(d.id)) pend.get(d.id)(d);
     // A "leave this page?" prompt (VS Code asks when an editor has unsaved changes) would block the next navigation: leave.
     if (d.method === "Page.javascriptDialogOpening") ws.send(JSON.stringify({ id: ++id, method: "Page.handleJavaScriptDialog", params: { accept: true } }));
@@ -262,6 +275,7 @@ async function browser(name, srv, { hide = false, dark = false, copy = null, ove
     fs.writeFileSync(path.join(outDir, file), Buffer.from(s.result.data, "base64"));
   };
   await send("Page.enable");
+  await send("Runtime.enable");
   await send("Emulation.setFocusEmulationEnabled", { enabled: true });
   await send("Emulation.setDeviceMetricsOverride", { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
   const seedProfile = async () => {
@@ -281,7 +295,8 @@ async function browser(name, srv, { hide = false, dark = false, copy = null, ove
       await sleep(0.05);
     }
   };
-  const workbenchUrl = `http://127.0.0.1:${srv.port}/?tkn=${srv.token}&folder=${encodeURIComponent(vault)}`;
+  // `file`: the URL the Code tab navigates to for a file (the same code), which opens that file in the editor; else the bare folder.
+  const workbenchUrl = file ? pluginPaths.buildFileUrl(`http://127.0.0.1:${srv.port}`, vault, file, srv.token) : `http://127.0.0.1:${srv.port}/?tkn=${srv.token}&folder=${encodeURIComponent(vault)}`;
   if (hide) await seedProfile();
   const navigatedAt = Date.now();
   await send("Page.navigate", { url: workbenchUrl });
@@ -289,6 +304,8 @@ async function browser(name, srv, { hide = false, dark = false, copy = null, ove
   if (hide) {
     await waitWorkbench();
     if (script) console.log(`[${name}] chrome script: ${await ev(buildChromeHideScript())}`);
+    // PR-4: the tab's open-from-editor script, installed at the workbench page's dom-ready as the Code tab does (the file it was loaded with is the tab's own).
+    if (intercept) console.log(`[${name}] open-from-editor script: ${await ev(process.env.PR4_DEBUG ? buildOpenInterceptScript(intercept).replace("window.__vscwOpen = {", "window.__dbg = () => JSON.stringify({ own, reported, pending, budget, s: read() }); window.__vscwOpen = {") : buildOpenInterceptScript(intercept))}`);
     // E6 flash check (best effort): frames over the first seconds after navigation, and whether the full workbench is ever painted.
     // PR-1 saw no flash (docs/spike-chrome.md S4), so the frames are kept as evidence and nothing here fails the run.
     if (wantFlash) {
@@ -339,7 +356,7 @@ async function browser(name, srv, { hide = false, dark = false, copy = null, ove
     ws.close();
     stopPid(chrome.pid);
   };
-  return { send, ev, key, shot, openFile, close, META, reload };
+  return { send, ev, key, shot, openFile, close, META, reload, consoleLog };
 }
 
 // What VS Code is showing besides the editor: toasts, dialogs, and the editor's text.
@@ -366,7 +383,7 @@ const notRendered = (what) => (neverPainted = true, check(false, `${what}: the p
 // G4: a file changes on disk behind an open editor
 // =====================================================================================================
 g4: {
-  if (process.env.SKIP_G4 === "1" || process.env.ONLY_GP4 === "1") break g4; // SKIP_G4=1: only the G5/G6 block (a faster rerun while working on the hiding)
+  if (process.env.SKIP_G4 === "1" || process.env.ONLY_GP4 === "1" || process.env.ONLY_PR4 === "1") break g4; // SKIP_G4=1: only the G5/G6 block (a faster rerun while working on the hiding)
   // The web workbench saves by itself after a second unless auto-save is off; the checklist runs with it off (GP7).
   // The plugin's Machine file now hides the tab strip (GP1), and the unsaved-buffer probes below read `.tab.dirty` and
   // `data-resource-name` from it, so this block puts the tab strip back for its own server only. The Code tab itself has no
@@ -524,7 +541,7 @@ const CONTRAST = `(() => {
   };
 })()`;
 
-for (const dark of process.env.ONLY_GP4 === "1" ? [] : [false, true]) {
+for (const dark of process.env.ONLY_GP4 === "1" || process.env.ONLY_PR4 === "1" ? [] : [false, true]) {
   const name = dark ? "dark" : "light";
   const srv = await startServer(name, dark);
   const b = await browser(name, srv, { hide: true, dark });
@@ -597,7 +614,7 @@ const findVisible = `(() => { const e = document.querySelector('.monaco-editor .
 const escape = (b) => b.key("Escape", "Escape", 27);
 
 gp4: {
-  if (process.env.SKIP_GP4 === "1") break gp4;
+  if (process.env.SKIP_GP4 === "1" || process.env.ONLY_PR4 === "1") break gp4;
   const want = (part) => !process.env.GP4_PARTS || process.env.GP4_PARTS.split(",").includes(part); // GP4_PARTS=ctl,ovl,term,e8,table,e9: a faster rerun of some parts
   const srv = await startServer("gp4", false, { "files.autoSave": "off" });
   const shotName = (n) => `GP4-${n}.png`;
@@ -873,6 +890,231 @@ gp4: {
       [seen, now] = await press();
       await b.shot("GP4-reload.png");
       check(seen.length === 0 && barsHidden(now), "E9: after a reload of the tab (same copy id) the same chords still bring nothing back", JSON.stringify({ seen, now }));
+    }
+    b.close();
+  }
+  stopPid(srv.pid);
+}
+
+
+// =====================================================================================================
+// PR-4: a file opened from inside the editor becomes a tab of its own (GP2, GP3, E2, E3, E4, E7)
+// =====================================================================================================
+pr4: {
+  if (process.env.SKIP_PR4 === "1") break pr4;
+  // Fixtures: pd.js imports a helper in the vault and a module outside it; a note; the helper is short so a bad line has a last line.
+  const PD = ['import { helper } from "./helper.js";', 'import { ext } from "../outside/ext.js";', ...Array.from({ length: 77 }, (_, i) => `// filler ${i + 3}`), "helper(1);", "ext(2);", ""].join("\n");
+  const HELPER = ["// helper", "", "", "", "export function helper(n) {", "  return n + 1;", "}", ""].join("\n");
+  fs.writeFileSync(path.join(vault, "pd.js"), PD);
+  fs.writeFileSync(path.join(vault, "helper.js"), HELPER);
+  fs.writeFileSync(path.join(vault, "note.md"), "# A note\n\nSome text.\n");
+  fs.mkdirSync(path.join(work, "outside"), { recursive: true });
+  fs.writeFileSync(path.join(work, "outside", "ext.js"), "export function ext(n) {\n  return n * 2;\n}\n");
+  const HELPER_LINES = HELPER.split("\n").length; // 8: the empty last line counts, as Go to Line counts it
+  const authority = (srv) => `127.0.0.1:${srv.port}`;
+  const NONCE = "pr4-check-nonce";
+
+  const state = `(() => {
+    const shown = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const eds = [...document.querySelectorAll('.part.editor .monaco-editor[data-uri]')].filter(shown);
+    const active = document.querySelector('.part.editor .monaco-editor .line-numbers.active-line-number');
+    const nums = [...document.querySelectorAll('.part.editor .monaco-editor .margin-view-overlays .line-numbers')].map((e) => Number(e.textContent)).filter(Boolean);
+    return { uris: eds.map((e) => e.getAttribute('data-uri')), line: active ? Number(active.textContent) : null, firstVisible: nums.length ? Math.min(...nums) : null, groups: [...document.querySelectorAll('.part.editor .editor-group-container')].filter(shown).length, tabstrip: [...document.querySelectorAll('.tabs-and-actions-container')].some(shown) };
+  })()`;
+  // Records (for the whole page life) that the VS Code tab strip was ever laid out, or two files were ever on screen at once.
+  const TAB_RECORDER = `(() => { window.__tabstripSeen = false; const shown = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    new MutationObserver(() => { if ([...document.querySelectorAll('.tabs-and-actions-container')].some(shown)) window.__tabstripSeen = true; }).observe(document.documentElement, { subtree: true, attributes: true, childList: true, attributeFilter: ['class', 'style'] }); return 'recording'; })()`;
+  const reportsOf = (b) => b.consoleLog.map((m) => parseOpenReport(m, NONCE)).filter(Boolean);
+  const waitFor = async (what, fn, seconds = 20) => { for (let i = 0; i < seconds * 4; i++) { const v = await fn(); if (v) return v; await sleep(0.25); } return null; };
+  // The textarea of the editor on screen (an editor kept open behind it, such as a file with unsaved edits, is not laid out).
+  const focusEditor = (b) => b.ev("(() => { const shown = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; }; [...document.querySelectorAll('.monaco-editor textarea.inputarea')].find(shown)?.focus(); })()");
+  const endsWith = (uri, name) => typeof uri === "string" && decodeURIComponent(uri).endsWith(`/${name}`);
+  // Go to Definition with the cursor where it is. The language features load a moment after the editor (the first ask can find no
+  // definition yet), so ask again, alternating F12 and the palette command, until a new report arrives.
+  const definition = async (b, seen) => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      await focusEditor(b);
+      if (attempt % 2 === 0) await b.key("F12", "F12", 123);
+      else {
+        await b.key("p", "KeyP", 80, b.META | 8); await sleep(1.2);
+        await b.send("Input.insertText", { text: "Go to Definition" }); await sleep(1.2);
+        await b.key("Enter", "Enter", 13);
+      }
+      const report = await waitFor("report", () => reportsOf(b)[seen], 6);
+      if (report) return report;
+      const st = await b.ev(state);
+      if (process.env.PR4_DEBUG) console.log(`[definition] dbg ${await b.ev("window.__dbg()")} console ${JSON.stringify(b.consoleLog.filter((m) => m.includes("vscw")))}`);
+      console.log(`[definition] attempt ${attempt + 1} gave no report; state ${JSON.stringify(st)}; toasts ${JSON.stringify((await pageState(b)).toasts)}`);
+      await escape(b); await sleep(0.5);
+    }
+    return null;
+  };
+  const target = (srv, report) => pluginPaths.targetOfUri(report.uri, authority(srv), vault);
+
+  const srv = await startServer("pr4", false, { "files.autoSave": "off" });
+  const shotName = (n) => `PR-4-${n}.png`;
+
+  // --- the tab: pd.js loaded the way the Code tab loads it.
+  {
+    const b = await browser("pr4", srv, { hide: true, flash: false, file: "pd.js", intercept: NONCE, trust: true });
+    await b.ev(TAB_RECORDER);
+    const first = await waitFor("pd.js", async () => { const st = await b.ev(state); return endsWith(st?.uris?.[0], "pd.js") ? st : null; });
+    if (!first) notRendered("PR-4");
+    else {
+      await sleep(2);
+      check(first.uris.length === 1 && first.groups === 1 && !first.tabstrip, "GP2/E7: the tab shows pd.js alone, in one editor group, with no VS Code tab strip", JSON.stringify(first));
+      check(reportsOf(b).length === 0, "Added: the file the tab was loaded with is not reported by the intercept (no second tab for itself)", JSON.stringify(b.consoleLog.slice(-3)));
+      await b.shot(shotName("1-start"));
+
+      // GP3 line placement into the first tab: go to the call of the imported name.
+      check((await b.ev(buildGoToLineScript(80))) === GO_TO_LINE_DONE, "GP3: the go-to-line script moves the cursor of a loaded tab");
+      await sleep(1);
+      const placed = await b.ev(state);
+      check(placed?.line === 80, "GP3: ...to the line asked for", `line ${placed?.line}`);
+      check(reportsOf(b).length === 0, "Added: a cursor that moves inside the tab's own file is not reported");
+      const before = placed;
+
+      // Go to Definition on the imported name (F12): reported once, with the definition's file and line.
+      const r1 = await definition(b, 0);
+      check(!!r1 && endsWith(r1.uri, "helper.js"), "GP3: Go to Definition on an imported name reports the target file", JSON.stringify(r1));
+      check(r1?.line === 5, "GP3: ...at the definition's line", `line ${r1?.line}`);
+      const t1 = r1 && target(srv, r1);
+      check(t1?.kind === "vault" && t1.file === "helper.js", "GP3: ...which the plugin maps to the vault file helper.js", JSON.stringify(t1));
+      check(JSON.stringify(t1 && planEditorOpen(t1)) === JSON.stringify({ action: "code", file: "helper.js" }), "GP3: ...and plans a Code tab for it", JSON.stringify(t1 && planEditorOpen(t1)));
+      await b.shot(shotName("2-definition-before-restore"));
+
+      // The tab puts the opened editor away: the first tab shows pd.js again at its own cursor and scroll.
+      check((await b.ev(RESTORE_OPEN_SCRIPT)) === "pressed", "GP3: the tab puts the opened editor away with the close-editor chord");
+      const back = await waitFor("pd.js back", async () => { const st = await b.ev(state); return st?.uris?.length === 1 && endsWith(st.uris[0], "pd.js") ? st : null; });
+      check(!!back, "GP2: the first tab shows pd.js alone again (VS Code did not switch the tab to the other file)", JSON.stringify(back));
+      await sleep(1);
+      const after = await b.ev(state);
+      check(after?.line === before.line && after?.firstVisible === before.firstVisible, "GP3: the first tab's cursor and scroll are where they were", `before line ${before.line} top ${before.firstVisible}; after line ${after?.line} top ${after?.firstVisible}`);
+      await b.shot(shotName("3-first-tab-after"));
+
+      // E3: the same definition again is reported again (the plugin then focuses the tab it already has).
+      const r2 = await definition(b, 1);
+      check(!!r2 && endsWith(r2.uri, "helper.js") && r2.line === 5, "E3: the same Go to Definition again is reported again, same file and line", JSON.stringify(r2));
+      await b.ev(RESTORE_OPEN_SCRIPT); await sleep(1.5);
+
+      // E2: a definition outside the vault.
+      await b.ev(buildGoToLineScript(81)); await sleep(1);
+      const r3 = await definition(b, 2);
+      const t3 = r3 && target(srv, r3);
+      check(t3?.kind === "outside" && t3.path === path.join(work, "outside", "ext.js"), "E2: Go to Definition into a file outside the vault is reported as outside, by its path", JSON.stringify(t3));
+      check(JSON.stringify(t3 && planEditorOpen(t3)) === JSON.stringify({ action: "outside", name: "ext.js" }), "E2: ...and the plan is a notice naming it, no tab", JSON.stringify(t3 && planEditorOpen(t3)));
+      await b.shot(shotName("4-outside"));
+      await b.ev(RESTORE_OPEN_SCRIPT); await sleep(1.5);
+
+      // GP3 quick open: Cmd+P and a file; E2: a note.
+      const quick = async (name) => {
+        await focusEditor(b);
+        await b.key("p", "KeyP", 80, b.META); await sleep(1.5);
+        await b.send("Input.insertText", { text: name }); await sleep(1.5);
+        await b.key("Enter", "Enter", 13);
+      };
+      const n0 = reportsOf(b).length;
+      await quick("helper.js");
+      const r4 = await waitFor("quick open report", () => reportsOf(b)[n0]);
+      check(!!r4 && endsWith(r4.uri, "helper.js"), "GP3: choosing a file in Cmd+P quick open is reported as an open from the editor", JSON.stringify(r4));
+      await b.shot(shotName("5-quick-open"));
+      await b.ev(RESTORE_OPEN_SCRIPT);
+      check(!!(await waitFor("pd.js after quick open", async () => { const st = await b.ev(state); return st?.uris?.length === 1 && endsWith(st.uris[0], "pd.js"); })), "GP3: ...and the tab shows its own file again after it is put away");
+      const n1 = reportsOf(b).length;
+      await quick("note.md");
+      const r5 = await waitFor("note report", () => reportsOf(b)[n1]);
+      const t5 = r5 && target(srv, r5);
+      check(t5?.kind === "vault" && t5.file === "note.md" && JSON.stringify(planEditorOpen(t5)) === JSON.stringify({ action: "obsidian", file: "note.md" }), "E2: a note chosen in quick open is reported as a vault file that Obsidian opens in its own view", JSON.stringify(t5 && planEditorOpen(t5)));
+      await b.ev(RESTORE_OPEN_SCRIPT); await sleep(1.5);
+
+      // T1: the file opened from the editor already holds unsaved edits in this tab, so VS Code answers the close with its save prompt.
+      // The page cancels the prompt (never saves or discards) and shows the previous editor, so the tab shows pd.js and not helper.js.
+      const n2 = reportsOf(b).length;
+      await quick("helper.js");
+      const r6 = await waitFor("helper report for the edit", () => reportsOf(b)[n2]);
+      check(!!r6 && endsWith(r6.uri, "helper.js"), "T1: helper.js is open in the tab to be edited", JSON.stringify(r6));
+      await sleep(1);
+      await b.ev(buildGoToLineScript(1)); await sleep(1); // line 1 is a comment: the edit leaves `helper` exported, so Go to Definition below still finds it
+      await b.send("Input.insertText", { text: "// EDITED " });
+      await sleep(1);
+      check((await b.ev(DIRTY_SCRIPT)) === true, "T1: ...and it holds unsaved edits (the window title shows the dirty mark)");
+      const n3 = reportsOf(b).length;
+      check((await b.ev(RESTORE_OPEN_SCRIPT)) === "switched", "T1: putting away an opened file with unsaved edits cancels the save prompt and shows the previous editor");
+      const own1 = await waitFor("pd.js after the prompt", async () => { const st = await b.ev(state); return st?.uris?.length === 1 && endsWith(st.uris[0], "pd.js") ? st : null; });
+      check(!!own1, "T1: the tab shows pd.js alone again, not helper.js (no in-place navigation)", JSON.stringify(own1));
+      await sleep(1.5);
+      check((await b.ev(state))?.uris?.length === 1, "T1: ...and it stays alone, with the edited helper.js not on screen", JSON.stringify(await b.ev(state)));
+      check(!(await pageState(b)).dialogs?.length, "T1: ...and no save prompt is left on screen", JSON.stringify((await pageState(b)).dialogs));
+      // The same Go to Definition again, with the dirty helper.js still open behind: reported again, put away the same way.
+      await b.ev(buildGoToLineScript(80)); await sleep(1);
+      const r7 = await definition(b, n3);
+      check(!!r7 && endsWith(r7.uri, "helper.js") && r7.line !== null, "T1: Go to Definition into the file with unsaved edits is reported again", JSON.stringify(r7));
+      check((await b.ev(RESTORE_OPEN_SCRIPT)) === "switched", "T1: ...and put away the same way a second time");
+      check(!!(await waitFor("pd.js again", async () => { const st = await b.ev(state); return st?.uris?.length === 1 && endsWith(st.uris[0], "pd.js"); })), "T1: ...the tab shows pd.js alone");
+      // The edits were kept: reaching helper.js again shows them, and nothing was written to disk.
+      const n4 = reportsOf(b).length;
+      await quick("helper.js");
+      await waitFor("helper report again", () => reportsOf(b)[n4]);
+      await sleep(1);
+      check((await pageState(b)).text.includes("EDITED"), "T1: the unsaved edits are still in the tab's helper.js buffer");
+      check(fs.readFileSync(path.join(vault, "helper.js"), "utf8") === HELPER, "T1: ...and the file on disk is untouched (the prompt was cancelled, not answered with Save)");
+      // Put the buffer back as it was (revert), so the steps below see a clean helper.js, then put the editor away.
+      await b.key("p", "KeyP", 80, b.META | 8); await sleep(1.2);
+      await b.send("Input.insertText", { text: "File: Revert File" }); await sleep(1.2);
+      await b.key("Enter", "Enter", 13); await sleep(1.5);
+      check((await b.ev(RESTORE_OPEN_SCRIPT)) === "pressed", "T1: once the edits are reverted, the opened file is closed as before");
+      check(!!(await waitFor("pd.js after revert", async () => { const st = await b.ev(state); return st?.uris?.length === 1 && endsWith(st.uris[0], "pd.js"); })), "T1: ...and the tab shows pd.js alone");
+
+      check((await b.ev("window.__tabstripSeen")) === false, "E7: the VS Code tab strip was never laid out, through all of the above (no patching of VS Code internals was needed)");
+      const end = await b.ev(state);
+      check(end?.uris?.length === 1 && endsWith(end.uris[0], "pd.js") && !end.tabstrip, "GP2: the tab ends with the one file it started with", JSON.stringify(end));
+
+      // E4: Split Editor from the palette is undone by the script (a control without the script follows below).
+      await focusEditor(b);
+      await b.key("p", "KeyP", 80, b.META | 8); await sleep(1.2);
+      await b.send("Input.insertText", { text: "View: Split Editor Right" }); await sleep(1.2);
+      await b.key("Enter", "Enter", 13);
+      await sleep(4);
+      const split = await b.ev(state);
+      check(split?.groups === 1, "E4: Split Editor from the palette leaves one editor group in the tab", JSON.stringify(split));
+      await b.shot(shotName("6-split"));
+    }
+    b.close();
+  }
+
+  // --- E4 control: without the tab's script, the same palette command does split (so the line above is the script's doing).
+  {
+    const b = await browser("pr4-ctl", srv, { hide: true, flash: false, file: "pd.js" });
+    const ok = await waitFor("pd.js", async () => endsWith((await b.ev(state))?.uris?.[0], "pd.js"));
+    if (!ok) notRendered("PR-4 control");
+    else {
+      await sleep(2);
+      await focusEditor(b);
+      await b.key("p", "KeyP", 80, b.META | 8); await sleep(1.2);
+      await b.send("Input.insertText", { text: "View: Split Editor Right" }); await sleep(1.2);
+      await b.key("Enter", "Enter", 13);
+      await sleep(4);
+      const st = await b.ev(state);
+      check(st?.groups === 2, "E4 control: without the script the palette's Split Editor does split (two groups)", JSON.stringify(st));
+      await b.shot(shotName("6-split-control"));
+    }
+    b.close();
+  }
+
+  // --- GP3 line placement into a tab opened for a file, and bad lines.
+  {
+    const b = await browser("pr4-line", srv, { hide: true, flash: false, file: "helper.js" });
+    const ok = await waitFor("helper.js", async () => endsWith((await b.ev(state))?.uris?.[0], "helper.js"));
+    if (!ok) notRendered("PR-4 line");
+    else {
+      await sleep(2);
+      for (const [asked, expected, why] of [[5, 5, "the definition's line"], [0, 1, "zero is line 1"], [-3, 1, "negative is line 1"], ["abc", 1, "non-numeric is line 1"], [99999, HELPER_LINES, "past the end is the last line"], [3, 3, "a line in the middle"]]) {
+        check((await b.ev(buildGoToLineScript(asked))) === GO_TO_LINE_DONE, `GP3: the script runs for line ${JSON.stringify(asked)}`);
+        await sleep(1);
+        const st = await b.ev(state);
+        check(st?.line === expected, `GP3: line ${JSON.stringify(asked)} puts the cursor on line ${expected} (${why}), never an error`, `line ${st?.line}`);
+      }
+      await b.shot(shotName("7-line"));
     }
     b.close();
   }
