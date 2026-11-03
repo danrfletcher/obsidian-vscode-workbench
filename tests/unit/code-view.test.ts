@@ -129,6 +129,33 @@ describe("CodeView", () => {
     expect(el.children[0].executed).toEqual([]);
   });
 
+  it("F5: with embedElement() returning iframe and every hiding host method present, the tab opens, runs no page script and shows no error", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { view, el } = makeView({
+      embedElement: () => "iframe",
+      chromeHiding: () => ({ keybindings: chromeKeybindings(), script: buildChromeHideScript() }),
+      openFromEditor: vi.fn() as never,
+      noteTrustOutcome: vi.fn(),
+    });
+    await view.setState({ file: "a.py" }, {} as never);
+    const frame = el.children[0];
+    frame.fire("dom-ready");
+    await new Promise((r) => setTimeout(r, 0));
+    // the tab opened: one iframe on the workbench URL with the token, and nothing else (no banner or message element)
+    expect(el.children).toHaveLength(1);
+    expect(frame.tag).toBe("iframe");
+    expect(frame.srcs).toHaveLength(1);
+    expect(frame.srcs[0]).toContain("tkn=tok123");
+    // no page script of any kind: no seed, no hiding script, no open-from-editor script, no go-to-line
+    expect(frame.executed).toEqual([]);
+    // and nothing complained
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    warn.mockRestore();
+    error.mockRestore();
+  });
+
   it("an iframe tab cannot be read, so it counts as holding unsaved edits: idle stop and quit keep it (PR-2 R6)", async () => {
     const { view, el } = makeView({ embedElement: () => "iframe" });
     await view.setState({ file: "a.py" }, {} as never);
@@ -709,6 +736,24 @@ describe("CodeView: the chrome-hiding script (GP1)", () => {
     warn.mockRestore();
   });
 
+  it("F3: a host that throws something that is not an Error from the overlay or the script is logged by its text, and the tab still opens", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { view, el } = makeView({
+      workbenchOverlay: () => {
+        throw "overlay text"; // eslint-disable-line no-throw-literal
+      },
+      chromeHiding: () => {
+        throw "script text"; // eslint-disable-line no-throw-literal
+      },
+    });
+    await view.setState({ file: "a.py" }, {} as never);
+    expect(el.children[0].srcs[1]).toContain("tkn=tok123");
+    const lines = warn.mock.calls.map((c) => String(c[0]));
+    expect(lines.some((l) => l.includes("settings were not built (overlay text)"))).toBe(true);
+    expect(lines.some((l) => l.includes("script was not built (script text)"))).toBe(true);
+    warn.mockRestore();
+  });
+
   it("a host that fails to build the script opens the tab with the chrome the settings leave, and says so", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const { view, el } = makeView({
@@ -966,6 +1011,25 @@ describe("CodeView: a file opened from the editor becomes its own tab (PR-4)", (
   it("a host that throws is logged and the tab stays open and unchanged (F3)", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const t = await loaded({ openFromEditor: async () => { throw new Error("no server"); } });
+    report(t.wv, t.nonce, { uri: HELPER, line: 5 });
+    await vi.waitFor(() => expect(warn.mock.calls.flat().join(" ")).toContain("was not opened as a tab (no server)"));
+    expect(t.view.filePath).toBe("a.py");
+    warn.mockRestore();
+  });
+
+  it("a page that rejects with something that is not an Error is logged by its text, and the file is still handed on", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const t = await loaded();
+    t.wv.executeJavaScript = () => Promise.reject("page gone"); // eslint-disable-line prefer-promise-reject-errors
+    report(t.wv, t.nonce, { uri: HELPER, line: 5 });
+    await vi.waitFor(() => expect(t.calls).toHaveLength(1));
+    expect(warn.mock.calls.flat().join(" ")).toContain("could not put the opened editor away (page gone)");
+    warn.mockRestore();
+  });
+
+  it("a host that rejects with something that is not an Error is logged by its text, and the tab stays open", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const t = await loaded({ openFromEditor: () => Promise.reject("no server") }); // eslint-disable-line prefer-promise-reject-errors
     report(t.wv, t.nonce, { uri: HELPER, line: 5 });
     await vi.waitFor(() => expect(warn.mock.calls.flat().join(" ")).toContain("was not opened as a tab (no server)"));
     expect(t.view.filePath).toBe("a.py");
@@ -1281,6 +1345,32 @@ describe("CodeView: the cursor line (PR-4, GP3)", () => {
     el.children[0].executeResult = async () => { throw new Error("gone"); };
     await view.goToLine(3);
     expect(warn.mock.calls.flat().join(" ")).toContain("the cursor was not moved to the requested line (error:gone)");
+    expect(el.children).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it("a page that rejects with something that is not an Error is logged by its text, and the tab stays open", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { view, el } = makeView({ chromeHiding: hiding });
+    await view.setState({ file: "a.py" }, {} as never);
+    el.children[0].fire("dom-ready");
+    await settle();
+    el.children[0].executeResult = () => Promise.reject("page closed"); // eslint-disable-line prefer-promise-reject-errors
+    await view.goToLine(3);
+    expect(warn.mock.calls.flat().join(" ")).toContain("the cursor was not moved to the requested line (error:page closed)");
+    expect(el.children).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it("a page without executeJavaScript (an iframe) logs the line as unsupported and the tab stays open", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { view, el } = makeView({ chromeHiding: hiding });
+    await view.setState({ file: "a.py" }, {} as never);
+    el.children[0].fire("dom-ready");
+    await settle();
+    (el.children[0] as unknown as { executeJavaScript?: unknown }).executeJavaScript = undefined;
+    await view.goToLine(3);
+    expect(warn.mock.calls.flat().join(" ")).toContain("the cursor was not moved to the requested line (unsupported)");
     expect(el.children).toHaveLength(1);
     warn.mockRestore();
   });

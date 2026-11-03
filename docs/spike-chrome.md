@@ -2,9 +2,9 @@
 
 Result: **the side bar can be hidden on both builds, so the build does not stop.** The stop rule (E10) fires only when neither
 VS Code 1.143.1 nor 1.144.0 can hide the side bar by any route. Both can, by the same routes, with the same measured sizes.
-The `chrome` header of `docs/spike-decision.md` is now `hidden` (measured: hideable). The product is unchanged: the side bar still
-shows as it ships until PR-2 builds the route below, and the README "Hidden chrome" text and the `src/chrome-settings.ts` table
-stay as they are until that PR retires them together.
+The `chrome` header of `docs/spike-decision.md` is now `hidden` (measured: hideable). When this spike was written the product was
+unchanged and 0.1.0's "ship visible" rule (`chrome: visible`) still stood; PR-2 built the routes below and retired that rule, the
+README "Hidden chrome" text and the old `src/chrome-settings.ts` table together, and PR-6 corrected the remaining docs.
 
 Every size below is the `getBoundingClientRect()` width x height in px of the part's element in the page's computed layout, read by
 `npm run check:chrome-spike` (`tests/render/chrome-spike-check.mjs`), not a screenshot. The probe starts a scratch `code serve-web`

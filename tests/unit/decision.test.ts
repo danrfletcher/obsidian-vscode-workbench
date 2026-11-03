@@ -83,6 +83,12 @@ describe("docs/spike-decision.md", () => {
     expect(text).not.toMatch(/\|\s*`chrome: visible`\s*\|/);
   });
 
+  it("keeps the 0.1.0 plan's F2 and F5 labels as history, with a note that they belong to that plan", () => {
+    expect(text).toContain("labels F2");
+    expect(text).toMatch(/belong to the 0\.1\.0 plan and are kept as history/);
+    expect(text).toContain("Outbound connections (F5)");
+  });
+
   it("records every unknown with a result and lists the conditional checks", () => {
     const unknowns = [
       "iframe runs in Obsidian",

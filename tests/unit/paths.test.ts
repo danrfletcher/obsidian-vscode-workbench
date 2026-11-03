@@ -214,6 +214,13 @@ describe("targetOfUri (the file URI the editor reports, read back)", () => {
     expect(targetOfUri(uriOf(`${ROOT}/a/../b/./c.py`), AUTH, ROOT)).toEqual({ kind: "vault", file: "b/c.py" });
   });
 
+  it("an encoded slash cannot smuggle a .. past the vault root (the URL parser leaves %2F alone, so the .. is resolved here)", () => {
+    const encoded = (rest: string) => `vscode-remote://${AUTH}/Users/dan/My%20Vault${rest}`;
+    expect(targetOfUri(encoded("%2F..%2Fsecret.txt"), AUTH, ROOT)).toEqual({ kind: "outside", path: "/Users/dan/secret.txt" });
+    expect(targetOfUri(encoded("%2Fa%2F..%2F..%2F..%2Fetc%2Fhosts"), AUTH, ROOT)).toEqual({ kind: "outside", path: "/Users/etc/hosts" });
+    expect(targetOfUri(encoded("%2Fa%2F..%2Fb%2F.%2Fc.py"), AUTH, ROOT)).toEqual({ kind: "vault", file: "b/c.py" });
+  });
+
   it("a vault at the file system root has every path inside it", () => {
     expect(targetOfUri(uriOf("/a/b.py"), AUTH, "/")).toEqual({ kind: "vault", file: "a/b.py" });
     expect(targetOfUri(uriOf("/a/b.py"), AUTH, "")).toEqual({ kind: "vault", file: "a/b.py" });

@@ -28,6 +28,8 @@ Obsidian 1.14.5 (Electron 43.7.7, Chromium 150, Node 24.21.0), VS Code 1.143.1 a
 `/usr/share/code`, Python 2026.10.0 and Pylance 2026.4.1, driven over the DevTools
 protocol and `xdotool`. Screenshots are in the round-3 evidence set (`PR-1-*.png`).
 
+Note: the labels F2 ("no Monaco fallback") and F5 ("Outbound connections") in this file belong to the 0.1.0 plan and are kept as history; the editor-only ticket has its own fence numbers (its F2 and F5 are about the terminal drawer, trust and server, and about mobile and the iframe embed).
+
 ## Unknowns
 
 | Unknown | Result | Evidence |
