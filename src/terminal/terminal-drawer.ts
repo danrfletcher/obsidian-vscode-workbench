@@ -12,12 +12,12 @@
  * hotkey bridge, goes through `toggle`, which flips the state synchronously, so ten presses in a second end open after an
  * odd count and closed after an even count, with the one host page.
  */
-import type { ShellProgress, ToggleTarget } from "../hotkey/drawer-toggle";
+import type { PageProgress, ToggleTarget } from "../hotkey/drawer-toggle";
 import type { HostView } from "../terminal-host/host-state";
 import { BottomEdge } from "./bottom-edge";
 import { clampHeight } from "./drawer-geometry";
 import { drawerVisibility, type ViewKind, type Visibility } from "./drawer-visibility";
-import type { FocusReturn } from "./focus-return";
+import type { FocusHandoff } from "./focus-return";
 import { LayoutController } from "./layout";
 
 /** The terminal host page, as the drawer drives it. */
@@ -42,7 +42,8 @@ export interface TerminalDrawerOptions {
   viewKind(): ViewKind;
   /** The "drawer over non-code views" setting, read each time it matters so a change applies live. */
   nonCodeDrawer(): boolean;
-  focus: FocusReturn<unknown>;
+  /** Remembers the view that has focus when the drawer opens and gives it back when the drawer hides. */
+  focus: FocusHandoff;
 }
 
 export class TerminalDrawer implements ToggleTarget {
@@ -74,8 +75,8 @@ export class TerminalDrawer implements ToggleTarget {
     return this.visibility().hotkey;
   }
 
-  /** What the host page is doing, in the words the toggle uses: starting, running, or ended (failed). */
-  shellProgress(): ShellProgress {
+  /** What the host page is doing, in the words the toggle uses: not started, starting, running, or ended (failed). */
+  pageProgress(): PageProgress {
     switch (this.opts.host()?.view() ?? "hidden") {
       case "hidden":
       case "stopped":

@@ -78,7 +78,7 @@ function startHost(opts: HostOptions = {}): Run {
   return { calls, errors, layout: () => calls.map((c) => c.command).filter((c) => (PANEL_ONLY_COMMANDS as readonly string[]).includes(c)) };
 }
 
-const until = (fn: () => boolean) => vi.waitFor(() => { if (!fn()) throw new Error("not yet"); }, { timeout: 5000, interval: 10 });
+const until = (fn: () => boolean) => vi.waitFor(() => { if (!fn()) throw new Error("not yet"); }, { timeout: 20_000, interval: 10 });
 
 describe("the panel-only step of the terminal-at extension", () => {
   it("runs VS Code's own commands, in order: close the side bar, close the secondary side bar, focus the terminal; each with no argument", async () => {

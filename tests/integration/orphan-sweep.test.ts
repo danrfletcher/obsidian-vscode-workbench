@@ -154,10 +154,10 @@ async function answers(port: number): Promise<boolean> {
 }
 
 describe.skipIf(!hasPython)("sweepOrphans with a terminal under the server", () => {
-  async function startWithShell(dir: string) {
+  async function startWithShell(dir: string, extraEnv: Record<string, string> = {}) {
     const devPort = await findFreePort();
     const shellPids = path.join(dir, "shell-pids");
-    const srv = await startOrphanServer(dir, { FAKE_CODE_SHELL_PORT: String(devPort), FAKE_CODE_SHELL_PIDFILE: shellPids });
+    const srv = await startOrphanServer(dir, { FAKE_CODE_SHELL_PORT: String(devPort), FAKE_CODE_SHELL_PIDFILE: shellPids, ...extraEnv });
     const shell = Number(fs.readFileSync(shellPids, "utf8").trim().split("\n")[0]);
     killed.push(shell);
     await vi.waitFor(async () => expect(await answers(devPort)).toBe(true), { timeout: 8000, interval: 100 });
@@ -191,10 +191,12 @@ describe.skipIf(!hasPython)("sweepOrphans with a terminal under the server", () 
     }, { timeout: 5000 });
   });
 
-  it("leaves a nohup process that nothing recorded alone, and removes the pidfile", async () => {
+  it("leaves a detached process that is not under the server and that nothing recorded alone, and removes the pidfile", async () => {
     const dir = tempDir();
     const { wrapper, shell, dev, tokenFile } = await startWithShell(dir);
-    // a `nohup ... & disown`: detached, re-parented to init, not under the server, and nothing in the pidfile names it
+    // a `nohup ... & disown` whose shell is gone: re-parented to init, not under the server, and nothing in the pidfile names it.
+    // It is started here, from the test process, so it is outside the fake server's tree by construction; the case where
+    // the nohup process is still under the server's shell is the next test.
     const nohup = spawn("nohup", ["sleep", "307"], { detached: true, stdio: "ignore" });
     nohup.unref();
     const nohupPid = nohup.pid as number;
@@ -209,6 +211,35 @@ describe.skipIf(!hasPython)("sweepOrphans with a terminal under the server", () 
       expect(isAlive(dev)).toBe(false);
     }, { timeout: 5000 });
     expect(isAlive(nohupPid)).toBe(true);
+    expect(fs.existsSync(pf.file)).toBe(false);
+  });
+
+  // docs/terminal-spike.md, S6 scenario A: Obsidian is force-quit, the server and its shell survive, and the shell still holds a
+  // `nohup` process. The sweep reaches it through the process tree, so it is KILLED. The ticket plan says a nohup process should
+  // outlive Obsidian, as it does in real VS Code, and the spike left the choice to Dan (stop the walk at a shell that holds one,
+  // or accept the kill). This test pins what the sweep does today so that the choice is made on purpose: if Dan decides nohup
+  // processes must survive, change the final assertion and the sweep together.
+  it("kills a nohup process that is still under the server's shell (scenario A: the tree walk reaches it; whether it should is Dan's choice)", async () => {
+    const dir = tempDir();
+    const nohupPids = path.join(dir, "nohup-pids");
+    const { wrapper, shell, dev, tokenFile } = await startWithShell(dir, { FAKE_CODE_SHELL_NOHUP_PIDFILE: nohupPids });
+    await vi.waitFor(() => expect(fs.existsSync(nohupPids) && fs.readFileSync(nohupPids, "utf8").trim() !== "").toBe(true), { timeout: 5000 });
+    const nohupPid = Number(fs.readFileSync(nohupPids, "utf8").trim().split("\n")[0]);
+    killed.push(nohupPid);
+    // it is a child of the shell that is under the server, not of the test, and it is running `sleep` under `nohup`
+    const row = spawnSync("ps", ["-ww", "-o", "ppid=,command=", "-p", String(nohupPid)], { encoding: "utf8" }).stdout.trim();
+    expect(row).toMatch(new RegExp(`^${shell}\\s+.*sleep 307`));
+    expect(isAlive(nohupPid)).toBe(true);
+    const pf = new PidFile(path.join(dir, "pids.json"));
+    pf.add({ pid: wrapper, label: "vscode-server", match: tokenFile, findByMatch: true, startedAt: Date.now(), workspace: dir, group: true });
+
+    await sweepOrphans(pf.file);
+
+    await vi.waitFor(() => {
+      expect(isAlive(shell)).toBe(false);
+      expect(isAlive(dev)).toBe(false);
+      expect(isAlive(nohupPid)).toBe(false);
+    }, { timeout: 5000 });
     expect(fs.existsSync(pf.file)).toBe(false);
   });
 });

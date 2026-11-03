@@ -8,4 +8,11 @@ import fs from "node:fs";
 const shell = spawn("sh", ["-c", "sleep 600; true"], { detached: true, stdio: "ignore" });
 fs.appendFileSync(process.env.FAKE_CODE_TERMINAL_PIDFILE, `${shell.pid}\n`);
 shell.on("exit", () => undefined);
-setInterval(() => undefined, 1000);
+// Like the real pty host, this is not meant to outlive its server: when the server (its parent) is gone, the shell and its
+// `sleep` go too, so a test run that is killed before its afterEach leaves nothing behind for the length of the sleep.
+const server = process.ppid;
+setInterval(() => {
+  if (process.ppid === server) return;
+  if (shell.pid) { try { process.kill(-shell.pid, "SIGKILL"); } catch { /* already gone */ } }
+  process.exit(0);
+}, 500);

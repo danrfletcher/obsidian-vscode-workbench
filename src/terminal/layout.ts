@@ -1,7 +1,7 @@
 /**
  * Where the drawer and its edge sit and how much room the drawer takes (G4). They span only the main
  * pane area (Obsidian's root split), not the sidebars: they take that area's left edge and
- * width, and the area is shortened by the drawer's height with a bottom margin, so the
+ * width, and the area is shortened by the drawer's height (styles.css: its height and bottom margin, only in the main window), so the
  * sidebars keep the full window height. The left edge and width are measured whether or not the
  * drawer is open, because the always-visible edge needs them. Closing the drawer sets the offset
  * to zero (the bottom margin is gone, so no gap is left); disposing removes every variable.

@@ -11,7 +11,15 @@ export interface FocusDeps<L> {
   focusLeaf(leaf: L): void;
 }
 
-export class FocusReturn<L> {
+/** What the drawer needs from a focus return: it does not see the leaf type the implementation is generic over. */
+export interface FocusHandoff {
+  /** The drawer is opening: note which view has focus now. */
+  remember(): void;
+  /** The drawer has hidden: give focus back. */
+  restore(): void;
+}
+
+export class FocusReturn<L> implements FocusHandoff {
   private leaf: L | null = null;
 
   constructor(private readonly deps: FocusDeps<L>) {}

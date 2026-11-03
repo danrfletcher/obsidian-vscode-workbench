@@ -69,6 +69,8 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
 body { display: flex; }
 .workspace-split { box-sizing: border-box; }
 .mod-left-split, .mod-right-split { width: 260px; background: ${hex(SIDE)}; }
+/* Obsidian gives its splits an explicit height of 100% (T1: a margin alone did not shorten the main pane area), so the page does too. */
+.mod-left-split, .mod-right-split, .mod-root { height: 100%; }
 .mod-root { flex: 1; background: ${hex(MAIN)}; }
 body .vscode-workbench-terminal-host { visibility: hidden; background: ${hex(HOST)}; }
 </style><style>${fs.readFileSync(path.join(root, "src/styles.css"), "utf8")}</style></head><body>
@@ -241,6 +243,14 @@ try {
     const y = host.top + 40;
     check(`G4 ${kind}: sidebars keep the full height`, Math.round(left.bottom) === H && Math.round(right.bottom) === H, `left ${left.top}..${left.bottom}, right ${right.top}..${right.bottom}`);
     check(`G4 ${kind}: the drawer spans the main pane area only`, Math.round(host.left) === Math.round(main.left) && Math.round(host.width) === Math.round(main.width), `drawer x ${host.left}..${host.right}, main pane x ${main.left}..${main.right}`);
+    // PR-3 T1: the note area stops above the drawer instead of running under it; the sidebars (checked above) do not.
+    check(`T1 ${kind}: the main pane area stops at the top of the drawer`, Math.abs(main.bottom - host.top) <= 1 && Math.abs(main.bottom - (H - s.height)) <= 1, `main pane x ${main.top}..${main.bottom}, drawer top ${host.top}, window ${H}, drawer height ${s.height}`);
+    // PR-3 T9: Obsidian copies the main body's classes and variables to a pop-out window's body (and marks it is-popout-window): there the note area keeps its full height.
+    await ev(`document.body.classList.add("is-popout-window")`);
+    const popMain = await rect(".mod-root");
+    await ev(`document.body.classList.remove("is-popout-window")`);
+    check(`T9 ${kind}: a pop-out body with the copied drawer classes keeps the full note area`, Math.round(popMain.bottom) === H, `pop-out main pane ${popMain.top}..${popMain.bottom}, window ${H}`);
+    check(`T1 ${kind}: and the main window's area is shortened again once the marker is gone`, Math.abs((await rect(".mod-root")).bottom - host.top) <= 1, `main pane bottom ${(await rect(".mod-root")).bottom}`);
     check(`G4 ${kind}: pixels agree`, near(img.at(500, y), HOST) && near(img.at(100, y), SIDE) && near(img.at(900, y), SIDE) && near(img.at(100, H - 3), SIDE) && near(img.at(900, H - 3), SIDE), `drawer ${hex(img.at(500, y))}, left sidebar at that row ${hex(img.at(100, y))}, right ${hex(img.at(900, y))}, sidebars' last rows ${hex(img.at(100, H - 3))} ${hex(img.at(900, H - 3))}; the edge shows on the ${kind} tab: ${await ev(`getComputedStyle(document.querySelector(".vscw-edge")).display !== "none"`)}`);
     check(`G4 ${kind}: the edge is on the drawer's top`, (await ev(`document.querySelector(".vscw-edge").hidden`)) === false && Math.abs((await rect(".vscw-edge")).bottom - (host.top + 2)) <= 1, `edge ${JSON.stringify(await rect(".vscw-edge"))}`);
     await click(500, host.top);

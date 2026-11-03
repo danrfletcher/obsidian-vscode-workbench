@@ -73,6 +73,11 @@ export const SPIKE_FILE = "AWS SA Associate Mock Exams/scripts/estimate_time.py"
 /** The least time between two rescans triggered by the window regaining focus (files made outside Obsidian). */
 const FOCUS_RESCAN_MS = 30_000;
 
+/** Whether a start (or restart) that fails raises the failure Notice. The terminal page asks quietly: it shows the reason itself. */
+interface StartNotice {
+  notify: boolean;
+}
+
 interface WorkbenchData extends Partial<WorkbenchSettings> {
   /** Hand-edited; path to a `code` CLI. When set it overrides the instance chosen in the settings tab. */
   codeCliPath?: string;
@@ -122,7 +127,10 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private gate!: LicenceGate;
   private idle!: IdleTimer;
   private serverRequest: Promise<RunningServer> | null = null;
+  /** Whether the start in `serverRequest` shows a failure Notice: false while only the terminal page asked (it shows the reason itself). */
+  private serverFlow: StartNotice = { notify: false };
   private restarting: Promise<void> | null = null;
+  private restartFlow: StartNotice = { notify: false };
   private lastBuild: CodeBuild | null = null;
   /** The instance's settings and keybindings as copied at the last server start; the Code tab seeds its browser profile from it. */
   private copy: UserDataCopy | null = null;
@@ -249,7 +257,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
           activeLeaf: () => this.activeLeaf(),
           isAlive: (leaf) => this.leafIsAlive(leaf),
           focusLeaf: (leaf) => this.focusLeafView(leaf),
-        }) as FocusReturn<unknown>,
+        }),
       });
       this.bridgeToggle = new DrawerToggle(this.drawer);
       this.addCommand({
@@ -535,6 +543,11 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   }
 
   skipCloseGuard(): boolean {
+    return this.ending;
+  }
+
+  /** The plugin is going away for good (Obsidian is quitting, or the plugin unloaded): a start still under way must not go on to show a notice or spawn a server. */
+  private get ending(): boolean {
     return this.quitting || this.unloaded;
   }
 
@@ -639,8 +652,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       vaultRoot: () => this.vaultRoot(),
       licenceAccepted: () => this.gate.accepted,
       requestLicence: () => this.gate.request(),
-      ensureServer: () => this.ensureServer(),
-      restartServer: () => this.restartServer(),
+      // The page shows a failed start's reason itself, with Retry (or in the crash banner): no Notice beside it.
+      ensureServer: () => this.ensureServer({ quiet: true }),
+      restartServer: () => this.restartServer({ quiet: true }),
       failureText: (e) => this.describeStartFailure(e).message,
       notice: (message) => void new Notice(message, 10000),
       isDark: () => this.isDark(),
@@ -722,16 +736,6 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     );
   }
 
-  /** Show the terminal host directly, without the drawer's edge and layout. Starts the server on the first show. */
-  showTerminalHost(): void {
-    this.terminalHostPage()?.show();
-  }
-
-  /** Hide the terminal host. The page stays mounted and alive. */
-  hideTerminalHost(): void {
-    this.terminalHost?.hide();
-  }
-
   // --- Starting the server ------------------------------------------------
 
   /**
@@ -739,38 +743,43 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
    * for the licence; nothing is downloaded before it is accepted. Callers that
    * arrive while it starts share one start, one licence modal and one failure
    * notice. Rejects with LicenceDeclinedError if the licence was declined, or
-   * with the start error (already shown in a Notice) if the server failed.
+   * with the start error (shown in a Notice unless every caller was `quiet`) if the server failed.
+   * A `quiet` caller shows the failure itself (the terminal page does, beside Retry), so the Notice is skipped; as soon as a
+   * caller that is not quiet shares the start, the Notice is raised for the failure.
    */
-  ensureServer(): Promise<RunningServer> {
+  ensureServer(opts: { quiet?: boolean } = {}): Promise<RunningServer> {
     const running = this.manager.current;
     if (running) return Promise.resolve(running);
     if (!this.serverRequest) {
-      const p: Promise<RunningServer> = this.startFlow((o) => this.manager.ensureStarted(o)).finally(() => {
+      const flow: StartNotice = { notify: false };
+      this.serverFlow = flow;
+      const p: Promise<RunningServer> = this.startFlow((o) => this.manager.ensureStarted(o), flow).finally(() => {
         if (this.serverRequest === p) this.serverRequest = null;
       });
       this.serverRequest = p;
     }
+    if (!opts.quiet) this.serverFlow.notify = true;
     return this.serverRequest;
   }
 
-  private async startFlow(start: (o?: StartOptions) => Promise<RunningServer>): Promise<RunningServer> {
+  private async startFlow(start: (o?: StartOptions) => Promise<RunningServer>, flow: StartNotice): Promise<RunningServer> {
     if (!(await this.gate.request())) throw new LicenceDeclinedError();
     // The plugin was unloaded while the licence modal was up: accepting it must not start a server nobody owns.
-    if (this.unloaded) throw new StartCancelledError();
+    if (this.ending) throw new StartCancelledError();
     try {
       const running = await start();
       await this.recordLastServer();
       return running;
     } catch (e) {
       if (e instanceof StartCancelledError) throw e;
-      const failure = this.reportFailure(e);
+      const failure = this.reportFailure(e, flow);
       if (failure.offerReuse && failure.versionChange && (await promptReuseBuild(this.app, failure.versionChange))) {
-        if (this.unloaded) throw new StartCancelledError();
+        if (this.ending) throw new StartCancelledError();
         try {
           // The reused build is not recorded as the last server: it is the old one.
           return await this.manager.ensureStarted({ commitOverride: failure.offerReuse.commit });
         } catch (e2) {
-          if (!(e2 instanceof StartCancelledError)) this.reportFailure(e2);
+          if (!(e2 instanceof StartCancelledError)) this.reportFailure(e2, flow);
           throw e2;
         }
       }
@@ -790,14 +799,17 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     });
   }
 
-  /** Show the Notice for a failed start (token-free) and clear any half-downloaded server. */
-  private reportFailure(e: unknown): StartFailure {
+  /**
+   * Show the Notice for a failed start (token-free) unless the start was the terminal page's alone, and clear any
+   * half-downloaded server either way.
+   */
+  private reportFailure(e: unknown, flow: StartNotice): StartFailure {
     const cliDataDir = path.join(this.runtimeDir(), "cli-data");
     const failure = this.describeStartFailure(e);
     if (failure.kind === "offline-first-run" || failure.kind === "offline-redownload" || failure.kind === "download") {
       removePartialDownloads(cliDataDir, this.cachedBefore);
     }
-    new Notice(failure.message, 15000);
+    if (flow.notify) new Notice(failure.message, 15000);
     return failure;
   }
 
@@ -815,13 +827,13 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     if (!this.gate.accepted) throw new LicenceDeclinedError();
     // Unload does not wait for a start: each await below can finish after the plugin is gone, and nothing
     // may then be written, shown or spawned for it. (ServerManager also drops a server created after a stop.)
-    if (this.unloaded) throw new StartCancelledError();
+    if (this.ending) throw new StartCancelledError();
     const chosen = await this.instanceForStart();
-    if (this.unloaded) throw new StartCancelledError();
+    if (this.ending) throw new StartCancelledError();
     const build = chosen ? findNewestBuild({ override: chosen.cli }) : null;
     if (!chosen || !build) throw new ServerStartError("No VS Code installation found.", null, "", { kind: "missing-binary" });
     const support = await checkServeWebSupport(build.cli);
-    if (this.unloaded) throw new StartCancelledError();
+    if (this.ending) throw new StartCancelledError();
     if (!support.serveWeb) {
       throw new ServerStartError(`${build.cli} has no "serve-web" command.`, null, "", { kind: "no-serve-web", detail: build.cli });
     }
@@ -1018,10 +1030,16 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
    * Stop the server and start a fresh one (new token; the stable port when it is free, else a new port); open Code tabs
    * reload, and the terminal page reloads and says its terminals were lost. Works from every state, the failed and crashed ones
    * included (they never prompt). Asks first when a running server holds unsaved buffers or live terminal shells (`restartPrompt`).
-   * Resolves once running; rejects if it cannot start. Two calls share one restart.
+   * Resolves once running; rejects if it cannot start. Two calls share one restart. A `quiet` caller (the crash banner) shows the
+   * failure itself, so a failed restart raises no Notice unless a caller that is not quiet shares it.
    */
-  restartServer(): Promise<void> {
-    if (this.restarting) return this.restarting;
+  restartServer(opts: { quiet?: boolean } = {}): Promise<void> {
+    if (this.restarting) {
+      if (!opts.quiet) this.restartFlow.notify = true;
+      return this.restarting;
+    }
+    const flow: StartNotice = { notify: !opts.quiet };
+    this.restartFlow = flow;
     const p = (async () => {
       if (this.manager.state === "running") {
         // Both questions are asked once, before the prompt: a server that crashes or a shell that exits while it is open changes
@@ -1033,7 +1051,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       }
       this.profileStale = true; // the user chose to re-read desktop VS Code's state
       try {
-        await this.startFlow((o) => this.manager.restart(o));
+        await this.startFlow((o) => this.manager.restart(o), flow);
       } catch (e) {
         if (e instanceof LicenceDeclinedError) return;
         throw e;

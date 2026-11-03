@@ -13,8 +13,8 @@
 
 export type ToggleState = "hidden" | "revealing" | "shown";
 
-/** How far the terminal page is, as far as the toggle cares. */
-export type ShellProgress = "none" | "starting" | "running" | "ended";
+/** How far the terminal page is (not started, starting, up, or ended with an error), as far as the toggle cares. */
+export type PageProgress = "none" | "starting" | "running" | "ended";
 
 /** The drawer, as the toggle drives it (the terminal drawer in the plugin; a fake in the tests). */
 export interface ToggleTarget {
@@ -22,7 +22,7 @@ export interface ToggleTarget {
   hotkeyEnabled(): boolean;
   readonly isOpen: boolean;
   toggle(): void;
-  shellProgress(): ShellProgress;
+  pageProgress(): PageProgress;
 }
 
 /** What has focus when the key arrives: the embed, which can give focus up and take it back. */
@@ -33,8 +33,8 @@ export interface FocusHandle {
 
 export function toggleState(target: ToggleTarget): ToggleState {
   if (!target.isOpen) return "hidden";
-  const shell = target.shellProgress();
-  return shell === "none" || shell === "starting" ? "revealing" : "shown";
+  const page = target.pageProgress();
+  return page === "none" || page === "starting" ? "revealing" : "shown";
 }
 
 export class DrawerToggle {

@@ -944,7 +944,7 @@ try {
 } catch (e) {
   console.error(neverPainted ? `a page never painted: ${e.message}` : `terminal spike could not finish: ${e.stack ?? e}`);
   await stopAll();
-  process.exit(neverPainted ? 2 : 2);
+  process.exit(2);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1065,7 +1065,10 @@ setInterval(() => {}, 1000);
     await br.close();
     // clean up what survived: the nohup process (started through the terminal by this script), and anything of ours left
     if (nohupBefore && isAlive(nohupBefore.pid)) await stopPid(nohupBefore.pid);
-    for (const r of psRows().filter((r) => r.command.includes(rt.tokenFile))) if (isAlive(r.pid)) { try { process.kill(r.pid, "SIGKILL"); } catch { /* gone */ } }
+    // anything of the server's tree that survived, stopped by PID: the pids this script saw under the server before the
+    // force-quit, and only while the pid still shows the command it had then (a reused pid is left alone)
+    const nowCommand = new Map(psRows().map((r) => [r.pid, r.command]));
+    for (const t of view0.tree) if (nowCommand.get(t.pid) === t.command && isAlive(t.pid)) { try { process.kill(t.pid, "SIGKILL"); } catch { /* gone */ } }
     started.delete(ids.server);
     started.delete(nohupBefore?.pid);
     log(`S6 ${scenario}:`, JSON.stringify({ afterQuit: { server: afterQuit.serverWrapperAlive, shells: afterQuit.interactiveShellsAlive, http: afterQuit.httpServerAnswers, nohup: afterQuit.nohupProcessAlive }, sweep: sweepResult, afterSweep: { server: afterSweep.serverProcessesAlive, shells: afterSweep.interactiveShellsAlive, http: afterSweep.httpServerAnswers, nohup: afterSweep.nohupProcessAlive } }));

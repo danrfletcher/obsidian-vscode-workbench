@@ -418,13 +418,16 @@ describe("G16: the bridge inside the terminal host page", () => {
   /**
    * The real host page, made by the real plugin path (licence accepted, the fake server running): its webview element is
    * given the pieces a real <webview> has (`executeJavaScript`, `getURL`), and a stub page that runs the real key script
-   * and reports back as a console line. The plugin's own `attachKeys` wiring decides whether any of it is watched.
+   * and reports back as a console line. The plugin's own `attachKeys` wiring decides whether any of it is watched. The drawer is
+   * open when this returns.
    */
   async function realHostFrame(): Promise<{ el: HTMLElement; page: StubEmbed; scripts: string[] }> {
     await loadPlugin({}, true);
     const server = await plugin.ensureServer();
     const page = new StubEmbed(server.baseUrl, "webview");
-    (plugin as unknown as { showTerminalHost(): void }).showTerminalHost();
+    // the page is made the way a user's first Ctrl+` makes it: the drawer opens and opens the host with it
+    const drawer = (plugin as unknown as { drawer: { toggle(): void } }).drawer;
+    drawer.toggle();
     const host = () => (plugin as unknown as { terminalHost: { webview: HTMLElement | null } | null }).terminalHost;
     await waitUntil(() => host()?.webview != null);
     const el = host()!.webview as HTMLElement & { executeJavaScript?: unknown; getURL?: unknown };
@@ -451,7 +454,6 @@ describe("G16: the bridge inside the terminal host page", () => {
     expect(scripts).toHaveLength(1);
     page.load(false); // the page's own window gets the script
     page.inject(scripts[0]);
-    (plugin as unknown as { drawer: { openDrawer(): void } }).drawer.openDrawer();
     expect(drawerOpen()).toBe(true);
     const ev = page.press({ key: "`", ctrlKey: true });
     expect(ev.prevented).toBe(1);
@@ -466,7 +468,6 @@ describe("G16: the bridge inside the terminal host page", () => {
     const { el, scripts } = await realHostFrame();
     el.dispatchEvent(new Event("dom-ready"));
     expect(scripts.join("")).not.toMatch(/TOKEN-NOT-FOR-LOGS|127\.0\.0\.1|tkn/);
-    (plugin as unknown as { drawer: { openDrawer(): void } }).drawer.openDrawer();
     el.dispatchEvent(Object.assign(new Event("console-message"), { message: '__vscw_key__:{"v":1,"action":"toggle-terminal"}' }));
     el.dispatchEvent(Object.assign(new Event("console-message"), { message: '__vscw_key__:{"v":1,"action":"toggle-terminal","n":"guess"}' }));
     expect(drawerOpen()).toBe(true);
@@ -485,7 +486,6 @@ describe("G16: the bridge inside the terminal host page", () => {
     page.load(false);
     page.inject(scripts[1]);
     expect(page.press({ key: "`", ctrlKey: true }).prevented).toBe(0);
-    (plugin as unknown as { drawer: { openDrawer(): void } }).drawer.openDrawer();
     expect(page.press({ key: "j", ctrlKey: true, altKey: true }).prevented).toBe(1);
     expect(drawerOpen()).toBe(false);
   });

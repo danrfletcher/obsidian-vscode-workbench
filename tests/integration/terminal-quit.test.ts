@@ -14,7 +14,8 @@ import { WorkbenchServer, type CodeBuild } from "../../src/server";
 import { ServerManager } from "../../src/server-manager";
 import { Modal, Notice, Plugin, Tasks } from "../mocks/obsidian";
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
-import { FAKE_CODE, isAlive, listenersOn, tempDir } from "../helpers";
+import { STARTING_TEXT } from "../../src/terminal-host/host-page";
+import { FAKE_CODE, isAlive, listenersOn, tempDir, openTerminal } from "../helpers";
 import { installFakeDocument, makeHostApp } from "../fake-host-page";
 
 const build: CodeBuild = { cli: FAKE_CODE, version: [1, 0, 0], versionText: "1.0.0", extensionsDir: null };
@@ -134,14 +135,14 @@ describe("the plugin: quit and unload", () => {
   }
   const host = () => (plugin as unknown as { terminalHost: { settled(): Promise<void> } }).terminalHost;
   afterEach(() => {
-    for (const k of ["FAKE_CODE_NODE", "FAKE_CODE_PIDFILE", "FAKE_CODE_SHELLS", "FAKE_CODE_SHELL_KINDS"]) delete process.env[k];
+    for (const k of ["FAKE_CODE_NODE", "FAKE_CODE_PIDFILE", "FAKE_CODE_SHELLS", "FAKE_CODE_SHELL_KINDS", "FAKE_CODE_HELP_DELAY"]) delete process.env[k];
     vi.unstubAllGlobals();
   });
 
   it("Obsidian's quit: no prompt, and the page, server and every shell are gone when the quit task ends", async () => {
     const d = installFakeDocument();
     await load();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host().settled();
     const p = await allChildrenListed();
     const tasks = new Tasks();
@@ -161,10 +162,38 @@ describe("the plugin: quit and unload", () => {
     expect(isAlive(p.setsid[0])).toBe(true); // the documented exception
   });
 
+  it("Obsidian's quit while the terminal page shows \"Starting VS Code server...\" is harmless: no prompt, no notice, no banner, no server left, state stopped", async () => {
+    const d = installFakeDocument();
+    await load();
+    process.env.FAKE_CODE_HELP_DELAY = "1"; // `serve-web --help` takes a second to answer, so the start is still in its first step when Obsidian quits
+    openTerminal(plugin);
+    await vi.waitFor(() => expect(d.text()).toContain(STARTING_TEXT), { timeout: 5000, interval: 20 });
+    const manager = (plugin as unknown as { manager: ServerManager }).manager;
+    expect(manager.state).toBe("starting");
+    expect(pids().servers).toEqual([]); // nothing has been spawned yet
+    Notice.reset();
+    const tasks = new Tasks();
+    for (const e of Plugin.events.filter((x) => x.name === "quit")) e.cb(tasks);
+    expect(tasks.fns).toHaveLength(1);
+    await tasks.runAll();
+
+    expect(Modal.opened).toHaveLength(0);
+    expect(manager.state).toBe("stopped"); // cancelled: not "failed", not "crashed"
+    // the start that was in flight finishes its `--help` after the quit: it must not go on to make a server nobody owns
+    await new Promise((r) => setTimeout(r, 2500));
+    expect(pids().servers).toEqual([]);
+    expect(manager.state).toBe("stopped");
+    expect(Notice.messages).toEqual([]);
+    expect(d.text()).not.toContain("stopped unexpectedly");
+    expect(d.text()).not.toContain("could not");
+    expect(d.text()).not.toContain("lost");
+    expect(d.webviews).toHaveLength(0);
+  });
+
   it("onunload (disabling the plugin): no prompt, the page, server and shells end, no banner and no reload", async () => {
     const d = installFakeDocument();
     await load();
-    plugin.showTerminalHost();
+    openTerminal(plugin);
     await host().settled();
     const p = await allChildrenListed();
     plugin.onunload();

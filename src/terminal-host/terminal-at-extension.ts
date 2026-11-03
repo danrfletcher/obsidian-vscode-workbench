@@ -131,7 +131,16 @@ exports.activate = (ctx) => {
 /** The extension's code with the usual wait for the page's first terminal. */
 export const EXTENSION_JS = extensionSource(FIRST_TERMINAL_WAIT_MS);
 
-/** The extension's manifest. It contributes one setting, which the terminal page's own profile sets to true. */
+/**
+ * The extension's manifest. It contributes one setting, which the terminal page's own profile sets to true.
+ *
+ * `capabilities.untrustedWorkspaces.supported: true` is required: VS Code does not activate an extension that has a `main`
+ * entry and no such declaration while Workspace Trust is on and the folder is not trusted (Restricted Mode). Everything the
+ * page's panel-only layout and "New terminal at folder" do runs in this extension, and terminals are allowed in Restricted
+ * Mode, so without it a page whose trust record was not seeded (the vault-trust setting is off, or the seed could not be
+ * built) would never become panel-only and would not open a terminal at a chosen folder. The extension only runs VS Code's own
+ * layout and terminal commands.
+ */
 export function extensionManifest(): Record<string, unknown> {
   return {
     name: EXTENSION_NAME,
@@ -141,6 +150,7 @@ export function extensionManifest(): Record<string, unknown> {
     main: "./extension.js",
     activationEvents: ["onStartupFinished"],
     extensionKind: ["workspace"],
+    capabilities: { untrustedWorkspaces: { supported: true } },
     contributes: {
       configuration: {
         properties: {
