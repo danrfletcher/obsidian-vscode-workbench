@@ -62,6 +62,7 @@ import { addNewTerminalItem, type MenuLike, type MenuTarget } from "./terminal/n
 import { TerminalDrawer } from "./terminal/terminal-drawer";
 import { TerminalHostPage } from "./terminal-host/host-page";
 import { newTerminalAtFolder } from "./terminal-host/new-terminal";
+import { requestPanel } from "./terminal-host/terminal-at-extension";
 import { TabRegistry } from "./tab-registry";
 import { decideFile, extensionOf, fileName, opensInCodeTab } from "./text-file-rules";
 import { isDarkBody, themeSwitchMessage, ThemeSync } from "./theme-map";
@@ -689,6 +690,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       noteTrustOutcome: (outcome) => this.noteTrustOutcome(outcome),
       attachKeys: (frame) => this.keyRelay?.attach(frame as unknown as RelayFrame) ?? (() => undefined),
       closedByHost: () => this.drawer?.hostClosed(),
+      requestPanel: () => this.requestTerminalPanel(),
       // The page was created, became ready or lost its page, failed or was closed: what the idle clock sees may have changed.
       stateChanged: () => void this.idle?.evaluate(),
     });
@@ -729,6 +731,18 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private endTerminalPage(): void {
     this.terminalHost?.dispose();
     this.terminalHost = null;
+  }
+
+  /** The terminal page's panel was closed in the page and the drawer is opening again: ask the page's extension to bring it back. */
+  private requestTerminalPanel(): boolean {
+    const dataDir = this.manager.current ? (this.manager.serverInstance?.serverDataDir ?? null) : null;
+    if (dataDir === null) return false;
+    try {
+      requestPanel(dataDir);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** The file explorer's menu is being built: add the item that opens a terminal in the folder (or the file's folder). */

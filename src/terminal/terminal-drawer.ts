@@ -15,7 +15,7 @@
 import type { PageProgress, ToggleTarget } from "../hotkey/drawer-toggle";
 import type { HostView } from "../terminal-host/host-state";
 import { BottomEdge } from "./bottom-edge";
-import { clampHeight } from "./drawer-geometry";
+import { clampHeight, dragHeight, settleHeight } from "./drawer-geometry";
 import { drawerVisibility, type ViewKind, type Visibility } from "./drawer-visibility";
 import type { FocusHandoff } from "./focus-return";
 import { LayoutController } from "./layout";
@@ -47,7 +47,10 @@ export interface TerminalDrawerOptions {
 }
 
 export class TerminalDrawer implements ToggleTarget {
+  /** The height the drawer shows now. It follows the pointer during a drag, all the way down to 0; otherwise it equals `rest`. */
   private height: number;
+  /** The height the drawer keeps (never under MIN_HEIGHT): what a click opens at, and what is saved. A drag only changes it when it ends. */
+  private rest: number;
   private open = false;
   private disposed = false;
   /** A drag opened the drawer: focus goes into the terminal when the drag ends, not while it runs (see openDrawer). */
@@ -58,6 +61,7 @@ export class TerminalDrawer implements ToggleTarget {
 
   constructor(private readonly opts: TerminalDrawerOptions) {
     this.height = opts.initialHeight;
+    this.rest = opts.initialHeight;
   }
 
   // --- ToggleTarget (the hotkey bridge) ------------------------------------------------------------------------
@@ -135,15 +139,17 @@ export class TerminalDrawer implements ToggleTarget {
     else this.openDrawer();
   }
 
-  openDrawer(): void {
+  /** Open the drawer. `shownHeight` is the height to show at first when a drag opens it; absent, the drawer opens at its kept height. */
+  openDrawer(shownHeight?: number): void {
     const host = this.disposed ? null : this.opts.host();
     if (!host || this.open) return;
     // The window may have shrunk since the height was saved (E9).
-    const clamped = clampHeight(this.height, this.opts.window.innerHeight);
-    if (clamped !== this.height) {
-      this.height = clamped;
+    const clamped = clampHeight(this.rest, this.opts.window.innerHeight);
+    if (clamped !== this.rest) {
+      this.rest = clamped;
       this.opts.saveHeight(clamped);
     }
+    this.height = shownHeight ?? this.rest;
     this.opts.focus.remember(); // before the terminal takes focus
     this.open = true;
     this.apply();
@@ -154,17 +160,30 @@ export class TerminalDrawer implements ToggleTarget {
     else host.focusTerminal();
   }
 
-  /** A drag that moved has ended: the height is final, and a drag that opened the drawer now hands focus to the terminal. */
+  /**
+   * A drag that moved has ended. Dragged down to nothing (under COLLAPSE_HEIGHT) the drawer closes and keeps the height it had.
+   * Otherwise the height is final (never under MIN_HEIGHT) and saved, and a drag that opened the drawer now hands focus to the terminal.
+   */
   private resizeEnded(): void {
-    this.opts.saveHeight(this.height);
+    if (!this.open) return;
+    const settled = settleHeight(this.height, this.opts.window.innerHeight);
+    if (settled === null) {
+      this.close();
+      return;
+    }
+    this.rest = settled;
+    this.height = settled;
+    this.apply();
+    this.opts.saveHeight(settled);
     const focus = this.focusAfterDrag;
     this.focusAfterDrag = false;
-    if (focus && this.open && !this.disposed) this.opts.host()?.focusTerminal();
+    if (focus && !this.disposed) this.opts.host()?.focusTerminal();
   }
 
   close(): void {
     if (!this.open) return;
     this.open = false;
+    this.height = this.rest;
     this.focusAfterDrag = false;
     this.opts.host()?.hide();
     this.apply();
@@ -175,6 +194,7 @@ export class TerminalDrawer implements ToggleTarget {
   hostClosed(): void {
     if (!this.open) return;
     this.open = false;
+    this.height = this.rest;
     this.focusAfterDrag = false;
     this.apply();
     this.opts.focus.restore();
@@ -199,12 +219,14 @@ export class TerminalDrawer implements ToggleTarget {
 
   // --- Resizing -------------------------------------------------------------------------------------------------
 
-  /** A drag asks for `wanted` px. A closed drawer opens first. */
+  /**
+   * A drag asks for `wanted` px. The drawer follows the pointer between 0 and the tallest it may be; a closed drawer opens
+   * first, at that height. The drag's end decides between closing and keeping the height (resizeEnded).
+   */
   private resizeTo(wanted: number): void {
-    const next = clampHeight(wanted, this.opts.window.innerHeight);
+    const next = dragHeight(wanted, this.opts.window.innerHeight);
     if (!this.open) {
-      this.height = next;
-      this.openDrawer();
+      this.openDrawer(next);
       return;
     }
     if (next === this.height) return;
@@ -214,9 +236,10 @@ export class TerminalDrawer implements ToggleTarget {
 
   /** The window changed size: a drawer taller than the new maximum shrinks to it, and the corrected height is saved (E9). */
   private windowResized(): void {
-    const next = clampHeight(this.height, this.opts.window.innerHeight);
-    if (next === this.height) return;
-    this.height = next;
+    const next = clampHeight(this.rest, this.opts.window.innerHeight);
+    if (next === this.rest) return;
+    this.rest = next;
+    if (!this.edge?.dragging) this.height = next; // a drag in progress keeps following the pointer, and its end settles the height
     this.apply();
     this.opts.saveHeight(next);
   }

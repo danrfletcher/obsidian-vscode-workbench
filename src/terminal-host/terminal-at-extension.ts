@@ -17,7 +17,8 @@
  *  - a host runs each request id once.
  *
  * Panel-only (F2, S1): the extension also puts the page in its panel-only layout itself, once per page load and before it takes any
- * request, with VS Code's own commands: close the side bar, close the secondary side bar, focus the terminal (which opens the
+ * request (and again for a request with `panel: true`, made when the panel was closed with the X in the page), with VS Code's own
+ * commands: close the side bar, close the secondary side bar, focus the terminal (which opens the
  * panel and starts the page's first shell when there is none). They are commands, not key presses: they need no focus and no
  * key binding, and running them again changes nothing. A command VS Code does not know yet (the workbench is still starting) is
  * asked again after a short wait. The host page only waits for the layout to be panel-only.
@@ -110,6 +111,13 @@ exports.activate = (ctx) => {
       try { req = JSON.parse(fs.readFileSync(file, "utf8")); } catch { continue; }
       if (!req || typeof req.id !== "string" || done.has(req.id)) continue;
       done.add(req.id);
+      // A panel request: the plugin found the panel closed (the X in the page's panel) and wants it back. No terminal is asked for;
+      // the focus command opens the panel and starts a shell only when there is none.
+      if (req.panel === true) {
+        await panelOnly();
+        try { fs.unlinkSync(file); } catch { /* already gone */ }
+        continue;
+      }
       const adopt = req.adoptFirst === true && firstPage;
       firstPage = false;
       const own = adopt ? await pageTerminals() : [];
@@ -212,6 +220,8 @@ export function installTerminalAtExtension(serverDataDir: string): void {
 export interface TerminalRequest {
   /** The folder as a path: passed to VS Code as the `cwd` argument. Absent: VS Code's own default start folder. */
   cwd: string | null;
+  /** The request is not for a terminal: it puts the page back in its panel-only layout (see `requestPanel`). `cwd` is then null. */
+  panel?: boolean;
   /** The click that made this request also started the terminal page: take the place of the page's own first terminal (see the top of this file). */
   adoptFirst?: boolean;
 }
@@ -228,11 +238,20 @@ export function writeTerminalRequest(serverDataDir: string, request: TerminalReq
   fs.mkdirSync(requests, { recursive: true });
   const id = randomBytes(8).toString("hex");
   const name = `${String(now()).padStart(15, "0")}-${String(sequence++).padStart(6, "0")}-${id}`;
-  const body: { id: string; cwd?: string; adoptFirst?: true } = { id };
+  const body: { id: string; cwd?: string; adoptFirst?: true; panel?: true } = { id };
+  if (request.panel === true) body.panel = true;
   if (request.cwd !== null) body.cwd = request.cwd;
   if (request.adoptFirst === true) body.adoptFirst = true;
   const temp = path.join(requests, `.${name}.tmp`);
   fs.writeFileSync(temp, JSON.stringify(body));
   fs.renameSync(temp, path.join(requests, `${name}.json`));
   return id;
+}
+
+/**
+ * Ask the extension to put the page back in its panel-only layout, after the panel was closed from inside the page (the X in
+ * VS Code's panel). It runs the same commands as at page load. Returns the request id.
+ */
+export function requestPanel(serverDataDir: string, now: () => number = Date.now): string {
+  return writeTerminalRequest(serverDataDir, { cwd: null, panel: true }, now);
 }

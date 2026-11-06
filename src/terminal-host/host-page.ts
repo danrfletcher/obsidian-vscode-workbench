@@ -18,7 +18,7 @@ import { buildTrustSeedScript } from "../trust/trust-seed";
 import { buildFileUri } from "../paths";
 import { INITIAL_HOST_STATE, hostView, reduceHost, type HostEffect, type HostEvent, type HostState, type HostView } from "./host-state";
 import { buildTerminalHostUrl, hostOriginUrl, hostSettings, TERMINAL_PARTITION } from "./host-url";
-import { LAYOUT_SCRIPT, isPainted, isPanelOnly, parseLayout, type PageLayout } from "./panel-only";
+import { LAYOUT_SCRIPT, isPainted, isPanelOnly, parseLayout, partShown, type PageLayout } from "./panel-only";
 
 export const STARTING_TEXT = "Starting VS Code server...";
 export const LICENCE_TEXT = "Waiting for the VS Code server licence...";
@@ -79,7 +79,13 @@ export interface TerminalHostDeps {
   noteTrustOutcome?(outcome: string): void;
   /** Start watching the page's keys for the bridged chords (the plugin's key relay); returns the function that stops. Absent: no bridge. */
   attachKeys?(frame: HTMLElement): () => void;
-  /** The host hid itself (the licence was declined), not because `hide` was called: the drawer closes. */
+  /**
+   * Put the page back in its panel-only layout after its panel was closed from inside the page (the X in VS Code's panel): the plugin
+   * asks the extension in the page for it. Returns false when the request could not be made (no running server, or the file could not
+   * be written); the page is then shown as it is.
+   */
+  requestPanel?(): boolean;
+  /** The host hid itself (the licence was declined, or the page's panel was closed), not because `hide` was called: the drawer closes. */
   closedByHost?(): void;
   /** The host's phase changed (a start began, the page is ready or was lost, a start failed, the host was closed): the plugin re-reads the idle clock's inputs. */
   stateChanged?(): void;
@@ -87,6 +93,8 @@ export interface TerminalHostDeps {
   pollMs?: number;
   loadMs?: number;
   panelMs?: number;
+  /** How often a ready page is checked for a panel that was closed in it. */
+  panelWatchMs?: number;
 }
 
 const POLL_MS = 200;
@@ -97,6 +105,8 @@ const LOAD_MS = 90_000;
  * fresh profile is slow, so this is generous.
  */
 const PANEL_MS = 30_000;
+/** How often a ready page is asked whether its terminal panel is still there. */
+const PANEL_WATCH_MS = 500;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -128,6 +138,13 @@ export class TerminalHostPage {
   /** The drawer opened before the page was ready: focus goes into the terminal when it is. */
   private focusWhenReady = false;
   private detachKeys: (() => void) | null = null;
+  /** The page's panel was closed from inside it (the X): the next show asks for it back before it shows the page. */
+  private panelClosed = false;
+  /** The panel was asked for and has not come back yet: the drawer says it is starting rather than show a blank VS Code. */
+  private restoring = false;
+  private restoreToken = 0;
+  private panelWatch: ReturnType<typeof setInterval> | null = null;
+  private panelChecking = false;
 
   constructor(private readonly deps: TerminalHostDeps) {
     this.themeSync = new ThemeSync((dark) => this.applyTheme(dark), deps.isDark());
@@ -188,6 +205,7 @@ export class TerminalHostPage {
   // --- the small internal API (the drawer in `terminal/terminal-drawer.ts` drives it) ---------------------------
 
   show(): void {
+    if (this.panelClosed && this.ready() && !this.state.visible) this.restorePanel();
     this.dispatch({ type: "show", licenceAccepted: this.deps.licenceAccepted() });
   }
 
@@ -353,6 +371,7 @@ export class TerminalHostPage {
       await this.mount(server);
       if (abandoned()) return;
       this.finish({ type: "ready" });
+      this.watchPanel(); // after `ready`: from here a missing panel means the user closed it
       if (this.focusWhenReady && this.state.visible) this.runFocus(); // the drawer opened while the page was loading
     } catch (e) {
       if (abandoned()) return;
@@ -484,10 +503,62 @@ export class TerminalHostPage {
     }
   }
 
+  /**
+   * Watch a ready page for a panel that is no longer there: the X in VS Code's terminal panel closes it, and the page is then a
+   * blank workbench that nothing can close (the drawer's edge is the only way, and the page behind it shows no terminal). A page
+   * that is not painted (loading, reloading) says nothing, so only a painted page without its panel counts.
+   */
+  private watchPanel(): void {
+    if (this.panelWatch) return;
+    this.panelWatch = setInterval(() => void this.checkPanel(), this.deps.panelWatchMs ?? PANEL_WATCH_MS);
+  }
+
+  private async checkPanel(): Promise<void> {
+    const el = this.page;
+    if (!el || !this.pageReady || this.restoring || this.panelClosed || this.panelChecking || this.state.disposed) return;
+    this.panelChecking = true;
+    try {
+      const layout = await this.readLayout(el).catch(() => null);
+      if (!layout || this.page !== el || !this.pageReady || this.restoring || this.state.disposed) return;
+      if (isPainted(layout) && !partShown(layout, "panel")) {
+        this.panelClosed = true;
+        this.dispatch({ type: "panel-closed" }); // hides the page; the drawer follows (closedByHost)
+      }
+    } finally {
+      this.panelChecking = false;
+    }
+  }
+
+  /** The drawer is opening on a page whose panel was closed: ask for the panel, and say "starting" until it is back. */
+  private restorePanel(): void {
+    this.panelClosed = false;
+    const el = this.page;
+    if (!el || !(this.deps.requestPanel?.() ?? false)) return;
+    const token = ++this.restoreToken;
+    this.restoring = true;
+    void (async () => {
+      try {
+        await this.until(() => this.readLayout(el), (l) => isPanelOnly(l), this.deps.panelMs ?? PANEL_MS);
+      } catch {
+        /* the page was replaced or the host unloaded: whatever replaced it owns the display */
+      } finally {
+        if (this.restoreToken === token) {
+          this.restoring = false;
+          this.render();
+        }
+      }
+    })();
+  }
+
   private removePage(): void {
     const el = this.page;
     this.page = null;
     this.pageReady = false;
+    this.panelClosed = false;
+    this.restoring = false;
+    this.restoreToken++;
+    if (this.panelWatch) clearInterval(this.panelWatch);
+    this.panelWatch = null;
     this.detachKeys?.();
     this.detachKeys = null;
     el?.remove();
@@ -518,11 +589,11 @@ export class TerminalHostPage {
     this.container.style.visibility = visible ? "visible" : "hidden";
     this.container.style.pointerEvents = visible ? "auto" : "none";
 
-    const key = `${phase}|${error ?? ""}|${lostCause ?? ""}`;
+    const key = `${phase}|${error ?? ""}|${lostCause ?? ""}|${this.restoring}`;
     if (key !== this.statusKey) {
       this.statusKey = key;
       this.status.replaceChildren();
-      const text = phase === "starting" ? STARTING_TEXT : phase === "licence" ? LICENCE_TEXT : phase === "error" ? (error ?? "") : "";
+      const text = phase === "starting" || (this.restoring && phase !== "error" && phase !== "crashed") ? STARTING_TEXT : phase === "licence" ? LICENCE_TEXT : phase === "error" ? (error ?? "") : "";
       this.status.style.display = text === "" ? "none" : "flex";
       if (text !== "") {
         const line = this.deps.createElement("div");
