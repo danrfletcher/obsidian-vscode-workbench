@@ -211,7 +211,17 @@ describe("the extension, the request and the seed", () => {
     const written = py<string>(`print(json.dumps(m.write_request(a["dir"], m.build_request("r1", a["folder"]), a["tmp"]), ensure_ascii=False))`, { dir, tmp, folder });
     expect(written).toBe(path.join(dir, "request.json"));
     expect(fs.readdirSync(tmp)).toEqual([]);
-    await vi.waitFor(() => expect(calls).toEqual([["workbench.action.terminal.newWithCwd", { cwd: folder }]]));
+    // fs.watch can still be coming alive when the request is written, and an event in that window is never reported (the extension
+    // has no timer to re-scan). While the request is unread, touch it now and then: a live watcher reports that and the extension reads it.
+    const request = path.join(dir, "request.json");
+    let last = 0;
+    await vi.waitFor(() => {
+      if (calls.length === 0 && fs.existsSync(request) && Date.now() - last > 250) {
+        last = Date.now();
+        try { const now = new Date(); fs.utimesSync(request, now, now); } catch { /* the extension read it just now */ }
+      }
+      expect(calls).toEqual([["workbench.action.terminal.newWithCwd", { cwd: folder }]]);
+    }, { timeout: 10_000, interval: 10 });
     await vi.waitFor(() => expect(fs.existsSync(path.join(dir, "request.json"))).toBe(false));
   });
 

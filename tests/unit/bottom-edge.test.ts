@@ -5,7 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BottomEdge, CLICK_SLOP } from "../../src/terminal/bottom-edge";
-import { DEFAULT_HEIGHT, HEADROOM, MIN_HEIGHT } from "../../src/terminal/drawer-geometry";
+import { COLLAPSE_HEIGHT, DEFAULT_HEIGHT, HEADROOM, MIN_HEIGHT } from "../../src/terminal/drawer-geometry";
 import { FocusReturn } from "../../src/terminal/focus-return";
 import { TerminalDrawer, type DrawerHost } from "../../src/terminal/terminal-drawer";
 
@@ -332,13 +332,90 @@ describe("the edge driving the real drawer (G1, G3, E9)", () => {
     expect(order).toEqual(["show", "focus"]);
   });
 
-  it("dragging to the top stops at the window height minus the headroom; to the bottom stops at the minimum", () => {
+  it("dragging to the top stops at the window height minus the headroom", () => {
     makeDrawer();
     drag(800, -2000);
     expect(drawer.currentHeight).toBe(900 - HEADROOM);
-    drag(100, 5000);
+  });
+
+  it("dragging down to the bottom of the window follows the pointer to 0 height, with no minimum in the way, and closes the drawer on release", () => {
+    makeDrawer();
+    click(); // open at 300
+    order.length = 0;
+    edgeEl().dispatchEvent(pointer("pointerdown", { y: 600 }));
+    window.dispatchEvent(pointer("pointermove", { y: 700 })); // 100 px down: 200
+    expect(drawer.currentHeight).toBe(200);
+    window.dispatchEvent(pointer("pointermove", { y: 850 })); // 250 px down: 50, under the old minimum of 120
+    expect(drawer.currentHeight).toBe(50);
+    expect(document.body.style.getPropertyValue("--vscw-open-height")).toBe("50px");
+    window.dispatchEvent(pointer("pointermove", { y: 5000 })); // far past the bottom of the window
+    expect(drawer.currentHeight).toBe(0);
+    expect(document.body.style.getPropertyValue("--vscw-open-height")).toBe("0px");
+    expect(drawer.isOpen).toBe(true); // still following the pointer
+    window.dispatchEvent(pointer("pointerup", { y: 5000, buttons: 0 }));
+    expect(drawer.isOpen).toBe(false);
+    expect(host.hides).toBe(1);
+    expect(order).toEqual(["hide"]);
+    expect(document.body.classList.contains("vscw-drawer-open")).toBe(false);
+    expect(document.body.style.getPropertyValue("--vscw-open-height")).toBe("0px");
+    expect(saved).toEqual([]); // the height it had is kept, nothing is saved as 0
+  });
+
+  it("after a drag closed it, the drawer opens again at the height it had, by a click and by a drag up from the bottom", () => {
+    makeDrawer(450);
+    click();
+    drag(500, 5000);
+    expect(drawer.isOpen).toBe(false);
+    expect(drawer.currentHeight).toBe(450);
+    expect(document.body.style.getPropertyValue("--vscw-height")).toBe("450px");
+    click();
+    expect(drawer.isOpen).toBe(true);
+    expect(document.body.style.getPropertyValue("--vscw-open-height")).toBe("450px");
+    drag(500, 5000);
+    drag(895, 695); // press at the bottom edge of the window, drag 200 px up
+    expect(drawer.isOpen).toBe(true);
+    expect(drawer.currentHeight).toBe(200);
+    expect(saved).toEqual([200]);
+  });
+
+  it("dragging up from the bottom of a closed drawer opens it at once and grows with the pointer from 0, not from the minimum", () => {
+    makeDrawer();
+    edgeEl().dispatchEvent(pointer("pointerdown", { y: 895 }));
+    window.dispatchEvent(pointer("pointermove", { y: 885 })); // 10 px up: past the click slop
+    expect(drawer.isOpen).toBe(true);
+    expect(host.shows).toBe(1);
+    expect(drawer.currentHeight).toBe(10);
+    expect(document.body.style.getPropertyValue("--vscw-open-height")).toBe("10px");
+    window.dispatchEvent(pointer("pointermove", { y: 795 }));
+    expect(drawer.currentHeight).toBe(100);
+    window.dispatchEvent(pointer("pointermove", { y: 595 }));
+    expect(drawer.currentHeight).toBe(300);
+    expect(saved).toEqual([]);
+    window.dispatchEvent(pointer("pointerup", { y: 595, buttons: 0 }));
+    expect(saved).toEqual([300]);
+    expect(host.shows).toBe(1);
+    expect(order).toEqual(["show", "focus"]);
+  });
+
+  it("a drag that ends with the drawer under the collapse height closes it; one that ends above it but under the minimum keeps the minimum", () => {
+    makeDrawer();
+    click();
+    drag(600, 600 + (DEFAULT_HEIGHT - (COLLAPSE_HEIGHT - 1))); // leaves one px under the collapse height
+    expect(drawer.isOpen).toBe(false);
+    expect(drawer.currentHeight).toBe(DEFAULT_HEIGHT);
+    click();
+    drag(600, 600 + (DEFAULT_HEIGHT - COLLAPSE_HEIGHT)); // leaves exactly the collapse height
+    expect(drawer.isOpen).toBe(true);
     expect(drawer.currentHeight).toBe(MIN_HEIGHT);
     expect(saved.at(-1)).toBe(MIN_HEIGHT);
+  });
+
+  it("a drag up from the bottom that is let go almost at once closes the drawer again (a flick is not a tiny drawer)", () => {
+    makeDrawer();
+    drag(895, 880);
+    expect(drawer.isOpen).toBe(false);
+    expect(host.hides).toBe(1);
+    expect(saved).toEqual([]);
   });
 
   it("a drag does not toggle on release: an open drawer stays open", () => {

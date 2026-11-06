@@ -210,27 +210,28 @@ try {
   check("G1 drag opens", s.open && s.height === 300 && Math.round(host.height) === 300 && Math.round(host.bottom) === H, `state ${JSON.stringify(s)}; host box ${Math.round(host.left)}..${Math.round(host.right)} x ${Math.round(host.top)}..${Math.round(host.bottom)}`);
   check("G1 drawer shows over the main pane", near(img.at(500, host.top + 50), HOST) && near(img.at(500, host.top - 20), MAIN), `pixel in the drawer ${hex(img.at(500, host.top + 50))}, pixel above it ${hex(img.at(500, host.top - 20))}`);
 
-  // G3 / C30: drag to the top of the window: stops 160 px below it. Drag to the bottom: stops at 120 px. Close and reopen: kept.
+  // G3 / C30: drag to the top of the window: stops 160 px below it. Drag to the bottom: the drawer follows the pointer down to
+  // nothing and closes on release, keeping the height it had for the next open. Reopen: kept.
   await dragTo(500, host.top, 0);
   s = await state();
   host = await rect(".vscode-workbench-terminal-host");
   await shot("g3-1-top");
   check("G3 top: stops 160 px below the window top", Math.round(host.top) === 160 && s.height === H - 160, `drawer top ${host.top}, height ${s.height}`);
+  const keptHeight = s.height;
   await dragTo(500, host.top, H - 1);
   s = await state();
-  host = await rect(".vscode-workbench-terminal-host");
   await shot("g3-2-bottom");
-  check("G3 bottom: stops at 120 px", s.height === 120 && Math.round(host.height) === 120 && s.open, `height ${s.height}, host height ${host.height}`);
-  await click(500, host.top);
-  s = await state();
-  check("G1 click closes", !s.open && s.cssOpen === "0px", `state ${JSON.stringify(s)}`);
+  check("G3 bottom: closes at 0 height", !s.open && s.cssOpen === "0px" && !s.dragging, `state ${JSON.stringify(s)}`);
   await moveTo(500, 100);
   await click(500, H - 2);
   s = await state();
   host = await rect(".vscode-workbench-terminal-host");
   await shot("g3-3-reopened");
-  check("G3 reopen keeps the height", s.open && s.height === 120 && Math.round(host.height) === 120, `state ${JSON.stringify(s)}`);
-  check("G3 the heights were saved", (await ev("saved")).includes(120), `saved: ${JSON.stringify(await ev("saved"))}`);
+  check("G3 reopen keeps the height from before the drag-close", s.open && s.height === keptHeight && Math.round(host.height) === keptHeight, `state ${JSON.stringify(s)}, expected ${keptHeight}`);
+  check("G3 the heights were saved", (await ev("saved")).includes(keptHeight), `saved: ${JSON.stringify(await ev("saved"))}`);
+  await click(500, host.top);
+  s = await state();
+  check("G1 click closes", !s.open && s.cssOpen === "0px", `state ${JSON.stringify(s)}`);
 
   // G4 / C34: both sidebars open; the drawer spans only the main pane area and the sidebars reach the bottom; over a note and a Code tab.
   for (const kind of ["markdown", "code"]) {

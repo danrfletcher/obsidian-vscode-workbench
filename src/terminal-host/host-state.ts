@@ -49,6 +49,8 @@ export type HostEvent =
   | { type: "retry" }
   | { type: "page-reloaded" }
   | { type: "dismiss-lost" }
+  /** The page's terminal panel was closed from inside the page (the X in VS Code's panel): the drawer closes with it. */
+  | { type: "panel-closed" }
   /** The server died on its own (G13). */
   | { type: "server-crashed" }
   /** The server was stopped to be started again (Restart server). Quit and unload never send this: they dispose the host first. */
@@ -117,6 +119,9 @@ export function reduceHost(state: HostState, event: HostEvent): HostStep {
       return state.phase === "running" ? { state: { ...state, phase: "lost", lostCause: "reload" }, effects: [] } : stay(state);
     case "dismiss-lost":
       return state.phase === "lost" ? { state: { ...state, phase: "running", lostCause: null }, effects: [] } : stay(state);
+    case "panel-closed":
+      // Only a page that is up has a panel to lose. The page stays mounted (hidden, like any hide); the host page restores its panel at the next show.
+      return state.phase === "running" || state.phase === "lost" ? { state: { ...state, visible: false }, effects: [] } : stay(state);
     case "server-crashed":
       // Only a page that is up or being made has anything to lose. A host that was never shown (or sits at its licence or its
       // error) is untouched: opening it later starts a server as any first open does.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_HEIGHT, HEADROOM, MIN_HEIGHT, clampHeight, maxHeight } from "../../src/terminal/drawer-geometry";
+import { COLLAPSE_HEIGHT, DEFAULT_HEIGHT, HEADROOM, MIN_HEIGHT, clampHeight, dragHeight, maxHeight, settleHeight } from "../../src/terminal/drawer-geometry";
 
 const WINDOW = 900;
 const MAX = WINDOW - HEADROOM; // 740
@@ -51,5 +51,37 @@ describe("drawer height clamp (G9, E14)", () => {
   it("maxHeight is never negative", () => {
     expect(maxHeight(0)).toBe(0);
     expect(maxHeight(-10)).toBe(0);
+  });
+});
+
+describe("the height while dragging has no minimum (it follows the pointer to 0)", () => {
+  const table: Array<[string, unknown, number, number]> = [
+    ["inside the range is kept", 300, WINDOW, 300],
+    ["under the minimum is kept", 50, WINDOW, 50],
+    ["zero is zero", 0, WINDOW, 0],
+    ["below zero stops at zero", -400, WINDOW, 0],
+    ["negative infinity is zero", Number.NEGATIVE_INFINITY, WINDOW, 0],
+    ["above the maximum stops at it", 5000, WINDOW, MAX],
+    ["a fraction is rounded", 49.6, WINDOW, 50],
+    ["NaN is zero", Number.NaN, WINDOW, 0],
+    ["not a number is zero", "tall", WINDOW, 0],
+    ["a window of unknown height: only zero applies", 5000, Number.NaN, 5000],
+    ["a window of unknown height and no bound gives zero", Number.POSITIVE_INFINITY, Number.NaN, 0],
+  ];
+  it.each(table)("%s", (_name, wanted, windowHeight, expected) => {
+    expect(dragHeight(wanted, windowHeight)).toBe(expected);
+  });
+});
+
+describe("where a drag leaves the drawer", () => {
+  it("closes it (null) when it is shorter than the collapse height, and keeps at least the minimum otherwise", () => {
+    expect(COLLAPSE_HEIGHT).toBeLessThan(MIN_HEIGHT);
+    expect(settleHeight(0, WINDOW)).toBeNull();
+    expect(settleHeight(COLLAPSE_HEIGHT - 1, WINDOW)).toBeNull();
+    expect(settleHeight(Number.NaN, WINDOW)).toBeNull();
+    expect(settleHeight(COLLAPSE_HEIGHT, WINDOW)).toBe(MIN_HEIGHT);
+    expect(settleHeight(MIN_HEIGHT - 1, WINDOW)).toBe(MIN_HEIGHT);
+    expect(settleHeight(300, WINDOW)).toBe(300);
+    expect(settleHeight(5000, WINDOW)).toBe(MAX);
   });
 });

@@ -17,6 +17,7 @@ import {
   extensionDir,
   extensionSource,
   installTerminalAtExtension,
+  requestPanel,
   writeTerminalRequest,
 } from "../../src/terminal-host/terminal-at-extension";
 import { FakeWorkbenchPage } from "../host-fakes";
@@ -78,7 +79,23 @@ function startHost(opts: HostOptions = {}): Run {
   return { calls, errors, layout: () => calls.map((c) => c.command).filter((c) => (PANEL_ONLY_COMMANDS as readonly string[]).includes(c)) };
 }
 
-const until = (fn: () => boolean) => vi.waitFor(() => { if (!fn()) throw new Error("not yet"); }, { timeout: 20_000, interval: 10 });
+/**
+ * Wait until fn is true. fs.watch can still be coming alive when a test writes its first request (an event written in that window is
+ * never reported, and the extension has no timer to re-scan), so while waiting this touches the requests folder now and then: a
+ * live watcher reports that and the extension re-reads the folder. The touched file is not a .json request, so it is never read as one.
+ */
+const until = (fn: () => boolean) => {
+  let last = 0;
+  return vi.waitFor(() => {
+    if (fn()) return;
+    if (Date.now() - last > 250) {
+      last = Date.now();
+      const nudge = path.join(extensionDir(data), REQUESTS_DIR, "watcher-nudge.tmp");
+      try { fs.writeFileSync(nudge, ""); fs.unlinkSync(nudge); } catch { /* the folder is not there yet */ }
+    }
+    throw new Error("not yet");
+  }, { timeout: 20_000, interval: 10 });
+};
 
 describe("the panel-only step of the terminal-at extension", () => {
   it("runs VS Code's own commands, in order: close the side bar, close the secondary side bar, focus the terminal; each with no argument", async () => {
@@ -167,6 +184,33 @@ describe("the panel-only step of the terminal-at extension", () => {
     // the page's own vault-root terminal existed when the chosen folder's was made, and was then taken away: exactly one is left
     await until(() => page.terminals.length === 1 && page.terminals[0].cwd === "/vault/chosen");
     expect(page.terminals.map((t) => t.cwd)).toEqual(["/vault/chosen"]);
+  });
+
+  it("a panel request (the X closed the panel) runs the panel-only commands again, asks for no new terminal, and is deleted", async () => {
+    const page = new FakeWorkbenchPage({ extension: false, defaultCwd: "/vault" });
+    const run = startHost({ page });
+    await until(() => run.layout().length === 3);
+    expect(page.shown()).toEqual(["panel"]);
+    page.parts.panel = [0, 0]; // the user clicked the X in the panel
+    page.parts.editor = [page.win[0], page.win[1]];
+    expect(page.shown()).toEqual(["editor"]);
+    requestPanel(data);
+    await until(() => run.layout().length === 6);
+    expect(run.layout().slice(3)).toEqual([...PANEL_ONLY_COMMANDS]);
+    expect(page.shown()).toEqual(["panel"]);
+    expect(run.calls.some((c) => c.command === NEW_WITH_CWD_COMMAND)).toBe(false);
+    expect(page.terminals).toHaveLength(1); // the focus command starts a shell only when there is none
+    await until(() => fs.readdirSync(path.join(extensionDir(data), REQUESTS_DIR)).filter((n) => n.endsWith(".json")).length === 0);
+  });
+
+  it("a panel request does not use up the first-use adoption of a terminal request that follows it", async () => {
+    const page = new FakeWorkbenchPage({ extension: false, defaultCwd: "/vault" });
+    const run = startHost({ page });
+    await until(() => run.layout().length === 3);
+    requestPanel(data);
+    writeTerminalRequest(data, { cwd: "/vault/chosen", adoptFirst: true });
+    await until(() => run.calls.some((c) => c.command === NEW_WITH_CWD_COMMAND));
+    await until(() => page.terminals.length === 1 && page.terminals[0].cwd === "/vault/chosen");
   });
 
   it("holds no key press and no text for a shell: its code names only commands", () => {
