@@ -1205,6 +1205,23 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.openFiles.release(file, leaf);
   }
 
+  /**
+   * A folder in a Code tab's path was clicked: reveal it in the file explorer, the way a note's path does (Obsidian's own
+   * breadcrumb calls the file-explorer plugin's `revealInFolder`). Nothing happens when the plugin is off or the folder is gone.
+   */
+  revealFolder(folder: string): void {
+    const app = this.app as unknown as {
+      internalPlugins?: { getEnabledPluginById?(id: string): { revealInFolder?(f: unknown): void } | null };
+      vault?: { getFolderByPath?(p: string): unknown };
+    };
+    const explorer = app.internalPlugins?.getEnabledPluginById?.("file-explorer");
+    if (!explorer?.revealInFolder) return;
+    for (const form of [folder, folder.normalize("NFC"), folder.normalize("NFD")]) {
+      const found = app.vault?.getFolderByPath?.(form);
+      if (found) return explorer.revealInFolder(found);
+    }
+  }
+
   /** The size and binary guard (E6). A refused file gets a notice and goes to the system app. */
   private async fitsInCodeTab(file: string): Promise<boolean> {
     const result = await checkFile(path.join(this.vaultRoot(), file));

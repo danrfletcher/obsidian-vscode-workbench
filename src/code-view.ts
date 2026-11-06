@@ -9,6 +9,7 @@ import type { CloseDirtyRequest } from "./modals";
 import { buildGoToLineScript, GO_TO_LINE_DONE, GO_TO_LINE_TOTAL_MS } from "./goto-line-script";
 import { fileKey } from "./open-file";
 import { buildOpenInterceptScript, isOtherEditorReport, OPEN_INTERCEPT_INSTALLED, parseOpenReport, RESTORE_OPEN_SCRIPT, RESTORE_SWITCHED, type OpenReport } from "./open-intercept-script";
+import { renderPathBreadcrumbs, type BreadcrumbParent } from "./path-breadcrumbs";
 import { authorityOf, buildFileUri, buildFileUrl, normalizeLine, targetOfUri, type EditorTarget } from "./paths";
 import type { CarryResult } from "./rename-carry";
 import type { RunningServer } from "./server";
@@ -71,6 +72,8 @@ export interface CodeViewHost {
   releaseFile(file: string, leaf: WorkspaceLeaf): void;
   /** Hand a file to the system's default app (the licence was declined). */
   openInSystemApp(file: string): void;
+  /** A folder in a tab's path was clicked: reveal that vault-relative folder in Obsidian's file explorer, as a note's path does. */
+  revealFolder?(folder: string): void;
   /** The chosen instance's auto-save, from the settings copied at the last server start. Default off. */
   autoSave?(): AutoSave;
   /** Ask the unsaved-changes question when a tab with unsaved edits is closed. Without it, a dirty tab stays open. */
@@ -410,6 +413,17 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     return "code-2";
   }
 
+  /**
+   * Draw the file's folder path in the view header, as Obsidian does for a note, each folder revealing itself in the file explorer
+   * when clicked. `titleParentEl` is Obsidian's own header element (not in its typings); without it there is nothing to draw into
+   * and the tab keeps just its title. A click does nothing when the host cannot reveal.
+   */
+  private renderBreadcrumbs(): void {
+    const parent = (this as unknown as { titleParentEl?: BreadcrumbParent }).titleParentEl;
+    if (!parent) return;
+    renderPathBreadcrumbs(parent, this.file, (folder) => this.host.revealFolder?.(folder));
+  }
+
   get filePath(): string {
     return this.file;
   }
@@ -454,6 +468,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
           this.detachNow();
           return;
         }
+        this.renderBreadcrumbs();
         (this.leaf as unknown as { updateHeader?: () => void }).updateHeader?.();
         const line = (state as CodeViewState).line;
         this.pendingLine = line === undefined || line === null ? null : normalizeLine(line);
@@ -1045,6 +1060,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     if (!this.file || newPath === this.file) return;
     this.file = newPath;
     this.notePendingMove(newPath);
+    this.renderBreadcrumbs();
     (this.leaf as unknown as { updateHeader?: () => void }).updateHeader?.();
     (this.app as unknown as { workspace?: { requestSaveLayout?: () => void } } | undefined)?.workspace?.requestSaveLayout?.();
     void this.repoint();
