@@ -1,6 +1,6 @@
 {
   "name": "vscode-workbench",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Open vault code files in a real VS Code editor (code serve-web) inside a tab, with VS Code's own terminal in a drawer at the bottom.",
   "main": "main.js",
   "private": true,

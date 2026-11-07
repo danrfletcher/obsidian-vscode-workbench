@@ -659,8 +659,7 @@ export class TerminalHostPage {
         line.textContent = error === null ? TERMINAL_CRASH_TEXT : `${TERMINAL_RESTART_FAILED_TEXT} ${error}`;
         const restart = this.deps.createElement("button");
         restart.textContent = "Restart";
-        restart.className = "mod-cta";
-        restart.style.marginLeft = "12px";
+        restart.className = "mod-cta vscode-workbench-banner-button";
         restart.addEventListener("click", () => void this.restartFromBanner());
         this.crashBanner.appendChild(line);
         this.crashBanner.appendChild(restart);
@@ -672,7 +671,7 @@ export class TerminalHostPage {
         line.textContent = lostCause === "restart" ? RESTART_LOST_TEXT : LOST_TEXT;
         const dismiss = this.deps.createElement("button");
         dismiss.textContent = "Dismiss";
-        dismiss.style.marginLeft = "12px";
+        dismiss.className = "vscode-workbench-banner-button";
         dismiss.addEventListener("click", () => this.dispatch({ type: "dismiss-lost" }));
         this.banner.appendChild(line);
         this.banner.appendChild(dismiss);

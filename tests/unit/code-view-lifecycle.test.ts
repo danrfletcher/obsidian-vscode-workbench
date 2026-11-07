@@ -165,6 +165,17 @@ describe("crash banner", () => {
     await view.onClose();
     expect(listeners).toHaveLength(0);
   });
+
+  it("release() does what closing does without a leaf being removed, once, however often it is asked", async () => {
+    const { view, contentEl } = await open();
+    expect(listeners).toHaveLength(1);
+    const first = view.release();
+    expect(view.release()).toBe(first);
+    await first;
+    await view.onClose(); // the user closing the leftover tab afterwards joins it
+    expect(listeners).toHaveLength(0);
+    expect(frame(contentEl).removed).toBe(true);
+  });
 });
 
 describe("tab left behind by an idle stop", () => {

@@ -38,9 +38,8 @@ export class ChoiceModal<T> extends Modal {
     contentEl.empty();
     // A file name has no spaces to break at, so a long one (the unsaved-changes prompts name the file in the
     // title and the text) would run past the modal's edge; let it break anywhere instead.
-    const title = contentEl.createEl("h2", { text: this.o.title });
-    title.style.overflowWrap = "anywhere";
-    for (const line of this.o.lines) contentEl.createEl("p", { text: line }).style.overflowWrap = "anywhere";
+    contentEl.createEl("h2", { text: this.o.title, cls: "vscode-workbench-wrap-anywhere" });
+    for (const line of this.o.lines) contentEl.createEl("p", { text: line, cls: "vscode-workbench-wrap-anywhere" });
     const row = contentEl.createDiv({ cls: "modal-button-container" });
     for (const c of this.o.choices) {
       const cls = c.cta ? "mod-cta" : c.warning ? "mod-warning" : undefined;

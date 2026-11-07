@@ -374,7 +374,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.restoreDeletes = null;
     this.restoreCreates?.();
     this.restoreCreates = null;
-    this.app.workspace.detachLeavesOfType(VIEW_TYPE_CODE);
+    // The Code tabs are not detached here (Obsidian would reset a tab the user moved when the plugin loads again); each
+    // one lets go of its page, file claim and subscriptions through the same path its onClose takes.
+    for (const v of [...this.views]) void v.release();
     this.idle?.stop();
     if (this.chordTimer) clearInterval(this.chordTimer);
     this.chordTimer = null;

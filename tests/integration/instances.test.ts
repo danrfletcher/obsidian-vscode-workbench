@@ -747,7 +747,7 @@ describe("chrome settings and theme switching write nothing to another instance 
     try {
       await load();
       await plugin.openSpikeFile();
-      plugin.trackView({ switchTheme: async (m: { dark: boolean }) => void told.push(m.dark), isVisible: () => true, isDirty: async () => false } as never);
+      plugin.trackView({ switchTheme: async (m: { dark: boolean }) => void told.push(m.dark), isVisible: () => true, isDirty: async () => false, release: async () => undefined } as never);
       const machine = () => JSON.parse(fs.readFileSync(path.join(inner().manager.serverInstance!.serverDataDir, "data", "Machine", "settings.json"), "utf8")) as Record<string, unknown>;
       expect(machine()["workbench.colorTheme"]).toBe("Light Modern");
       expect(machine()["workbench.statusBar.visible"]).toBe(false);

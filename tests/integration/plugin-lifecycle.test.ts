@@ -137,6 +137,7 @@ function fakeView(o: { file?: string; visible?: boolean; dirty?: boolean; saves?
     },
     pathTaken: (p: string) => void v.taken.push(p),
     reload: () => undefined,
+    release: async () => undefined,
   };
   plugin.trackView(v as never);
   return v;
@@ -1265,7 +1266,7 @@ describe("css-change reloads the theme only when light/dark flips (PR-1 R5)", ()
     vi.stubGlobal("document", { body: { classList: { contains: (c: string) => c === "theme-dark" && dark } } });
     await plugin.openSpikeFile();
     const told: boolean[] = [];
-    plugin.trackView({ switchTheme: async (m: { dark: boolean }) => void told.push(m.dark), isVisible: () => true, isDirty: async () => false, notifyVisible: () => undefined } as never);
+    plugin.trackView({ switchTheme: async (m: { dark: boolean }) => void told.push(m.dark), isVisible: () => true, isDirty: async () => false, notifyVisible: () => undefined, release: async () => undefined } as never);
     const machine = path.join(inner().manager.serverInstance!.serverDataDir, "data", "Machine", "settings.json");
     fs.writeFileSync(machine, '{"marker": "untouched"}'); // a rewrite would replace this
     const pid = (inner().manager.serverInstance as unknown as { pid: number }).pid;
