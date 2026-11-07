@@ -1229,6 +1229,23 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     if (found) explorer.revealInFolder(found);
   }
 
+  /**
+   * The file name at the end of a Code tab's path was clicked: reveal the file in the file explorer, as the path's folders do.
+   * The file is found in the form given or the other Unicode form. Nothing happens when the plugin is off or the file is not in the vault.
+   */
+  revealFile(file: string): void {
+    const app = this.app as unknown as {
+      internalPlugins?: { getEnabledPluginById?(id: string): { revealInFolder?(f: unknown): void } | null };
+      vault?: { getFileByPath?(p: string): unknown };
+    };
+    const explorer = app.internalPlugins?.getEnabledPluginById?.("file-explorer");
+    if (!explorer?.revealInFolder) return;
+    for (const form of [file, file.normalize("NFC"), file.normalize("NFD")]) {
+      const found = app.vault?.getFileByPath?.(form);
+      if (found) return explorer.revealInFolder(found);
+    }
+  }
+
   /** Hover tooltip on a path crumb: the crumb's own folder name, as Obsidian's `createBreadcrumb` sets it on a note's. (Obsidian skips it on mobile; this plugin is desktop-only.) */
   folderTooltip(el: unknown, folder: string): void {
     setTooltip(el as HTMLElement, baseName(folder));

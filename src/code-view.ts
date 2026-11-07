@@ -9,7 +9,7 @@ import type { CloseDirtyRequest } from "./modals";
 import { buildGoToLineScript, GO_TO_LINE_DONE, GO_TO_LINE_TOTAL_MS } from "./goto-line-script";
 import { fileKey } from "./open-file";
 import { buildOpenInterceptScript, isOtherEditorReport, OPEN_INTERCEPT_INSTALLED, parseOpenReport, RESTORE_OPEN_SCRIPT, RESTORE_SWITCHED, type OpenReport } from "./open-intercept-script";
-import { renderPathBreadcrumbs, type BreadcrumbParent } from "./path-breadcrumbs";
+import { renderFileTitle, renderPathBreadcrumbs, type BreadcrumbParent, type FileTitleEl } from "./path-breadcrumbs";
 import { authorityOf, buildFileUri, buildFileUrl, normalizeLine, targetOfUri, type EditorTarget } from "./paths";
 import type { CarryResult } from "./rename-carry";
 import type { RunningServer } from "./server";
@@ -74,6 +74,8 @@ export interface CodeViewHost {
   openInSystemApp(file: string): void;
   /** A folder in a tab's path was clicked: reveal that vault-relative folder in Obsidian's file explorer, as a note's path does. */
   revealFolder?(folder: string): void;
+  /** The file name at the end of a tab's path was clicked: reveal that vault-relative file in Obsidian's file explorer. */
+  revealFile?(file: string): void;
   /** Give a path crumb its hover tooltip (the crumb's own folder name, as on a note). `el` is the crumb's element; `folder` its vault-relative path. */
   folderTooltip?(el: unknown, folder: string): void;
   /** A path crumb was right-clicked: show the menu a note's crumb shows for the folder (the host builds it with `Menu.forEvent`, which shows it). */
@@ -420,20 +422,23 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
   }
 
   /**
-   * Draw the file's folder path in the view header, as Obsidian does for a note, each folder revealing itself in the file explorer
-   * when clicked (and offering a tooltip, a right-click menu and drag, as a note's crumb does). `titleParentEl` is Obsidian's own header element (not in its typings); without it there is nothing to draw into
-   * and the tab keeps just its title. A click does nothing when the host cannot reveal.
+   * Draw the file's path in the view header, as Obsidian does for a note: each folder as a crumb revealing itself in the file explorer
+   * when clicked (and offering a tooltip, a right-click menu and drag, as a note's crumb does), then the file name as the header title,
+   * which reveals the file when clicked. `titleParentEl` and `titleEl` are Obsidian's own header elements (not in its typings); without
+   * one there is nothing to draw into and the tab keeps what Obsidian gives it. A click does nothing when the host cannot reveal.
    */
   private renderBreadcrumbs(): void {
-    const parent = (this as unknown as { titleParentEl?: BreadcrumbParent }).titleParentEl;
-    if (!parent) return;
+    const header = this as unknown as { titleParentEl?: BreadcrumbParent; titleEl?: FileTitleEl };
     const host = this.host;
-    renderPathBreadcrumbs(parent, this.file, {
-      reveal: (folder) => host.revealFolder?.(folder),
-      tooltip: host.folderTooltip && ((el, folder) => host.folderTooltip?.(el, folder)),
-      menu: host.folderMenu && ((folder, evt) => host.folderMenu?.(folder, evt)),
-      drag: host.dragFolder && ((folder, evt) => host.dragFolder?.(folder, evt) ?? false),
-    });
+    if (header.titleParentEl) {
+      renderPathBreadcrumbs(header.titleParentEl, this.file, {
+        reveal: (folder) => host.revealFolder?.(folder),
+        tooltip: host.folderTooltip && ((el, folder) => host.folderTooltip?.(el, folder)),
+        menu: host.folderMenu && ((folder, evt) => host.folderMenu?.(folder, evt)),
+        drag: host.dragFolder && ((folder, evt) => host.dragFolder?.(folder, evt) ?? false),
+      });
+    }
+    if (header.titleEl) renderFileTitle(header.titleEl, this.file, (file) => host.revealFile?.(file));
   }
 
   get filePath(): string {
