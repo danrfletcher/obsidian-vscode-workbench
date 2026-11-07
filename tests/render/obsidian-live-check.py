@@ -10,7 +10,7 @@ Live check of two lines of the PR-4 checklist in a REAL Obsidian (ticket warkwor
 It runs INSIDE the desktop container (python3 + `websockets`; no node), from the bind-mounted worktree. Prerequisites: Obsidian runs
 there with --remote-debugging-port (9461 for desktop-warkworth-42; set OBSIDIAN_CDP=http://127.0.0.1:<port> otherwise), the vault is
 trusted, this plugin is built into the vault (`npm run build`, then main.js, manifest.json and styles.css copied to
-<vault>/.obsidian/plugins/obsidian-vscode-workbench/) and the VS Code server licence is accepted. The run makes fixtures in the vault
+<vault>/.obsidian/plugins/vscode-workbench/) and the VS Code server licence is accepted. The run makes fixtures in the vault
 folder `live-check/` and removes them again.
 
   docker exec desktop-warkworth-42 python3 /config/workspace/warkworth-42/tests/render/obsidian-live-check.py [--only c2|c12] [--out-dir DIR]

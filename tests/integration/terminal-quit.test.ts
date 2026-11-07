@@ -129,7 +129,7 @@ describe("the plugin: quit and unload", () => {
     Notice.reset();
     Modal.reset();
     Object.assign(process.env, env());
-    plugin = new VSCodeWorkbenchPlugin(makeHostApp(vault) as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+    plugin = new VSCodeWorkbenchPlugin(makeHostApp(vault) as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
     (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, embed: "iframe", serverLicenceAccepted: true };
     await plugin.onload();
   }

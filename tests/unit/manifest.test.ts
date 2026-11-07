@@ -15,7 +15,7 @@ describe("manifest.json", () => {
   });
 
   it("has the plugin id and the required fields", () => {
-    expect(manifest.id).toBe("obsidian-vscode-workbench");
+    expect(manifest.id).toBe("vscode-workbench");
     for (const k of ["id", "name", "version", "minAppVersion", "description", "author", "isDesktopOnly"]) {
       expect(manifest, k).toHaveProperty(k);
     }

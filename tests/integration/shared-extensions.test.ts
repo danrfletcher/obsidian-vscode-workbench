@@ -16,7 +16,7 @@ import { FAKE_CODE, isAlive, tempDir } from "../helpers";
 import { makeReadOnly, makeWritable, treeDigest } from "../instance-helpers";
 import { stateDb } from "../mirror-tree";
 
-const PLUGIN_DIR = ".obsidian/plugins/obsidian-vscode-workbench";
+const PLUGIN_DIR = ".obsidian/plugins/vscode-workbench";
 const TCL = "chakrounanas.turbo-console-log-3.0.0";
 const PY = "ms-python.python-2026.10.0";
 const PYLANCE = "ms-python.vscode-pylance-2026.4.1";
@@ -79,7 +79,7 @@ const associate = (id: string) => writeUserData(userRoot, { associations: { [vsc
 
 async function load(): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile });
-  plugin = new VSCodeWorkbenchPlugin(makeApp(vault) as never, { id: "obsidian-vscode-workbench", dir: PLUGIN_DIR } as never);
+  plugin = new VSCodeWorkbenchPlugin(makeApp(vault) as never, { id: "vscode-workbench", dir: PLUGIN_DIR } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: fakeInstall(), serverLicenceAccepted: true, embed: "iframe", userDataFolder: "Code - Insiders" };
   (plugin as unknown as { downloadHostReachable: () => Promise<boolean> }).downloadHostReachable = async () => false;
   await plugin.onload();

@@ -267,7 +267,7 @@ describe("renderFileTitle", () => {
 describe("the plugin's folder reveal", () => {
   function pluginWith(app: unknown): VSCodeWorkbenchPlugin {
     Plugin.reset();
-    return new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+    return new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
   }
 
   it("reveals the vault folder in the file-explorer plugin", () => {

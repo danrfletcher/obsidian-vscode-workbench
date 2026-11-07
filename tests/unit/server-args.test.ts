@@ -4,9 +4,9 @@ import { buildServeWebArgs, parseServeWebHelp, pickPort, portIsFree, LOOPBACK_HO
 
 const base = {
   port: 51234,
-  tokenFile: "/vault/.obsidian/plugins/obsidian-vscode-workbench/.server/connection-token",
-  serverDataDir: "/vault/.obsidian/plugins/obsidian-vscode-workbench/.server/server-data",
-  cliDataDir: "/vault/.obsidian/plugins/obsidian-vscode-workbench/.server/cli-data",
+  tokenFile: "/vault/.obsidian/plugins/vscode-workbench/.server/connection-token",
+  serverDataDir: "/vault/.obsidian/plugins/vscode-workbench/.server/server-data",
+  cliDataDir: "/vault/.obsidian/plugins/vscode-workbench/.server/cli-data",
   acceptLicense: false,
 };
 

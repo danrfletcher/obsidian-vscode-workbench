@@ -30,7 +30,7 @@ export type BridgeAction = "toggle-terminal" | "open-switcher";
 
 /** The bridged actions: what the page reports, and the Obsidian command whose hotkey is followed. */
 export const BRIDGED_ACTIONS: ReadonlyArray<{ action: BridgeAction; commandId: string }> = [
-  { action: "toggle-terminal", commandId: "obsidian-vscode-workbench:toggle-terminal-drawer" },
+  { action: "toggle-terminal", commandId: "vscode-workbench:toggle-terminal-drawer" },
   { action: "open-switcher", commandId: "switcher:open" },
 ];
 

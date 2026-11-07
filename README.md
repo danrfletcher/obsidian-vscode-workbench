@@ -97,4 +97,4 @@ npm run check:workbench  # real VS Code web server + headless Chrome: outside ch
 
 `check:workbench` is not part of `npm test`. It needs the installed VS Code, Google Chrome and the VS Code server for the installed build's commit. Either point `CLI_DATA_SRC` at a `--cli-data-dir` whose `serve-web/` folder already holds that commit (it is copied, never written to), or set `ALLOW_DOWNLOAD=1` and `serve-web` downloads that server (about 600 MB) into a scratch folder. If neither fits it exits 2 before starting anything and names the commit it needs and the ones `CLI_DATA_SRC` holds. It exits 1 when a check fails and 2 when the check could not run (including a server that answers with an error, or a page that never paints).
 
-The plugin folder goes in `<vault>/.obsidian/plugins/obsidian-vscode-workbench/` (`main.js` and `manifest.json`). Runtime files (token, server data) live under `.server/` inside it and are git-ignored.
+The plugin folder goes in `<vault>/.obsidian/plugins/vscode-workbench/` (`main.js` and `manifest.json`). Runtime files (token, server data) live under `.server/` inside it and are git-ignored.
