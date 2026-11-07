@@ -368,6 +368,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
   /** The file was deleted: closing no longer asks about unsaved edits. */
   private deleted = false;
   private closed = false;
+  private releasing: Promise<void> | null = null;
   private closing: Promise<void> | null = null;
   private repointing = false;
   /** The line to put the cursor on once the workbench page has loaded (set by `setState` or `goToLine`), or null. Cleared when a load ends. */
@@ -494,13 +495,22 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
     this.host.trackView(this);
     this.unsubscribe = this.host.onServerState((s) => this.onServerState(s));
     this.contentEl.addClass("vscode-workbench-view");
-    this.contentEl.style.padding = "0";
-    this.contentEl.style.position = "relative";
-    this.contentEl.style.overflow = "hidden";
     this.installCloseGuard();
   }
 
   async onClose(): Promise<void> {
+    await this.release();
+  }
+
+  /**
+   * Everything that closing the tab does, short of removing the leaf. onClose runs it; so does the plugin's onunload, which
+   * must not detach leaves. Runs once: a second call (onunload, then the user closing the leftover tab) joins the first.
+   */
+  release(): Promise<void> {
+    return (this.releasing ??= this.doRelease());
+  }
+
+  private async doRelease(): Promise<void> {
     // A last look at the buffer before the page goes, so a save made since the last one is still seen (R8).
     if (!this.deleted) await this.observeMove();
     this.closed = true;
@@ -749,17 +759,8 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
   private showBanner(text: string): void {
     this.banner?.remove();
     const banner = this.contentEl.createDiv({ cls: "vscode-workbench-banner", text: "" }) as HTMLElement;
-    banner.style.position = "absolute";
-    banner.style.top = "0";
-    banner.style.left = "0";
-    banner.style.right = "0";
-    banner.style.zIndex = "10";
-    banner.style.padding = "8px 12px";
-    banner.style.background = "var(--background-modifier-error, #a33)";
-    banner.style.color = "var(--text-on-accent, #fff)";
     banner.createEl("span", { text });
-    const button = banner.createEl("button", { text: "Restart", cls: "mod-cta" });
-    button.style.marginLeft = "12px";
+    const button = banner.createEl("button", { text: "Restart", cls: "mod-cta vscode-workbench-banner-button" });
     button.addEventListener("click", () => void this.restartFromBanner());
     this.banner = banner;
     // The banner floats over the (dead) page, which stays visible so unsaved text can be copied.
@@ -867,9 +868,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
           if (this.frame === el) this.domReady = true;
         });
       }
-      el.style.width = "100%";
-      el.style.height = "100%";
-      el.style.border = "0";
+      el.className = "vscode-workbench-frame";
       // The application-scoped off switches (extension updates, experiments,
       // telemetry) and the user's settings and keybindings (copied from the chosen
       // instance, G17) are only read from the browser profile, so a webview first

@@ -271,6 +271,7 @@ function dirtyView() {
     abandonRename: () => undefined,
     pathTaken: () => undefined,
     reload: () => undefined,
+    release: async () => undefined,
   };
   plugin.trackView(v as never);
   return v;

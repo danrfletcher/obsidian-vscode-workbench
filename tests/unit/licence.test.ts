@@ -178,6 +178,6 @@ describe("ChoiceModal", () => {
     const text = nodes.filter((n) => n.tag === "h2" || n.tag === "p");
     expect(text.map((n) => n.tag)).toEqual(["h2", "p"]);
     expect(text[0].text).toContain("a_very_long_file_name_with_no_spaces_at_all.py");
-    for (const n of text) expect(n.style.overflowWrap).toBe("anywhere");
+    for (const n of text) expect(n.cls).toContain("vscode-workbench-wrap-anywhere"); // .modal-content .vscode-workbench-wrap-anywhere { overflow-wrap: anywhere } in styles.css
   });
 });
