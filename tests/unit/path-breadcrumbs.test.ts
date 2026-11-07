@@ -7,7 +7,7 @@ import { FILE_EXPLORER_SOURCE, NEW_TERMINAL_TITLE } from "../../src/terminal/new
 import { Menu, Plugin, TFolder, WorkspaceLeaf, tooltips } from "../mocks/obsidian";
 import { CodeView, type CodeViewHost } from "../../src/code-view";
 import VSCodeWorkbenchPlugin from "../../src/main";
-import { folderChain, renderPathBreadcrumbs } from "../../src/path-breadcrumbs";
+import { folderChain, renderFileTitle, renderPathBreadcrumbs } from "../../src/path-breadcrumbs";
 import { FakeWebview as FakeEl } from "../helpers";
 
 type Handler = (evt: { preventDefault(): void }) => void;
@@ -53,6 +53,19 @@ class FakeTitleParent {
   }
 }
 
+/** Obsidian's `titleEl` (the header title), as far as the file name touches it. */
+class FakeTitle {
+  text = "VS Code"; // what the header holds before the tab knows its file
+  onclick: ((evt: unknown) => unknown) | null = null;
+  style = { cursor: "" };
+  setText(t: string): void {
+    this.text = t;
+  }
+  click(): void {
+    this.onclick?.({});
+  }
+}
+
 function makeView(host: Partial<CodeViewHost> = {}) {
   const full: CodeViewHost = {
     vaultRoot: () => "/Users/dan/My Vault",
@@ -71,8 +84,9 @@ function makeView(host: Partial<CodeViewHost> = {}) {
   };
   const view = new CodeView(new WorkspaceLeaf() as never, full);
   const parent = new FakeTitleParent();
-  Object.assign(view, { contentEl: new FakeEl("div"), titleParentEl: parent });
-  return { view, parent };
+  const title = new FakeTitle();
+  Object.assign(view, { contentEl: new FakeEl("div"), titleParentEl: parent, titleEl: title });
+  return { view, parent, title };
 }
 
 beforeEach(() => {
@@ -197,6 +211,57 @@ describe("a Code tab's path", () => {
     await view.setState({ file: PD }, {} as never);
     expect(parent.spans).toEqual([]);
   });
+
+  it("ends the path with the file name in the header title, in place of the 'VS Code' placeholder", async () => {
+    const { view, title } = makeView();
+    expect(title.text).toBe("VS Code");
+    await view.setState({ file: PD }, {} as never);
+    expect(title.text).toBe("pd.js");
+  });
+
+  it("clicking the file name asks the host to reveal that file, by its full vault-relative path", async () => {
+    const revealFile = vi.fn();
+    const revealFolder = vi.fn();
+    const { view, title } = makeView({ revealFile, revealFolder });
+    await view.setState({ file: PD }, {} as never);
+    title.click();
+    expect(revealFile).toHaveBeenCalledExactlyOnceWith(PD);
+    expect(revealFolder).not.toHaveBeenCalled();
+  });
+
+  it("a click on the file name with a host that cannot reveal does nothing", async () => {
+    const { view, title } = makeView();
+    await view.setState({ file: PD }, {} as never);
+    expect(() => title.click()).not.toThrow();
+  });
+
+  it("follows a rename: the title shows the new name and a click reveals the new path, once", async () => {
+    const revealFile = vi.fn();
+    const { view, title } = makeView({ revealFile });
+    await view.setState({ file: "a/b/x.py" }, {} as never);
+    view.followTo("c/y.py");
+    expect(title.text).toBe("y.py");
+    title.click();
+    expect(revealFile).toHaveBeenCalledExactlyOnceWith("c/y.py");
+  });
+
+  it("a file at the vault root still gets its name as the title", async () => {
+    const { view, title, parent } = makeView();
+    await view.setState({ file: "top.py" }, {} as never);
+    expect(parent.spans).toEqual([]);
+    expect(title.text).toBe("top.py");
+  });
+});
+
+describe("renderFileTitle", () => {
+  it("clears the name and the click for an empty path", () => {
+    const title = new FakeTitle();
+    const reveal = vi.fn();
+    renderFileTitle(title, "a/b.py", reveal);
+    renderFileTitle(title, "", reveal);
+    expect(title.text).toBe("");
+    expect(title.onclick).toBeNull();
+  });
 });
 
 describe("the plugin's folder reveal", () => {
@@ -229,6 +294,28 @@ describe("the plugin's folder reveal", () => {
     });
     plugin.revealFolder("café".normalize("NFC"));
     expect(revealInFolder).toHaveBeenCalledExactlyOnceWith(folder);
+  });
+
+  it("reveals a vault file in the file-explorer plugin, found in either Unicode form", () => {
+    const file = { path: "café/x.js" };
+    const revealInFolder = vi.fn(function (this: unknown) {
+      return this;
+    });
+    const explorer = { revealInFolder };
+    const plugin = pluginWith({
+      internalPlugins: { getEnabledPluginById: (id: string) => (id === "file-explorer" ? explorer : null) },
+      vault: { getFileByPath: (p: string) => (p === "café/x.js".normalize("NFD") ? file : null) },
+    });
+    plugin.revealFile("café/x.js".normalize("NFC"));
+    expect(revealInFolder).toHaveBeenCalledExactlyOnceWith(file);
+    expect(revealInFolder.mock.contexts[0]).toBe(explorer);
+  });
+
+  it("revealing a file does nothing when the file explorer is off or the file is not in the vault", () => {
+    const revealInFolder = vi.fn();
+    expect(() => pluginWith({ internalPlugins: { getEnabledPluginById: () => null }, vault: { getFileByPath: () => ({}) } }).revealFile("a.js")).not.toThrow();
+    pluginWith({ internalPlugins: { getEnabledPluginById: () => ({ revealInFolder }) }, vault: { getFileByPath: () => null } }).revealFile("a.js");
+    expect(revealInFolder).not.toHaveBeenCalled();
   });
 
   it("does nothing when the file explorer is off or the folder is gone", () => {
