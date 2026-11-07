@@ -1,8 +1,102 @@
-# Obsidian VS Code Workbench
+# VS Code Workbench
 
-Obsidian desktop plugin that opens every text file in a real VS Code editor (via `code serve-web`) with VS Code's own integrated terminal in a drawer at the bottom of Obsidian.
+Every code file in your Obsidian vault opens in a **real VS Code editor**, inside an ordinary Obsidian tab, with **VS Code's own integrated terminal** in a drawer at the bottom of the window. Your installed VS Code extensions, settings and keybindings come with it.
 
-Status: in development (a spike with one ribbon icon and one Code tab, the server lifecycle, the settings tab, and the Code tab opening every text file in the vault; see `docs/spike-decision.md`). Not submitted to the community store.
+<p align="center">
+  <img src="docs/images/02-code-tab.png" alt="A TypeScript file open in a Code tab, with the file path above it and the vault's file explorer on the left" width="900">
+</p>
+
+It is not a Monaco look-alike. The plugin runs the official `code serve-web` on your machine and embeds the real workbench: IntelliSense, diagnostics, formatting, the command palette and your extensions all run in the editor, and the tab still behaves like any other Obsidian pane.
+
+Desktop only. Needs Obsidian 1.13.0 or newer and an installed VS Code (any build whose `code` command has `serve-web`).
+
+## What you get
+
+### A Code tab that is just the editor
+
+- **Every text file opens in it.** Nothing to register by hand: the plugin walks the vault, finds every file extension and registers it. Extensionless files and dotfiles (`Makefile`, `Dockerfile`, `.env`) open from a click in the file explorer, where Obsidian lists them. Markdown, canvas, base files and binaries stay with Obsidian.
+- **Editor only.** No VS Code explorer, tab strip, side bar, activity bar, status bar or panel. The file explorer, quick switcher, tabs, splits and links stay Obsidian's.
+- **The path reads like a note's.** One crumb per parent folder, then the file name. Click a folder crumb to reveal it in the file explorer.
+- **One tab per file.** Opening a file that is already open focuses it. Go to Definition, `Cmd+P` and links inside the editor open as a new Obsidian tab at the right line.
+- **Follows Obsidian.** Rename or move a file and the tab follows it; the editor is Dark Modern or Light Modern to match Obsidian, switching live without losing your cursor.
+
+<img src="docs/images/03-intellisense.png" alt="A VS Code hover showing a TypeScript function signature inside an Obsidian tab" width="900">
+
+### Real IntelliSense and your extensions
+
+Completions, hovers, diagnostics, formatting and the Command Palette are VS Code's own. The plugin mirrors your desktop VS Code setup read-only: the extensions you have enabled, the profile VS Code uses for the vault, your `settings.json` and `keybindings.json`. Desktop VS Code stays the source of truth. Nothing is written back, and the tab never installs, enables or disables an extension.
+
+### A terminal drawer, over any view
+
+<img src="docs/images/04-terminal-drawer.png" alt="VS Code's integrated terminal in a drawer at the bottom of Obsidian, under a Code tab" width="900">
+
+Drag up from the bottom edge of the window (or press <kbd>Ctrl</kbd>+<kbd>`</kbd>, rebindable in Settings > Hotkeys) and VS Code's integrated terminal opens. Drag it to the bottom to close it. It is VS Code's own terminal: terminal list, profiles, the **+** button and middle-click to close. Shells start in the vault root and **keep running while the drawer is collapsed**.
+
+<img src="docs/images/05-terminal-over-note.png" alt="The same terminal drawer open under a Markdown note" width="900">
+
+It works over notes, canvas, graph and PDFs too (switch that off in settings if you want it on Code tabs only). The server does not idle-stop while a shell is alive.
+
+<img src="docs/images/06-new-terminal-at-folder.png" alt="The file explorer context menu with New terminal at folder" width="360">
+
+Right-click any folder in the file explorer and choose **New terminal at folder** to open a terminal there.
+
+### Safe to close
+
+<img src="docs/images/07-unsaved-prompt.png" alt="The Save, Discard changes, Cancel prompt shown when closing a Code tab with unsaved edits" width="520">
+
+Closing a Code tab with unsaved edits asks **Save**, **Discard changes** or **Cancel**, once per file, the same way for the close button, `Cmd+W`, close all and close others. If the plugin cannot tell whether the editor is dirty, it asks rather than guess. Quitting Obsidian with unsaved buffers asks first too.
+
+### Light and dark, split panes
+
+<img src="docs/images/09-light-theme.png" alt="A Code tab in Obsidian's light mode with VS Code's Light Modern theme" width="440"> <img src="docs/images/10-split-view.png" alt="Two Code tabs side by side in a vertical split" width="440">
+
+### Settings
+
+<img src="docs/images/08-settings.png" alt="The plugin's settings tab: VS Code instance, custom CLI path, excluded extensions, terminal drawer toggle and the trust toggle" width="700">
+
+Pick which installed build to use (VS Code, Insiders, VSCodium, Antigravity), point at a custom CLI, exclude file extensions, switch the drawer over non-code views on or off, and see exactly which VS Code extensions the tab shares and why each is active or not.
+
+## Install
+
+From the community store: **Settings > Community plugins > Browse > "VS Code Workbench"**.
+
+Or by hand: download `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/danrfletcher/obsidian-vscode-workbench/releases/latest) into `<vault>/.obsidian/plugins/vscode-workbench/`, then enable the plugin.
+
+The first Code tab (or the first terminal drawer) asks you to accept the VS Code server licence before anything is downloaded:
+
+<img src="docs/images/01-licence-prompt.png" alt="The VS Code server licence prompt shown before the first download" width="520">
+
+## How it works
+
+```
+Obsidian window
+ ├─ Code tab        <webview> ── 127.0.0.1:<stable port>/?tkn… ─┐
+ ├─ Terminal drawer <webview> (own browser profile) ────────────┤
+ └─ Plugin (TypeScript, no native modules)                      ▼
+      server manager ── spawns ──▶  `code serve-web`  (one per Obsidian session, loopback only)
+      child registry + pidfile      ├─ token file, mode 0600, never on a command line
+      mirror of desktop VS Code     ├─ per-plugin user-data dir (private, 0700)
+      trust seed, chrome hider      └─ symlinked extensions from your VS Code build
+```
+
+A few of the decisions that make it behave:
+
+- **One local server, one token.** `code serve-web` is bound to `127.0.0.1` with a connection token passed through a mode-0600 file, never as an argument. Code tabs and the terminal drawer share the server but not the browser profile, so the drawer's layout can never leak into a tab.
+- **Nothing is left behind.** Every child process goes through a registry with a pidfile of process ids. The server stops with Obsidian, after 5 idle minutes (no visible Code tab, no unsaved buffer, no live shell), or when the plugin is disabled, and a server orphaned by a crash is swept at the next start. A shell under the server keeps it alive, found from the server's own process tree.
+- **Desktop VS Code is the source of truth, read-only.** At each server start the plugin reads which profile your desktop VS Code uses for the vault, the lists of disabled extensions (read from a temporary copy of VS Code's SQLite state) and your settings, then shares exactly the enabled extensions through symlinks into the plugin's own folder. Another instance's extensions and settings are never written, renamed or deleted.
+- **Trusted without being unsafe.** Workspace Trust stays on. The plugin writes VS Code's own trust record for the vault folder, and only that folder, so the tab opens trusted with no click, on a fallback port too. `security.workspace.trust.*` keys are stripped from the copied settings.
+- **A tab that is only an editor.** VS Code has no setting that hides every part of its workbench, so the plugin writes the settings that exist and runs a small script in the page that calls VS Code's own close commands for the rest. Chords that would bring a hidden part back are switched off in an overlay block at the end of the tab's `keybindings.json`; your copied keybindings above it stay byte for byte as they were. If a VS Code update renames a part, that part simply shows again; the tab still works.
+- **Keys survive the embed.** An embedded page swallows keys, so Obsidian's hotkeys do nothing inside it. A tiny script inside the page watches for exactly two chords (the ones Obsidian has for the terminal drawer and the quick switcher) and reports only the action's name back. It never sends the keys or any text typed. The chords follow Settings > Hotkeys.
+- **Renames carry unsaved work.** Rename or move a file in Obsidian and the tab follows it. If the tab had unsaved edits, they are moved into the renamed file after you save, never over something another tool wrote in the meantime.
+- **No telemetry.** The plugin adds none, and VS Code telemetry, extension auto-update, update checks and experiments are switched off. See [Network use](#network-use) for the one download and the two requests that cannot be switched off.
+
+### Engineering
+
+- About 14,000 lines of TypeScript in 78 modules and 3,500 tests across 118 files, including a real VS Code web server and headless Chrome in `npm run check:workbench` and checks that drive the plugin inside Obsidian in a container.
+- The community store's automated review reproduces the release `main.js` byte for byte from the repository, finds no vulnerable dependencies and no obfuscation.
+- The design record (every unknown the build had to settle, with the measurement behind it) is in [`docs/`](docs/).
+
+---
 
 ## Network use
 
