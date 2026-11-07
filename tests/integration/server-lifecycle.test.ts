@@ -388,12 +388,15 @@ describe("start failures with real processes", () => {
 
 describe("G10 keep-alive with a real shell under the server", () => {
   /** The plugin's wiring: an idle clock on the manager whose shell input reads the real process table under the server's pid. */
-  function idleOn(m: ServerManager, idleMs: number, over: { pollMs?: number; read?: () => Promise<string> } = {}): IdleTimer {
+  function idleOn(m: ServerManager, idleMs: number, over: { pollMs?: number; read?: () => Promise<string>; onIdle?: () => void } = {}): IdleTimer {
     const idle = new IdleTimer({
       visibleCodeTab: () => false,
       hasDirtyBuffer: () => false,
       liveTerminalShell: () => hasLiveTerminalShell(m.serverInstance?.pid, over.read),
-      onIdle: () => m.stop("idle"),
+      onIdle: () => {
+        over.onIdle?.();
+        return m.stop("idle");
+      },
       idleMs,
       // A process table read takes tens of ms. By default the poll does not tick inside the re-check at the moment the clock
       // runs out: 1000 ms + one read lands between two ticks of a 400 ms poll. The race test below forces the tick into it.
@@ -422,23 +425,33 @@ describe("G10 keep-alive with a real shell under the server", () => {
     // Every read of the real process table takes 100 ms more (so 125-200 ms in all) and the poll ticks every 300 ms. The first read
     // ends at about 150 ms, so the clock runs out at about 1150 ms and its re-check reads until about 1300 ms: the poll at 1200 ms
     // lands inside it. (A poll faster than a read would starve every evaluation, which is not the case under test.)
+    let slowestRead = 0; // how long the slowest read took, so the limit below follows a loaded machine instead of failing on it
     const slowRead = async () => {
+      const began = Date.now();
       await new Promise((res) => setTimeout(res, 100));
-      return readProcessTable();
+      const table = await readProcessTable();
+      slowestRead = Math.max(slowestRead, Date.now() - began);
+      return table;
     };
     const idleMs = 1000;
-    idleOn(m, idleMs, { pollMs: 300, read: slowRead });
+    let idledAt = 0;
+    idleOn(m, idleMs, { pollMs: 300, read: slowRead, onIdle: () => void (idledAt ||= Date.now()) });
     // The clock starts when the server is running, so that is where the time is measured from: the start of the server itself
-    // (a spawn, a listening port) is slow under load and is not what is being timed.
+    // (a spawn, a listening port) is slow under load and is not what is being timed. It is measured to the moment the idle clock
+    // decides to stop (its onIdle), not to the server being gone: killing the process tree and the test's own polling are slow
+    // under a parallel run and are not what is being timed either.
     let runningAt = 0;
     m.onChange((state) => {
       if (state === "running" && runningAt === 0) runningAt = Date.now();
     });
     await m.ensureStarted();
     await until(() => expect(m.state).toBe("stopped-by-idle"));
-    // the stop lands at about 1300 ms after running; the old race left the server up and started a fresh idleMs countdown, a stop at 2300 ms or later
     expect(runningAt).toBeGreaterThan(0);
-    expect(Date.now() - runningAt).toBeLessThan(idleMs + 800);
+    expect(idledAt).toBeGreaterThan(0);
+    // Idle lands at about idleMs plus the two reads around the clock running out (about 1300 ms in all). The old race left the server
+    // up and started a fresh idleMs countdown, so idle landed a whole idleMs later (2300 ms or later). Three reads and 400 ms of
+    // slack are allowed on top of idleMs, which is under that on an idle machine, and wider when the reads themselves are slow.
+    expect(idledAt - runningAt).toBeLessThan(idleMs + 3 * slowestRead + 400);
   });
 
   it("with a live shell the state stays running well past idleMs; after the shell is killed it goes to stopped-by-idle", async () => {

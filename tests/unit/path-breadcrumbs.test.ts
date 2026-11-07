@@ -57,12 +57,19 @@ class FakeTitleParent {
 class FakeTitle {
   text = "VS Code"; // what the header holds before the tab knows its file
   onclick: ((evt: unknown) => unknown) | null = null;
+  oncontextmenu: ((evt: { preventDefault(): void }) => unknown) | null = null;
   style = { cursor: "" };
   setText(t: string): void {
     this.text = t;
   }
   click(): void {
     this.onclick?.({});
+  }
+  /** Right-click as the browser would; returns whether the page called preventDefault. */
+  rightClick(): boolean {
+    let prevented = false;
+    this.oncontextmenu?.({ preventDefault: () => void (prevented = true) });
+    return prevented;
   }
 }
 
@@ -251,16 +258,45 @@ describe("a Code tab's path", () => {
     expect(parent.spans).toEqual([]);
     expect(title.text).toBe("top.py");
   });
+
+  it("wires the host's tooltip and menu to the file name, by the file's full vault-relative path", async () => {
+    const fileTooltip = vi.fn();
+    const fileMenu = vi.fn();
+    const { view, title } = makeView({ fileTooltip, fileMenu });
+    await view.setState({ file: PD }, {} as never);
+    expect(fileTooltip).toHaveBeenCalledExactlyOnceWith(title, PD);
+    expect(title.rightClick()).toBe(true); // the browser's own menu is suppressed
+    expect(fileMenu).toHaveBeenCalledExactlyOnceWith(PD, expect.anything());
+  });
+
+  it("a host with no tooltip or menu leaves the file name click-only", async () => {
+    const { view, title } = makeView();
+    await view.setState({ file: PD }, {} as never);
+    expect(title.oncontextmenu).toBeNull();
+    expect(title.rightClick()).toBe(false);
+  });
+
+  it("follows a rename: a right-click on the name opens the menu for the new path, once", async () => {
+    const fileMenu = vi.fn();
+    const fileTooltip = vi.fn();
+    const { view, title } = makeView({ fileMenu, fileTooltip });
+    await view.setState({ file: "a/b/x.py" }, {} as never);
+    view.followTo("c/y.py");
+    expect(fileTooltip).toHaveBeenLastCalledWith(title, "c/y.py");
+    title.rightClick();
+    expect(fileMenu).toHaveBeenCalledExactlyOnceWith("c/y.py", expect.anything());
+  });
 });
 
 describe("renderFileTitle", () => {
   it("clears the name and the click for an empty path", () => {
     const title = new FakeTitle();
     const reveal = vi.fn();
-    renderFileTitle(title, "a/b.py", reveal);
+    renderFileTitle(title, "a/b.py", reveal, { menu: () => undefined });
     renderFileTitle(title, "", reveal);
     expect(title.text).toBe("");
     expect(title.onclick).toBeNull();
+    expect(title.oncontextmenu).toBeNull();
   });
 });
 
@@ -421,6 +457,68 @@ describe("the plugin's folder reveal", () => {
     Menu.created = [];
     const trigger = vi.fn();
     pluginWith({ vault: { getFolderByPath: () => null }, workspace: { trigger } }).folderMenu("gone", {});
+    expect(Menu.created).toEqual([]);
+    expect(trigger).not.toHaveBeenCalled();
+  });
+
+  it("tooltips the file name with the file's vault-relative path", () => {
+    const el = {};
+    const before = tooltips.length;
+    pluginWith({}).fileTooltip(el, "a/b/pd.js");
+    expect(tooltips.slice(before)).toEqual([{ el, text: "a/b/pd.js" }]);
+  });
+
+  /** An app with one file "a/b/x.js", a file explorer on or off, and a recording workspace.trigger. */
+  function fileMenuApp(explorer: { revealInFolder: ReturnType<typeof vi.fn> } | null) {
+    const file = { path: "a/b/x.js" };
+    const trigger = vi.fn();
+    const app = {
+      vault: { getFileByPath: (p: string) => (p === "a/b/x.js" ? file : null) },
+      workspace: { trigger },
+      internalPlugins: { getEnabledPluginById: (id: string) => (id === "file-explorer" ? explorer : null) },
+    };
+    return { app, file, trigger };
+  }
+
+  it("right-click on the file name builds a menu with Reveal in file explorer, then file-menu with the file explorer's source", () => {
+    Menu.created = [];
+    const revealInFolder = vi.fn();
+    const { app, file, trigger } = fileMenuApp({ revealInFolder });
+    const evt = { type: "contextmenu" };
+    pluginWith(app).fileMenu("a/b/x.js", evt);
+    expect(Menu.created).toHaveLength(1);
+    const menu = Menu.created[0];
+    expect(menu.forEventEvt).toBe(evt);
+    expect(menu.sections).toEqual(["title", "open", "action-primary", "action", "info", "info.copy", "view", "system", "", "danger"]);
+    expect(menu.items.map((i) => [i.title, i.section, i.icon])).toEqual([["Reveal in file explorer", "system", "lucide-folder-open"]]);
+    expect(trigger).toHaveBeenCalledExactlyOnceWith("file-menu", menu, file, FILE_EXPLORER_SOURCE);
+    menu.items[0].click();
+    expect(revealInFolder).toHaveBeenCalledExactlyOnceWith(file);
+  });
+
+  it("the plugin's own 'New terminal at folder' item is added to the file name's menu by its file-menu listener", () => {
+    Menu.created = [];
+    const { app } = fileMenuApp({ revealInFolder: vi.fn() });
+    const plugin = pluginWith(app);
+    app.workspace.trigger = vi.fn((name: string, menu: Menu, target: unknown, source: string) => {
+      if (name === "file-menu") (plugin as unknown as { onFileMenu(m: Menu, t: unknown, s: string): void }).onFileMenu(menu, target, source);
+    });
+    plugin.fileMenu("a/b/x.js", {});
+    expect(Menu.created[0].items.map((i) => i.title)).toContain(NEW_TERMINAL_TITLE);
+  });
+
+  it("with the file explorer off the file name's menu has no Reveal item, and still triggers file-menu", () => {
+    Menu.created = [];
+    const { app, trigger } = fileMenuApp(null);
+    pluginWith(app).fileMenu("a/b/x.js", {});
+    expect(Menu.created[0].items).toEqual([]);
+    expect(trigger).toHaveBeenCalledTimes(1);
+  });
+
+  it("right-click on a file that is not in the vault shows no menu", () => {
+    Menu.created = [];
+    const { app, trigger } = fileMenuApp({ revealInFolder: vi.fn() });
+    pluginWith(app).fileMenu("gone.js", {});
     expect(Menu.created).toEqual([]);
     expect(trigger).not.toHaveBeenCalled();
   });
