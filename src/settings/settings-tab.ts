@@ -3,7 +3,7 @@ import { chooseInstance, type Selection } from "../instances/choose";
 import type { CliCheck } from "../instances/probe";
 import { CUSTOM_ID, KNOWN_BUILDS, type Instance, type ScanResult } from "../instances/scan";
 import type { ServerState } from "../server-manager";
-import { addExtension, defaultShell, type WorkbenchSettings } from "./data";
+import { addExtension, type WorkbenchSettings } from "./data";
 import { describeExtensionsSection, LIST_FAILED, LIST_LOADING, renderExtensionList, renderExtensionsSection, type PortStatus, type SpikeResult } from "./extensions-section";
 import type { ExtensionListView } from "./extension-states";
 import { describeTrust, MANUAL_TRUST_STEPS } from "../trust/trust-message";
@@ -77,7 +77,7 @@ interface InstanceViewState {
   customResult: { tone: Tone; text: string } | null;
 }
 
-/** The settings tab: instances, custom CLI, excludes, the drawer toggle, the shell, the trust toggle, the Extensions section (its list and the spike result) and Restart server. */
+/** The settings tab: instances, custom CLI, excludes, the drawer toggle, the trust toggle, the Extensions section (its list and the spike result) and Restart server. */
 export class WorkbenchSettingTab extends PluginSettingTab {
   /** Bumped by every display(): an answer that belongs to an older display is dropped. */
   private renderId = 0;
@@ -98,7 +98,7 @@ export class WorkbenchSettingTab extends PluginSettingTab {
     // The scan answers later; everything else is drawn at once.
     this.loadInstances(containerEl.createDiv(), render, { appliesNextStart: false, customResult: null });
     this.renderExcludes(containerEl.createDiv());
-    this.renderDrawerAndShell(containerEl);
+    this.renderDrawerToggle(containerEl);
     this.renderTrust(containerEl.createDiv());
     // Read once, here: the section shows the recorded result and the port as they are when settings opens.
     const list = renderExtensionsSection(containerEl.createDiv(), describeExtensionsSection(this.host.spikeResult(), this.host.portStatus(), this.profileState(), this.disabledListsState(), Date.now()));
@@ -291,24 +291,16 @@ export class WorkbenchSettingTab extends PluginSettingTab {
     }
   }
 
-  // --- Drawer toggle and shell ----------------------------------------------
+  // --- Drawer toggle ----------------------------------------------
 
-  private renderDrawerAndShell(el: HTMLElement): void {
+  private renderDrawerToggle(el: HTMLElement): void {
     const s = this.host.workbenchSettings();
     new Setting(el)
       .setName("Terminal drawer over non-code views")
-      .setDesc("Show the terminal strip and drawer over notes, canvas, graph and PDF as well as Code tabs. Off hides the strip, the drawer and the hotkey over those views (shells keep running and the status bar shows how many); a Code tab always has them. Takes effect at once.")
+      .setDesc("Show the thin line at the bottom of the main pane area, which opens the terminal drawer, over notes, canvas, graph and PDF as well as Code tabs. Off hides that line over those views; a Code tab always has it. The hotkey and the Toggle terminal drawer command still open the drawer over any view, and an open drawer stays open. Takes effect at once.")
       .addToggle((t) => {
         t.setValue(s.nonCodeDrawer);
         t.onChange((v) => void this.host.updateSettings({ nonCodeDrawer: v }));
-      });
-    const fallback = defaultShell();
-    new Setting(el)
-      .setName("Shell")
-      .setDesc(`The shell the terminal drawer starts. Leave empty for the default (${fallback}). Stored here; the drawer reads it.`)
-      .addText((t) => {
-        t.setPlaceholder(fallback).setValue(s.shellPath);
-        t.onChange((v) => void this.host.updateSettings({ shellPath: v.trim() }));
       });
   }
 

@@ -14,7 +14,7 @@ export interface MirrorFs {
   copyFile(src: string, dst: string): Promise<void>;
   readFile(file: string, encoding: "utf8"): Promise<string>;
   readdir(dir: string): Promise<string[]>;
-  stat(file: string): Promise<{ mtimeMs: number }>;
+  stat(file: string): Promise<{ mtimeMs: number; size: number }>;
   writeFile(file: string, data: string): Promise<void>;
   rename(from: string, to: string): Promise<void>;
   rm(target: string, opts: { recursive?: boolean; force?: boolean }): Promise<void>;

@@ -33,6 +33,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { listedIn } from "./listed-in.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const CODE = process.env.CODE_CLI ?? "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code";
@@ -139,13 +140,6 @@ const activations = (serverData) => {
   const f = path.join(serverData, "extensions", path.basename(extDir), "activated.log"); // the symlink resolves to extDir
   return fs.existsSync(f) ? fs.readFileSync(f, "utf8").split("\n").filter(Boolean).length : 0;
 };
-
-// What the plugin shares since PR-5: the extensions the profile lists. This check has no desktop state, so it shares every entry of the folder's own extensions.json.
-function listedIn(dir) {
-  const file = path.join(dir, "extensions.json");
-  if (!fs.existsSync(file)) return [];
-  return JSON.parse(fs.readFileSync(file, "utf8")).map((entry) => ({ id: String(entry.identifier?.id ?? "").toLowerCase(), folder: entry.relativeLocation, entry }));
-}
 
 const cliData = path.join(work, "cli-data");
 if (haveServer) fs.cpSync(CLI_DATA_SRC, cliData, { recursive: true, mode: fs.constants.COPYFILE_FICLONE });

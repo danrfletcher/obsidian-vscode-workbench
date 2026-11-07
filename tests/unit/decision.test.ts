@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { parseDecision, stopMessage } from "../decision";
+import { chromeStopMessage, parseDecision, stopMessage } from "../decision";
 import { REPO_ROOT } from "../helpers";
 
 const ok = "---\nembed: works\nchrome: hidden\nhotkey_bridge: yes\nextensionless: intercept\n---\nbody";
@@ -39,6 +39,25 @@ describe("stopMessage", () => {
   });
 });
 
+describe("chromeStopMessage: the side bar stop rule (E10)", () => {
+  // side bar hideable on 1.143.1, on 1.144.0 -> stops?
+  const table: Array<[boolean, boolean, boolean]> = [
+    [true, true, false],
+    [true, false, false], // one build hiding it is a pass; the other build's gap goes in the report
+    [false, true, false],
+    [false, false, true], // neither build: STOP
+  ];
+  it.each(table)("1.143.1 hideable %s, 1.144.0 hideable %s -> stop %s", (older, newer, stops) => {
+    const message = chromeStopMessage({ "1.143.1": older, "1.144.0": newer });
+    if (stops) expect(message).toMatch(/^STOP: ask Dan/);
+    else expect(message).toBeNull();
+  });
+
+  it("covers every combination of the two builds", () => {
+    expect(new Set(table.map(([a, b]) => `${a}/${b}`)).size).toBe(4);
+  });
+});
+
 describe("docs/spike-decision.md", () => {
   const text = fs.readFileSync(path.join(REPO_ROOT, "docs/spike-decision.md"), "utf8");
 
@@ -49,6 +68,25 @@ describe("docs/spike-decision.md", () => {
   it("is not a failed spike: a `fails` embed turns this test red with the STOP message", () => {
     const stop = stopMessage(parseDecision(text));
     expect(stop, stop ?? "").toBeNull();
+  });
+
+  it("records chrome: hidden, and no longer says the chrome is visible or lists the side bar as shown (PR-2)", () => {
+    expect(parseDecision(text).chrome).toBe("hidden");
+    expect(text).not.toMatch(/chrome:\s*visible\b/);
+    expect(text).not.toMatch(/F11/);
+    expect(text).not.toMatch(/stays visible in the product|does not hide it until PR-2|side bar stays visible/i);
+    const row = text.split("\n").find((l) => l.startsWith("|") && l.toLowerCase().includes("chrome hiding"))!;
+    expect(row).toMatch(/\| WORKS \|/);
+    expect(row).toContain("src/chrome-script.ts");
+    // the conditional-checks table names the check that all eight parts are not visible, and has no row for shipping chrome visible
+    expect(text).toContain("`chrome: hidden` (now)");
+    expect(text).not.toMatch(/\|\s*`chrome: visible`\s*\|/);
+  });
+
+  it("keeps the 0.1.0 plan's F2 and F5 labels as history, with a note that they belong to that plan", () => {
+    expect(text).toContain("labels F2");
+    expect(text).toMatch(/belong to the 0\.1\.0 plan and are kept as history/);
+    expect(text).toContain("Outbound connections (F5)");
   });
 
   it("records every unknown with a result and lists the conditional checks", () => {

@@ -27,8 +27,19 @@ const rel = (f: string) => path.relative(root, f);
 const grep = (re: RegExp) => SRC.filter((f) => re.test(fs.readFileSync(f, "utf8"))).map(rel);
 
 describe("F7: no file watchers on the instance's folders; the spike reads state once, on demand", () => {
-  it("src/ has no fs.watch, watchFile, watch(...) from fs, or chokidar", () => {
-    expect(grep(/\bfs\.watch\b|\bwatchFile\b|\bunwatchFile\b|chokidar|from "node:fs"[^\n]*\bwatch\b|\bfs\.promises\.watch\b/)).toEqual([]);
+  // The one exception is the text of the terminal-at extension (PR-5), which VS Code's extension host runs, not the plugin: it
+  // watches the plugin's own `requests` folder inside the extension's folder to see a "New terminal at folder" request. It never
+  // watches an instance's folder, the profile or the vault.
+  const TERMINAL_AT = "src/terminal-host/terminal-at-extension.ts";
+  it("src/ has no fs.watch, watchFile, watch(...) from fs, or chokidar (the terminal-at extension's own requests folder aside)", () => {
+    expect(grep(/\bfs\.watch\b|\bwatchFile\b|\bunwatchFile\b|chokidar|from "node:fs"[^\n]*\bwatch\b|\bfs\.promises\.watch\b/).filter((f) => f !== TERMINAL_AT)).toEqual([]);
+  });
+
+  it("the terminal-at extension watches only its own requests folder", () => {
+    const text = fs.readFileSync(path.join(root, TERMINAL_AT), "utf8");
+    expect([...text.matchAll(/\bfs\.watch\(([^,)]*)/g)].map((m) => m[1])).toEqual(["dir"]);
+    expect(text).toContain('const dir = path.join(ctx.extensionPath, ${JSON.stringify(REQUESTS_DIR)})');
+    expect(text).not.toMatch(/watchFile|chokidar/);
   });
 
   it("the Extensions section starts no timer and has no import of fs: it draws what it is given", () => {

@@ -153,7 +153,7 @@ async function build(input: ExtensionListInput, deps: ListDeps): Promise<Extensi
     located.map(async (l): Promise<ExtensionRow> => {
       const fact = log.found ? log.facts.get(l.ext.id) : undefined;
       const facts: LogFacts = log.found ? { found: true, failed: fact?.kind === "failed" ? { reason: fact.reason } : null, activated: fact?.kind === "active" } : { found: false };
-      const resolved = resolveState({ disabled: l.off, untrusted, log: facts });
+      const resolved = resolveState({ disabled: l.off, untrusted, trustSeedOff: !input.trustSeedOn, log: facts });
       return { ...(await describe(io, l)), state: resolved.state, stateLabel: resolved.label, reason: resolved.reason };
     }),
   );

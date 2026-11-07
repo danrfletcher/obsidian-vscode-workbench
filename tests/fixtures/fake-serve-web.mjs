@@ -12,10 +12,32 @@
 //                downloading the server, please retry: ..."
 //   download-error-log  like offline, but each attempt also logs an error-level line about the download
 //   slow-download  a real, slow download: FAKE_CODE_DOWNLOAD_REQUESTS=n requests answer 202, "Downloading server" is logged once
+//   workbench    answer a request with a page that has the parts of the VS Code workbench under their real class names
+//                (fake-workbench-page.mjs, imported only in these two modes: other tests copy this file alone), built a moment after
+//                load, that applies the browser profile's settings and keybindings and a saved layout. The file to open is the
+//                first entry of the URL's `payload`, as the Code tab builds it
+//   workbench-renamed  the same page with every class name of every part changed, as after a VS Code update that renamed them
 //   hang         never listen
 // FAKE_CODE_DOWNLOAD_REQUESTS=n makes the first n requests answer 202 (server still downloading).
+// FAKE_CODE_SHELL_PORT=p makes the server start a terminal the way the real one's pty host does: a shell in its own
+//   process group (the pty's session) with a child `python3 -m http.server p --bind 127.0.0.1`. The shell's pid is
+//   appended to FAKE_CODE_SHELL_PIDFILE. The shell is a descendant of the server and carries neither the server's
+//   token-file path nor "serve-web" on its command line, like a real shell under the pty host. FAKE_CODE_SHELL_NOHUP_PIDFILE=f adds
+//   a `nohup sleep 307 &` child of that shell, its pid appended to f.
+// FAKE_CODE_SHELLS=n makes the server hold n live terminal children, started the way a shell of the real server is: children of the
+//   server in its own process group, not detached. FAKE_CODE_SHELL_KINDS=a,b,c (default: all `sleep`) picks each child's kind, in
+//   order and repeating: `sleep` is a bare `sleep 600` (an idle shell), `fg` a shell with a foreground child (`sh -c 'sleep 600; true'`),
+//   `ignore` a shell that ignores SIGTERM and SIGHUP and keeps starting `sleep 600` (only SIGKILL ends it). One more child is
+//   started the way a `nohup`/`setsid` process is: in a session of its own and re-parented to init, so neither the tree nor the
+//   process group of the server reaches it. Their pids go to FAKE_CODE_PIDFILE after the server's own, one per line, as
+//   `shell <pid>` and `setsid <pid>` (the server's line is a bare number, so a reader that wants only servers still gets them).
+// FAKE_CODE_TERMINAL_PIDFILE=f makes the server start a pty host the way the real one does (fake-pty-host.mjs: a node process
+//   with `--type=ptyHost` on its command line) whose one terminal is a long-lived `sh`. The shell's pid is appended to f.
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const args = process.argv.slice(2);
 const arg = (name) => {
@@ -27,6 +49,38 @@ const token = fs.readFileSync(tokenFile, "utf8").trim();
 const mode = process.env.FAKE_CODE_MODE;
 
 if (process.env.FAKE_CODE_PIDFILE) fs.appendFileSync(process.env.FAKE_CODE_PIDFILE, `${process.pid}\n`);
+if (process.env.FAKE_CODE_SHELLS) {
+  const kinds = (process.env.FAKE_CODE_SHELL_KINDS || "sleep").split(",");
+  const commands = {
+    sleep: ["sleep", ["600"]],
+    fg: ["sh", ["-c", "sleep 600; true"]],
+    ignore: ["sh", ["-c", "trap '' TERM HUP; while :; do sleep 600; done"]],
+  };
+  for (let i = 0; i < Number(process.env.FAKE_CODE_SHELLS); i++) {
+    const [cmd, cmdArgs] = commands[kinds[i % kinds.length]];
+    const child = spawn(cmd, cmdArgs, { stdio: "ignore" });
+    child.unref();
+    if (process.env.FAKE_CODE_PIDFILE) fs.appendFileSync(process.env.FAKE_CODE_PIDFILE, `shell ${child.pid}\n`);
+  }
+  // The process that outlives its shell and its server: a background `nohup sleep` of a shell that then exits, in its own session.
+  const out = spawnSync("sh", ["-c", "nohup sleep 600 >/dev/null 2>&1 & echo $!"], { encoding: "utf8", detached: true });
+  const survivor = Number(out.stdout.trim());
+  if (survivor && process.env.FAKE_CODE_PIDFILE) fs.appendFileSync(process.env.FAKE_CODE_PIDFILE, `setsid ${survivor}\n`);
+}
+if (process.env.FAKE_CODE_SHELL_PORT) {
+  // `; true` keeps the shell alive as the parent (without it, sh -c would exec the last command in place).
+  // FAKE_CODE_SHELL_NOHUP_PIDFILE=f: the shell first does `nohup sleep 307 & disown`-style work, so a nohup process is still a child of the
+  //   shell (the tree reaches it) and its pid is appended to f. Without it there is no such process.
+  const nohupFile = process.env.FAKE_CODE_SHELL_NOHUP_PIDFILE;
+  const nohup = nohupFile ? `nohup sleep 307 >/dev/null 2>&1 & echo $! >> '${nohupFile.replace(/'/g, "'\\''")}'; ` : "";
+  const shell = spawn("sh", ["-c", `${nohup}python3 -m http.server ${process.env.FAKE_CODE_SHELL_PORT} --bind 127.0.0.1; true`], { detached: true, stdio: "ignore", env: { ...process.env, FAKE_CODE_SHELL_PORT: "", FAKE_CODE_PIDFILE: "", FAKE_CODE_SHELL_NOHUP_PIDFILE: "" } });
+  shell.unref();
+  if (process.env.FAKE_CODE_SHELL_PIDFILE) fs.appendFileSync(process.env.FAKE_CODE_SHELL_PIDFILE, `${shell.pid}\n`);
+}
+if (process.env.FAKE_CODE_TERMINAL_PIDFILE) {
+  const ptyHost = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-pty-host.mjs");
+  spawn(process.execPath, [ptyHost, "--type=ptyHost"], { detached: true, stdio: "ignore", env: process.env }).unref();
+}
 if (process.env.FAKE_CODE_ARGSFILE) fs.writeFileSync(process.env.FAKE_CODE_ARGSFILE, JSON.stringify(args));
 
 if (mode === "exit-early") {
@@ -83,6 +137,17 @@ if (mode === "hang") {
         console.log(`[${stamp()}] info Downloading server ${commit}`);
       }
       res.writeHead(202).end("downloading");
+      return;
+    }
+    if (mode === "workbench" || mode === "workbench-renamed") {
+      let files = [];
+      try {
+        const payload = JSON.parse(url.searchParams.get("payload") ?? "[]");
+        if (typeof payload?.[0]?.[1] === "string") files = [payload[0][1]];
+      } catch {
+        // no usable payload: a page with no file
+      }
+      import("./fake-workbench-page.mjs").then(({ fakeWorkbenchHtml }) => res.writeHead(200, { "content-type": "text/html" }).end(fakeWorkbenchHtml({ renamed: mode === "workbench-renamed", files })));
       return;
     }
     res.writeHead(302, { location: "/" }).end();

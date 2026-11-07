@@ -116,6 +116,15 @@ describe("resolveState: label and reason wording per state", () => {
     });
   });
 
+  it("inactive with the trust seed off: the reason names Restricted Mode, and only an inactive row says so", () => {
+    expect(resolveState(facts({ trustSeedOff: true })).reason).toBe(
+      "not activated; the trust setting above is off, so the tab may be in Restricted Mode, which keeps extensions that need a trusted folder from running",
+    );
+    expect(resolveState(facts({ trustSeedOff: true, log: ACTIVE })).reason).toBe("activated by the extension host");
+    expect(resolveState(facts({ trustSeedOff: true, log: NO_LOG })).reason).toBe("no extension host log found");
+    expect(resolveState(facts({ trustSeedOff: false })).reason).toContain("not activated yet");
+  });
+
   it("inactive with no log: the note \"no extension host log found\"", () => {
     expect(resolveState(facts({ log: NO_LOG }))).toEqual({ state: "inactive", label: "inactive", reason: "no extension host log found" });
   });

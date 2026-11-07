@@ -1,19 +1,24 @@
-import { FileSystemAdapter, ItemView, Notice, Platform, Plugin, TFile, type TAbstractFile, type Tasks, type WorkspaceLeaf } from "obsidian";
+import { FileSystemAdapter, ItemView, Keymap, Menu, Notice, Platform, Plugin, TFile, setTooltip, type TAbstractFile, type Tasks, type WorkspaceLeaf } from "obsidian";
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import { checkFile, refusalMessage } from "./binary-guard";
 import { ChildRegistry } from "./child-registry";
 import { AUTO_SAVE_KEY, autoSaveMode, withAutoSaveDefault, type AutoSave } from "./dirty-guard";
 import { ownerOfExtension, type ViewRegistryLike } from "./coexistence";
-import { CodeView, VIEW_TYPE_CODE, baseName, type CodeViewHost, type EmbedElement } from "./code-view";
+import { CodeView, VIEW_TYPE_CODE, baseName, type ChromeHiding, type CodeViewHost, type EmbedElement } from "./code-view";
 import { ExtensionRegistry } from "./extension-registry";
 import { scanVault } from "./extension-scan";
 import { createClickInterceptor, readMode, type ClickLike, type ExtensionlessMode } from "./extensionless-intercept";
 import { describeFailure, type StartFailure } from "./failure-messages";
 import { IdleTimer } from "./idle-timer";
+import { hasLiveTerminalShell, liveShellPids } from "./terminal-keepalive";
+import { restartPrompt, type ShellAnswer } from "./restart-prompt";
+import { readProcessTable } from "./process-utils";
 import { LicenceDeclinedError, LicenceGate } from "./licence";
-import { promptCloseDirty, promptKillShell, promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard, type CloseDirtyRequest } from "./modals";
+import { promptCloseDirty, promptLicence, promptRestartWithDirty, promptReuseBuild, promptSaveFailed, promptSaveOrDiscard, type CloseDirtyRequest } from "./modals";
 import { OpenFiles } from "./open-file";
+import { openCodeTabOnce, openFromEditor as routeEditorOpen } from "./open-from-editor";
+import { normalizeLine, type EditorTarget } from "./paths";
 import { PidFile, sweepOrphans } from "./pidfile";
 import { carryEdits as carryEditsOnDisk, readBaseline as readBaselineOnDisk, statSignature as statSignatureOnDisk, type CarryResult } from "./rename-carry";
 import {
@@ -40,15 +45,24 @@ import { profileForInstance, userDataRootFor, type ProfileState } from "./profil
 import type { MirrorRequest, MirrorResult } from "./mirror/mirror";
 import { MirrorStateCache, profileExtensionsFile } from "./server/shared-extensions";
 import { instanceUserDir, profileSeedSource, seedUserData } from "./server/user-data-seed";
-import { dataObject, effectiveShell, readSettings, type WorkbenchSettings } from "./settings/data";
+import { dataObject, readSettings, type WorkbenchSettings } from "./settings/data";
 import { type PortStatus, type SpikeResult } from "./settings/extensions-section";
 import { SPIKE_RESULT } from "./settings/spike-result";
 import { buildExtensionList } from "./settings/extension-list";
 import type { ExtensionListView } from "./settings/extension-states";
 import { WorkbenchSettingTab, type SettingsHost } from "./settings/settings-tab";
-import { workbenchOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
-import { DEVICE_ID_KEY } from "./terminal/drawer-state";
-import { TerminalFeature } from "./terminal/feature";
+import { workbenchOverlay, terminalOverlay, writeMachineSettings, type UserDataCopy } from "./settings";
+import { overlayKeybindings, unbindCommands } from "./chrome-settings";
+import { buildChromeHideScript } from "./chrome-script";
+import { DEVICE_ID_KEY, deviceId } from "./terminal/drawer-state";
+import { viewKind } from "./terminal/drawer-visibility";
+import { FocusReturn } from "./terminal/focus-return";
+import { HeightStore } from "./terminal/height-store";
+import { FILE_EXPLORER_SOURCE, addNewTerminalItem, type MenuLike, type MenuTarget } from "./terminal/new-terminal-menu";
+import { TerminalDrawer } from "./terminal/terminal-drawer";
+import { TerminalHostPage } from "./terminal-host/host-page";
+import { newTerminalAtFolder } from "./terminal-host/new-terminal";
+import { requestPanel } from "./terminal-host/terminal-at-extension";
 import { TabRegistry } from "./tab-registry";
 import { decideFile, extensionOf, fileName, opensInCodeTab } from "./text-file-rules";
 import { isDarkBody, themeSwitchMessage, ThemeSync } from "./theme-map";
@@ -59,6 +73,11 @@ export const SPIKE_FILE = "AWS SA Associate Mock Exams/scripts/estimate_time.py"
 
 /** The least time between two rescans triggered by the window regaining focus (files made outside Obsidian). */
 const FOCUS_RESCAN_MS = 30_000;
+
+/** Whether a start (or restart) that fails raises the failure Notice. The terminal page asks quietly: it shows the reason itself. */
+interface StartNotice {
+  notify: boolean;
+}
 
 interface WorkbenchData extends Partial<WorkbenchSettings> {
   /** Hand-edited; path to a `code` CLI. When set it overrides the instance chosen in the settings tab. */
@@ -74,7 +93,7 @@ interface WorkbenchData extends Partial<WorkbenchSettings> {
   serverLicenceAccepted?: boolean;
   /** The last server build that started: lets an offline re-download after a VS Code update name the change. */
   lastServer?: { commit: string; version: string };
-  /** The terminal drawer's height and open state, per device: `{ [deviceId]: { height, open } }`. */
+  /** The terminal drawer's height, per device: `{ [deviceId]: { height } }`. The open state is never stored. */
   drawer?: unknown;
 }
 
@@ -109,18 +128,25 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   private gate!: LicenceGate;
   private idle!: IdleTimer;
   private serverRequest: Promise<RunningServer> | null = null;
+  /** Whether the start in `serverRequest` shows a failure Notice: false while only the terminal page asked (it shows the reason itself). */
+  private serverFlow: StartNotice = { notify: false };
   private restarting: Promise<void> | null = null;
+  private restartFlow: StartNotice = { notify: false };
   private lastBuild: CodeBuild | null = null;
   /** The instance's settings and keybindings as copied at the last server start; the Code tab seeds its browser profile from it. */
   private copy: UserDataCopy | null = null;
-  private terminal: TerminalFeature | null = null;
+  /** The bottom edge and the drawer: shows, hides and sizes the terminal host page. Null where there is no desktop app. */
+  private drawer: TerminalDrawer | null = null;
+  private heightStore: HeightStore | null = null;
+  /** The terminal host page (VS Code's own terminal panel in a webview). Made at the first show, kept mounted until unload. */
+  private terminalHost: TerminalHostPage | null = null;
   /** The hotkey bridge: carries Ctrl+` and the quick switcher out of the embed (G8, G1). Null until onload; inactive when the spike decision is `no`. */
   private keyRelay: EmbedKeyRelay | null = null;
   private bridgeToggle: DrawerToggle | null = null;
   private chordTimer: ReturnType<typeof setInterval> | null = null;
   private instances = new InstanceService();
   private cachedBefore: ReadonlySet<string> = new Set();
-  /** Why the last start did not use the stored stable port (null when it did, or none is stored). */
+  /** Why the running server did not use the stored stable port (null when it did, none is stored, or no server is running). */
   private portNote: string | null = null;
   /** The mirrored profile as the last read left it. Read at the first start, at Restart server and when a start's instance differs from the one it was read for; never on an idle restart on the same instance or when settings opens. */
   private profile: ProfileState = { status: "not-read" };
@@ -136,8 +162,10 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
    * on an idle restart.
    */
   private mirrorCache = new MirrorStateCache();
-  /** What the trust seed answered at the last Code tab load that ran it; shown in settings. In memory only: nothing about it is stored. */
+  /** What the trust seed answered at the last Code tab load that ran it, during the current server run; shown in settings. In memory only: nothing about it is stored, and it is cleared whenever the server is not running. */
   private lastTrustOutcome: string | null = null;
+  /** Tests only: replaces the process table reader that the live-shell check uses (a fake clock cannot wait for a real `ps`). */
+  private processTable: () => Promise<string> = readProcessTable;
   /** Tests only: replaces the reachability check that turns a failed download into "the network is unreachable". */
   private downloadHostReachable?: () => Promise<boolean>;
 
@@ -164,11 +192,20 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.idle = new IdleTimer({
       visibleCodeTab: () => [...this.views].some((v) => v.isVisible()),
       hasDirtyBuffer: async () => (await this.dirtyViews()).length > 0,
+      // A live terminal shell under the server keeps it up, drawer shown or hidden (G10). Read from the server's own process tree.
+      liveTerminalShell: () => hasLiveTerminalShell(this.manager.serverInstance?.pid, () => this.processTable()),
       onIdle: () => this.manager.stop("idle"),
     });
     this.manager.onChange((state) => {
       if (state === "running") this.idle.start();
       else this.idle.stop();
+      // Both describe one run of the server (the port the start picked, the Code tab's trust seed): once it is not running they would
+      // describe a run that is over, so settings must not show them (the next start and the next tab load set them again).
+      if (state !== "running") {
+        this.portNote = null;
+        this.lastTrustOutcome = null;
+      }
+      this.terminalFollowsServer(state);
     });
 
     // A server left over from a crash or force-quit is swept before anything new starts (E11).
@@ -196,47 +233,45 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     });
     this.addSettingTab(new WorkbenchSettingTab(this.app, this, this));
 
-    // The terminal drawer: a strip along the bottom of the window, one shell on the first reveal, more from the +
-    // button. It needs neither a Code tab nor the VS Code server, and it is desktop only (F1). The page is drawn
-    // once the workspace is ready (below).
+    // The terminal drawer: a thin edge along the bottom of the main pane area, and the terminal host page behind it (VS Code's
+    // own terminal). It is desktop only and only in the main window (F7): the edge and the drawer go on this window's
+    // document, so a pop-out window gets neither. The page is drawn once the workspace is ready (below).
     if (Platform.isDesktopApp) {
-      this.terminal = new TerminalFeature({
-        document,
-        window,
-        vaultRoot: () => this.vaultRoot(),
-        activeFile: () => this.activeFilePath(),
+      this.heightStore = new HeightStore({
         data: () => this.data_ as Record<string, unknown>,
         save: () => this.saveData(this.data_),
-        shell: () => effectiveShell(this.workbenchSettings()),
-        runtimeDir: () => this.runtimeDir(),
-        registry: this.registry,
-        deviceStore: {
+        deviceId: deviceId({
           get: () => this.app.loadLocalStorage?.(DEVICE_ID_KEY),
           set: (id) => this.app.saveLocalStorage?.(DEVICE_ID_KEY, id),
-        },
-        nonCodeDrawer: () => this.workbenchSettings().nonCodeDrawer,
-        activeViewType: () => this.mainViewType(),
-        codeViewType: VIEW_TYPE_CODE,
-        addStatusBarItem: () => this.addStatusBarItem(),
-        confirmKill: (title) => promptKillShell(this.app, title),
-        focusEditor: () => this.focusActiveEditor(),
-        toggleChords: () =>
-          resolveChords((id) => this.hotkeysOf(id), this.isMac()).chords.filter((c) => c.action === "toggle-terminal"),
+        }),
+        windowHeight: () => window.innerHeight,
       });
-      this.bridgeToggle = new DrawerToggle(this.terminal);
+      this.drawer = new TerminalDrawer({
+        document,
+        window,
+        host: () => this.terminalHostPage(),
+        initialHeight: this.heightStore.read(),
+        saveHeight: (height) => this.heightStore?.write(height),
+        viewKind: () => viewKind(this.mainViewType(), VIEW_TYPE_CODE),
+        nonCodeDrawer: () => this.workbenchSettings().nonCodeDrawer,
+        focus: new FocusReturn<WorkspaceLeaf>({
+          activeLeaf: () => this.activeLeaf(),
+          isAlive: (leaf) => this.leafIsAlive(leaf),
+          focusLeaf: (leaf) => this.focusLeafView(leaf),
+        }),
+      });
+      this.bridgeToggle = new DrawerToggle(this.drawer);
       this.addCommand({
         id: "toggle-terminal-drawer",
         name: "Toggle terminal drawer",
         // Ctrl, not Mod: on macOS Mod is Cmd, and Ctrl+` is the VS Code binding. Rebindable in Obsidian's hotkey settings.
+        // An explicit action: it opens the drawer over every view, whatever the non-code setting says (G6).
         hotkeys: [{ modifiers: ["Ctrl"], key: "`" }],
-        // Over a note, canvas, graph or PDF with the non-code setting off the command is unavailable, so the hotkey does nothing (G11).
-        checkCallback: (checking: boolean) => {
-          const terminal = this.terminal;
-          if (!terminal || !terminal.hotkeyEnabled()) return false;
-          if (!checking) terminal.toggle();
-          return true;
-        },
+        callback: () => this.drawer?.toggle(),
       });
+      // "New terminal at folder" in the file explorer's right-click menu (G8). The single-item `file-menu` only: a multi-selection
+      // fires `files-menu`, which is not listened to, so one choice is never several terminals.
+      this.registerEvent(this.app.workspace.on("file-menu", (menu: Menu, file: TAbstractFile, source: string) => this.onFileMenu(menu, file, source)));
     }
 
     // The hotkey bridge (E12): installed only when the recorded spike decision allows it. It follows the hotkeys
@@ -257,7 +292,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.registerEvent(
       this.app.workspace.on("css-change", () => {
         void this.themeSync.set(this.isDark());
-        this.terminal?.themeChanged();
+        void this.terminalHost?.themeChanged(this.isDark());
       }),
     );
     // A tab shown, hidden or closed changes what the idle clock sees; a tab left behind by an idle stop wakes the server.
@@ -265,9 +300,9 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       for (const v of this.views) v.notifyVisible();
       void this.idle.evaluate();
       this.keyRelay?.sync();
-      // The tab the user is on decides whether the strip and drawer show (G11); a moved pane or sidebar changes the drawer's bounds.
-      this.terminal?.applyVisibility();
-      this.terminal?.layoutChanged();
+      // The tab the user is on decides whether the edge shows (G6); a moved pane or sidebar changes the drawer's bounds.
+      this.drawer?.applyVisibility();
+      this.drawer?.layoutChanged();
     };
     this.registerEvent(this.app.workspace.on("active-leaf-change", visibilityChanged));
     this.registerEvent(this.app.workspace.on("layout-change", visibilityChanged));
@@ -285,7 +320,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     // `beforeunload` that gets cancelled or is still waiting on the quit tasks; after a finished quit the
     // server is already stopped, so this finds nothing to do.
     this.registerDomEvent(window, "pagehide", () => {
-      void this.manager.shutdown();
+      void this.shutdownAll();
     });
 
     // Every extension found in the vault is registered against the Code tab, now and as new files appear (GP1).
@@ -296,7 +331,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     // The scan runs in the background in small slices; nothing waits for it.
     this.app.workspace.onLayoutReady(() => {
       if (this.unloaded) return;
-      this.terminal?.mount();
+      this.drawer?.mount();
       this.registerEvent(this.app.vault.on("create", (f) => this.onFileAppeared(f)));
       this.registerEvent(this.app.vault.on("rename", (f) => this.onFileAppeared(f)));
       // Open Code tabs follow the vault (G3): a rename or move re-points the tab, a delete closes it. A modify is
@@ -346,8 +381,14 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.keyRelay?.dispose();
     this.keyRelay = null;
     this.bridgeToggle = null;
-    // The drawer's shell and its helper go too; the kill signals are sent before this returns.
-    void this.terminal?.dispose();
+    // The terminal host page goes with the plugin: no webview left behind (a start still running is dropped at its next step).
+    // It goes before the server stops, so the page never reloads onto a dying server and no banner or lost message shows.
+    this.endTerminalPage();
+    // The edge and the layout variables go off the page, and the drawer height still waiting to be written is written.
+    this.drawer?.dispose();
+    this.drawer = null;
+    this.heightStore?.flush();
+    this.heightStore = null;
     // shutdown() sends its kill signals synchronously; unload does not wait for the exit.
     void this.manager?.shutdown();
   }
@@ -380,10 +421,13 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return manager?.getHotkeys?.(commandId) ?? manager?.getDefaultHotkeys?.(commandId) ?? [];
   }
 
-  /** A bridged chord was pressed inside the embed. Only the action name arrived; nothing is logged. */
+  /** A bridged chord was pressed inside the embed or the terminal host page. Only the action name arrived; nothing is logged. */
   private onBridgedKey(action: BridgeAction, frame: RelayFrame): void {
     if (action === "toggle-terminal") {
-      this.bridgeToggle?.press(frame);
+      // From the terminal page the press gives no focus handle: closing the drawer sends focus back to the view that had it (G1),
+      // not to the webview that is being hidden.
+      const fromTerminal = (frame as unknown) === this.terminalHost?.webview;
+      this.bridgeToggle?.press(fromTerminal ? null : frame);
       return;
     }
     // The quick switcher: the embed gives up focus first so the switcher's search box gets the typing.
@@ -391,10 +435,28 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     (this.app as unknown as { commands?: { executeCommandById?(id: string): boolean } }).commands?.executeCommandById?.("switcher:open");
   }
 
-  /** Keyboard focus back to the editor of the tab the user is on (the drawer closed with focus in the terminal). */
-  private focusActiveEditor(): void {
-    const ws = this.app.workspace as unknown as { getActiveViewOfType?: (t: unknown) => unknown };
-    const view = ws.getActiveViewOfType?.(ItemView);
+  /** The leaf the user is on: the focused one (a sidebar's too), else the last used in the main area. */
+  private activeLeaf(): WorkspaceLeaf | null {
+    const ws = this.app.workspace as unknown as { getActiveViewOfType?: (t: unknown) => { leaf?: WorkspaceLeaf } | null };
+    return ws.getActiveViewOfType?.(ItemView)?.leaf ?? this.app.workspace.getMostRecentLeaf?.() ?? null;
+  }
+
+  /** The leaf is still in the workspace (its tab was not closed). */
+  private leafIsAlive(leaf: WorkspaceLeaf): boolean {
+    let found = false;
+    this.app.workspace.iterateAllLeaves?.((l) => {
+      if (l === leaf) found = true;
+    });
+    return found;
+  }
+
+  /** Keyboard focus into a leaf's view (the drawer hid): a Code tab's embed, or a note's editor. */
+  private focusLeafView(leaf: WorkspaceLeaf): void {
+    const active = document.activeElement as HTMLElement | null;
+    if (active?.tagName === "WEBVIEW") active.blur(); // the terminal page keeps focus otherwise, though it is hidden
+    const ws = this.app.workspace as unknown as { setActiveLeaf?: (l: WorkspaceLeaf, o?: { focus: boolean }) => void };
+    ws.setActiveLeaf?.(leaf, { focus: true });
+    const view = leaf.view as unknown;
     if (view instanceof CodeView) view.focusEmbed();
     else (view as { editor?: { focus?(): void } } | null | undefined)?.editor?.focus?.();
   }
@@ -449,6 +511,16 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return workbenchOverlay({ dark: this.isDark() });
   }
 
+  /** The terminal drawer's host page has an overlay of its own: it never reads the Code tab's hiding settings (F2). */
+  terminalOverlay(): Record<string, unknown> {
+    return terminalOverlay({ dark: this.isDark() });
+  }
+
+  /** The keybinding overlay and page script that keep the bars of a Code tab closed and the layout chords dead; read at every load (GP1, GP4). */
+  chromeHiding(): ChromeHiding {
+    return { keybindings: overlayKeybindings(), unbind: unbindCommands(), script: buildChromeHideScript() };
+  }
+
   /** Read at every tab load, so the toggle applies at the next load (G6). */
   trustVaultFolder(): boolean {
     return this.workbenchSettings().trustVaultFolder;
@@ -472,6 +544,11 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   }
 
   skipCloseGuard(): boolean {
+    return this.ending;
+  }
+
+  /** The plugin is going away for good (Obsidian is quitting, or the plugin unloaded): a start still under way must not go on to show a notice or spawn a server. */
+  private get ending(): boolean {
     return this.quitting || this.unloaded;
   }
 
@@ -486,8 +563,55 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return this.focusLeaf(leaf);
   }
 
+  isActiveTab(leaf: WorkspaceLeaf): boolean {
+    return this.activeLeaf() === leaf;
+  }
+
   openInNewTab(file: string): void {
     void this.openCodeFile(file);
+  }
+
+  /**
+   * A file was opened from inside the editor of the Code tab `from` (Go to Definition, quick open, a link). It becomes an Obsidian tab
+   * beside `from`, in front, at `line`; a tab that already shows it is focused instead; a note, canvas, base, image or PDF opens the
+   * way Obsidian opens it; a file outside the vault only gets a notice (E2, E3, E4).
+   */
+  async openFromEditor(from: WorkspaceLeaf, target: EditorTarget, line: number | null): Promise<void> {
+    // The new tab goes into the tab group of the active tab, so a Code tab in a split pane must be the active one first.
+    if (!this.isActiveTab(from)) (this.app.workspace as unknown as { setActiveLeaf?: (l: WorkspaceLeaf, o?: { focus: boolean }) => void }).setActiveLeaf?.(from, { focus: false });
+    await routeEditorOpen(target, line, {
+      excluded: () => this.workbenchSettings().excludeExtensions,
+      openCode: (file, at) => this.openCodeFile(file, at),
+      openInObsidian: (file) => this.openInObsidian(file),
+      notify: (message) => void new Notice(message, 10000),
+    });
+  }
+
+  /** Obsidian's usual open for a file that is not a Code tab's (a note, canvas, base, image or PDF): the tab that already shows it is focused, else a new tab. */
+  private async openInObsidian(file: string): Promise<void> {
+    const found = this.findVaultFile(file);
+    if (!found) {
+      new Notice(`VS Code Workbench: ${fileName(file)} is not in this vault, so Obsidian cannot open it.`, 10000);
+      return;
+    }
+    // One tab per file, as for Code tabs: reaching the same note again (a repeated Go to Definition) focuses the tab it is in.
+    const shown = this.leafShowing(found);
+    if (shown) {
+      await this.app.workspace.revealLeaf(shown);
+      (this.app.workspace as unknown as { setActiveLeaf?: (l: WorkspaceLeaf, o?: { focus: boolean }) => void }).setActiveLeaf?.(shown, { focus: true });
+      return;
+    }
+    await this.app.workspace.getLeaf("tab").openFile(found, { active: true });
+  }
+
+  /** The leaf of Obsidian's own view (not a Code tab) that shows `file`, if there is one. */
+  private leafShowing(file: TFile): WorkspaceLeaf | null {
+    let shown: WorkspaceLeaf | null = null;
+    this.app.workspace.iterateAllLeaves?.((leaf) => {
+      if (shown || leaf.view instanceof CodeView) return;
+      if ((leaf.view as { file?: { path?: string } } | null | undefined)?.file?.path === file.path) shown = leaf;
+    });
+    return shown;
   }
 
   readBaseline(file: string): Promise<Buffer | null> {
@@ -506,6 +630,13 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   editsNotMoved(from: string, to: string): void {
     new Notice(
       `VS Code Workbench: ${baseName(to)} was renamed while it had unsaved edits, and ${from} holds a file the plugin cannot tie to this tab's save. Nothing was moved or overwritten: anything you saved from this tab is in ${from}, so copy it out from there.`,
+      15000,
+    );
+  }
+
+  editsKeptInTab(own: string, opened: string): void {
+    new Notice(
+      `VS Code Workbench: ${opened ? baseName(opened) : "the file you opened"} has unsaved edits in the tab for ${baseName(own)}, behind that file. The new tab opens it from disk, without those edits. Save or discard them in the first tab before you close it.`,
       15000,
     );
   }
@@ -534,6 +665,115 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     return path.join(this.vaultRoot(), manifestDir, ".server");
   }
 
+  // --- The terminal host page ---------------------------------------------
+
+  /** The host page, made on first use; null once the plugin has unloaded. Its start goes through `ensureServer` and the licence gate: one server, one modal. */
+  private terminalHostPage(): TerminalHostPage | null {
+    if (this.unloaded || this.quitting) return null;
+    if (this.terminalHost) return this.terminalHost;
+    this.terminalHost = new TerminalHostPage({
+      createElement: (tag) => document.createElement(tag),
+      parent: document.body,
+      vaultRoot: () => this.vaultRoot(),
+      licenceAccepted: () => this.gate.accepted,
+      requestLicence: () => this.gate.request(),
+      // The page shows a failed start's reason itself, with Retry (or in the crash banner): no Notice beside it.
+      ensureServer: () => this.ensureServer({ quiet: true }),
+      restartServer: () => this.restartServer({ quiet: true }),
+      failureText: (e) => this.describeStartFailure(e).message,
+      notice: (message) => void new Notice(message, 10000),
+      isDark: () => this.isDark(),
+      workbenchOverlay: () => this.terminalOverlay(),
+      userDataCopy: () => this.copy,
+      trustVaultFolder: () => this.trustVaultFolder(),
+      heldPorts: () => this.heldPorts(),
+      noteTrustOutcome: (outcome) => this.noteTrustOutcome(outcome),
+      attachKeys: (frame) => this.keyRelay?.attach(frame as unknown as RelayFrame) ?? (() => undefined),
+      closedByHost: () => this.drawer?.hostClosed(),
+      requestPanel: () => this.requestTerminalPanel(),
+      // The page was created, became ready or lost its page, failed or was closed: what the idle clock sees may have changed.
+      stateChanged: () => void this.idle?.evaluate(),
+    });
+    void this.idle?.evaluate(); // the host page was just created
+    return this.terminalHost;
+  }
+
+  /**
+   * The server changed state: the terminal page follows it (G13). A crash shows the banner in the drawer; a restart's stop drops
+   * the page, which comes back at the new address when a server runs; an idle stop drops it with nothing announced. Quit and
+   * unload never get here: they end the page first (`endTerminalPage`), so a stop that is theirs raises no banner and no reload.
+   */
+  private terminalFollowsServer(state: ServerState): void {
+    const host = this.terminalHost;
+    if (!host || this.quitting || this.unloaded) return;
+    switch (state) {
+      case "crashed":
+        host.serverCrashed();
+        break;
+      case "stopped":
+        host.serverStopped();
+        break;
+      case "stopped-by-idle":
+        host.serverIdle();
+        break;
+      case "running":
+        host.serverRunning();
+        break;
+      case "failed":
+        host.serverFailed(this.describeStartFailure(this.manager.lastError).message);
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** End the terminal page: its webview and container are removed and later events are ignored. Idempotent. */
+  private endTerminalPage(): void {
+    this.terminalHost?.dispose();
+    this.terminalHost = null;
+  }
+
+  /** The terminal page's panel was closed in the page and the drawer is opening again: ask the page's extension to bring it back. */
+  private requestTerminalPanel(): boolean {
+    const dataDir = this.manager.current ? (this.manager.serverInstance?.serverDataDir ?? null) : null;
+    if (dataDir === null) return false;
+    try {
+      requestPanel(dataDir);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The file explorer's menu is being built: add the item that opens a terminal in the folder (or the file's folder). */
+  private onFileMenu(menu: Menu, file: TAbstractFile, source: string): void {
+    if (this.unloaded) return;
+    addNewTerminalItem(menu as unknown as MenuLike, file as unknown as MenuTarget, source, (folder) => this.openTerminalAtFolder(folder));
+  }
+
+  /**
+   * Open a new terminal in `folder` (a vault path, "" for the vault root): the drawer is opened or revealed through its own
+   * reveal path, then VS Code's own terminal is asked for a new one at that folder. The drawer, the host page and the server
+   * start are the ones the edge and the hotkey use.
+   */
+  private openTerminalAtFolder(folder: string): Promise<unknown> {
+    return newTerminalAtFolder(
+      {
+        vaultRoot: () => this.vaultRoot(),
+        reveal: () => this.drawer?.openDrawer(),
+        settled: () => this.terminalHost?.settled() ?? Promise.resolve(),
+        ready: () => this.terminalHost?.ready() ?? false,
+        starting: () => this.terminalHost?.starting() ?? false,
+        focusTerminal: () => this.terminalHost?.focusTerminal(),
+        // Only a server that is running has a page to answer: a crashed one gets no request that a later start could replay.
+        serverDataDir: () => (this.manager.current ? (this.manager.serverInstance?.serverDataDir ?? null) : null),
+        unloaded: () => this.unloaded,
+        notice: (message) => void new Notice(message, 10000),
+      },
+      folder,
+    );
+  }
+
   // --- Starting the server ------------------------------------------------
 
   /**
@@ -541,38 +781,43 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
    * for the licence; nothing is downloaded before it is accepted. Callers that
    * arrive while it starts share one start, one licence modal and one failure
    * notice. Rejects with LicenceDeclinedError if the licence was declined, or
-   * with the start error (already shown in a Notice) if the server failed.
+   * with the start error (shown in a Notice unless every caller was `quiet`) if the server failed.
+   * A `quiet` caller shows the failure itself (the terminal page does, beside Retry), so the Notice is skipped; as soon as a
+   * caller that is not quiet shares the start, the Notice is raised for the failure.
    */
-  ensureServer(): Promise<RunningServer> {
+  ensureServer(opts: { quiet?: boolean } = {}): Promise<RunningServer> {
     const running = this.manager.current;
     if (running) return Promise.resolve(running);
     if (!this.serverRequest) {
-      const p: Promise<RunningServer> = this.startFlow((o) => this.manager.ensureStarted(o)).finally(() => {
+      const flow: StartNotice = { notify: false };
+      this.serverFlow = flow;
+      const p: Promise<RunningServer> = this.startFlow((o) => this.manager.ensureStarted(o), flow).finally(() => {
         if (this.serverRequest === p) this.serverRequest = null;
       });
       this.serverRequest = p;
     }
+    if (!opts.quiet) this.serverFlow.notify = true;
     return this.serverRequest;
   }
 
-  private async startFlow(start: (o?: StartOptions) => Promise<RunningServer>): Promise<RunningServer> {
+  private async startFlow(start: (o?: StartOptions) => Promise<RunningServer>, flow: StartNotice): Promise<RunningServer> {
     if (!(await this.gate.request())) throw new LicenceDeclinedError();
     // The plugin was unloaded while the licence modal was up: accepting it must not start a server nobody owns.
-    if (this.unloaded) throw new StartCancelledError();
+    if (this.ending) throw new StartCancelledError();
     try {
       const running = await start();
       await this.recordLastServer();
       return running;
     } catch (e) {
       if (e instanceof StartCancelledError) throw e;
-      const failure = this.reportFailure(e);
+      const failure = this.reportFailure(e, flow);
       if (failure.offerReuse && failure.versionChange && (await promptReuseBuild(this.app, failure.versionChange))) {
-        if (this.unloaded) throw new StartCancelledError();
+        if (this.ending) throw new StartCancelledError();
         try {
           // The reused build is not recorded as the last server: it is the old one.
           return await this.manager.ensureStarted({ commitOverride: failure.offerReuse.commit });
         } catch (e2) {
-          if (!(e2 instanceof StartCancelledError)) this.reportFailure(e2);
+          if (!(e2 instanceof StartCancelledError)) this.reportFailure(e2, flow);
           throw e2;
         }
       }
@@ -580,20 +825,29 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     }
   }
 
-  /** Show the Notice for a failed start (token-free) and clear any half-downloaded server. */
-  private reportFailure(e: unknown): StartFailure {
+  /** The token-free description of a failed start: what the Notice says, and what the terminal host shows beside Retry. */
+  private describeStartFailure(e: unknown): StartFailure {
     const cliDataDir = path.join(this.runtimeDir(), "cli-data");
     const last = this.data_.lastServer ?? null;
-    const failure = describeFailure(e, {
+    return describeFailure(e, {
       installedVersion: this.lastBuild?.versionText,
       installedCommit: this.lastBuild?.commit ?? null,
       lastServer: last,
       lastServerCached: last ? cachedServerCommits(cliDataDir).has(last.commit) : false,
     });
+  }
+
+  /**
+   * Show the Notice for a failed start (token-free) unless the start was the terminal page's alone, and clear any
+   * half-downloaded server either way.
+   */
+  private reportFailure(e: unknown, flow: StartNotice): StartFailure {
+    const cliDataDir = path.join(this.runtimeDir(), "cli-data");
+    const failure = this.describeStartFailure(e);
     if (failure.kind === "offline-first-run" || failure.kind === "offline-redownload" || failure.kind === "download") {
       removePartialDownloads(cliDataDir, this.cachedBefore);
     }
-    new Notice(failure.message, 15000);
+    if (flow.notify) new Notice(failure.message, 15000);
     return failure;
   }
 
@@ -611,13 +865,13 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     if (!this.gate.accepted) throw new LicenceDeclinedError();
     // Unload does not wait for a start: each await below can finish after the plugin is gone, and nothing
     // may then be written, shown or spawned for it. (ServerManager also drops a server created after a stop.)
-    if (this.unloaded) throw new StartCancelledError();
+    if (this.ending) throw new StartCancelledError();
     const chosen = await this.instanceForStart();
-    if (this.unloaded) throw new StartCancelledError();
+    if (this.ending) throw new StartCancelledError();
     const build = chosen ? findNewestBuild({ override: chosen.cli }) : null;
     if (!chosen || !build) throw new ServerStartError("No VS Code installation found.", null, "", { kind: "missing-binary" });
     const support = await checkServeWebSupport(build.cli);
-    if (this.unloaded) throw new StartCancelledError();
+    if (this.ending) throw new StartCancelledError();
     if (!support.serveWeb) {
       throw new ServerStartError(`${build.cli} has no "serve-web" command.`, null, "", { kind: "no-serve-web", detail: build.cli });
     }
@@ -642,6 +896,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       disableTelemetry: support.disableTelemetry,
       registry: this.registry,
       workspace: this.vaultRoot(),
+      installTerminalAt: true,
       downloadHostReachable: this.downloadHostReachable,
       storedPort: this.workbenchSettings().stablePort,
       onPortPick: (pick) => this.notePort(pick),
@@ -682,12 +937,12 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
       this.copy = { id: randomBytes(8).toString("hex"), settings: withAutoSaveDefault(result.merged), keybindingsBase64: result.keybindingsBase64 };
     } catch {
       this.copy = null;
-      new Notice("VS Code Workbench: could not copy the instance's settings, so the editor starts without them.", 10000);
+      new Notice("VS Code Workbench: could not copy the settings and keybindings of the VS Code profile this vault uses, so the editor starts without them.", 10000);
     }
   }
 
   /**
-   * Read which profile desktop VS Code uses for the vault, once per Obsidian start and once per Restart server
+   * Read which profile desktop VS Code uses for the vault, once at the first server start after Obsidian starts and once per Restart server
    * (an idle restart on the same instance keeps the result, G2). A start on a different instance (or user-data
    * folder) than the one the result was read for reads again, so settings never shows another instance's profile
    * (E6, F9). It only reads, and a failure is a result shown in settings: the start goes on.
@@ -785,7 +1040,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   async updateSettings(patch: Partial<WorkbenchSettings>): Promise<void> {
     Object.assign(this.data_, patch);
-    this.terminal?.applyVisibility(); // the non-code setting takes effect now, with no reload
+    this.drawer?.applyVisibility(); // the non-code setting takes effect now, with no reload
     await this.saveData(this.data_);
   }
 
@@ -811,19 +1066,30 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   /**
    * Stop the server and start a fresh one (new token; the stable port when it is free, else a new port); open Code tabs
-   * reload. Works from every state, the failed one included. Asks first when a
-   * running server holds unsaved buffers. Resolves once running; rejects if it cannot start.
+   * reload, and the terminal page reloads and says its terminals were lost. Works from every state, the failed and crashed ones
+   * included (they never prompt). Asks first when a running server holds unsaved buffers or live terminal shells (`restartPrompt`).
+   * Resolves once running; rejects if it cannot start. Two calls share one restart. A `quiet` caller (the crash banner) shows the
+   * failure itself, so a failed restart raises no Notice unless a caller that is not quiet shares it.
    */
-  restartServer(): Promise<void> {
-    if (this.restarting) return this.restarting;
+  restartServer(opts: { quiet?: boolean } = {}): Promise<void> {
+    if (this.restarting) {
+      if (!opts.quiet) this.restartFlow.notify = true;
+      return this.restarting;
+    }
+    const flow: StartNotice = { notify: !opts.quiet };
+    this.restartFlow = flow;
     const p = (async () => {
       if (this.manager.state === "running") {
+        // Both questions are asked once, before the prompt: a server that crashes or a shell that exits while it is open changes
+        // nothing about what it says, and confirming still restarts.
         const dirty = (await this.dirtyViews()).map((v) => baseName(v.filePath));
-        if (dirty.length && !(await promptRestartWithDirty(this.app, dirty))) return;
+        const shells = await this.liveShellAnswer();
+        const prompt = restartPrompt({ state: "running", dirtyFiles: dirty, shells, pageLoaded: this.terminalHost?.ready() ?? false });
+        if (prompt && !(await promptRestartWithDirty(this.app, prompt.files, prompt.terminalLine))) return;
       }
       this.profileStale = true; // the user chose to re-read desktop VS Code's state
       try {
-        await this.startFlow((o) => this.manager.restart(o));
+        await this.startFlow((o) => this.manager.restart(o), flow);
       } catch (e) {
         if (e instanceof LicenceDeclinedError) return;
         throw e;
@@ -833,6 +1099,17 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     });
     this.restarting = p;
     return p;
+  }
+
+  /** How many terminal shells live under the server, read from its process tree; "unknown" when the process table cannot be read. */
+  private async liveShellAnswer(): Promise<ShellAnswer> {
+    const pid = this.manager.serverInstance?.pid;
+    if (pid === undefined) return 0;
+    try {
+      return liveShellPids(await this.processTable(), pid).length;
+    } catch {
+      return "unknown";
+    }
   }
 
   // --- Unsaved buffers and quit -------------------------------------------
@@ -863,7 +1140,17 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     }
     // A rename of a file with edits saved from its tab (Cmd+S, auto-save, the Save above) left them in the old path.
     await Promise.all([...this.views].map((v) => v.settleRename()));
+    await this.shutdownAll();
+  }
+
+  /**
+   * Quit (after its prompts) and the `pagehide` fallback: the terminal page, the server and every shell go, with no prompt. Only
+   * Code buffers are ever asked about; shells add nothing. The page is ended first and the manager is told to stop for good
+   * (`stopped`, never `crashed`), so nothing shows a banner, reloads onto the dying server or raises an error notice.
+   */
+  private async shutdownAll(): Promise<void> {
     this.quitting = true;
+    this.endTerminalPage();
     await this.manager.shutdown();
   }
 
@@ -916,6 +1203,104 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
 
   releaseFile(file: string, leaf: WorkspaceLeaf): void {
     this.openFiles.release(file, leaf);
+  }
+
+  /** The vault folder at `folder`, found in the form given or the other Unicode form (macOS names are decomposed). */
+  private findFolder(folder: string): unknown {
+    const vault = (this.app as unknown as { vault?: { getFolderByPath?(p: string): unknown } }).vault;
+    for (const form of [folder, folder.normalize("NFC"), folder.normalize("NFD")]) {
+      const found = vault?.getFolderByPath?.(form);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  /**
+   * A folder in a Code tab's path was clicked: reveal it in the file explorer, the way a note's path does (Obsidian's own
+   * breadcrumb calls the file-explorer plugin's `revealInFolder`). Nothing happens when the plugin is off or the folder is gone.
+   */
+  revealFolder(folder: string): void {
+    const app = this.app as unknown as {
+      internalPlugins?: { getEnabledPluginById?(id: string): { revealInFolder?(f: unknown): void } | null };
+    };
+    const explorer = app.internalPlugins?.getEnabledPluginById?.("file-explorer");
+    if (!explorer?.revealInFolder) return;
+    const found = this.findFolder(folder);
+    if (found) explorer.revealInFolder(found);
+  }
+
+  /** Hover tooltip on a path crumb: the crumb's own folder name, as Obsidian's `createBreadcrumb` sets it on a note's. (Obsidian skips it on mobile; this plugin is desktop-only.) */
+  folderTooltip(el: unknown, folder: string): void {
+    setTooltip(el as HTMLElement, baseName(folder));
+  }
+
+  /**
+   * Right-click on a path crumb: the same menu a note's crumb shows. As Obsidian's own handler does, it builds the menu with
+   * `Menu.forEvent` (which cancels the browser menu and shows itself once this handler returns), lays out the same sections, adds
+   * "New note" and, when the file explorer is on, "New folder" and "Reveal in file explorer", then triggers `file-menu` with the
+   * file explorer's source so that other plugins' items (this plugin's "New terminal at folder" too) are added. Nothing when the folder is gone.
+   */
+  folderMenu(folder: string, evt: unknown): void {
+    const found = this.findFolder(folder);
+    if (!found) return;
+    const app = this.app as unknown as {
+      fileManager?: { createNewMarkdownFile?(f: unknown): Promise<unknown>; createNewFolder?(f: unknown): Promise<{ path: string } | null | undefined> };
+      workspace: {
+        trigger(name: string, ...args: unknown[]): void;
+        getLeaf(newLeaf?: unknown): { openFile(f: unknown, o: unknown): unknown };
+        ensureSideLeaf?(type: string, side: string, o: unknown): unknown;
+      };
+      internalPlugins?: { getEnabledPluginById?(id: string): { revealInFolder?(f: unknown): void } | null };
+    };
+    const menu = Menu.forEvent(evt as MouseEvent) as Menu & { addSections?(sections: string[]): Menu };
+    menu.addSections?.(["title", "open", "action-primary", "action", "info", "info.copy", "view", "system", "", "danger"]);
+    menu.addItem((item) =>
+      item
+        .setSection("action-primary")
+        .setTitle("New note")
+        .setIcon("lucide-edit")
+        .onClick(async (e: MouseEvent | KeyboardEvent) => {
+          const note = await app.fileManager?.createNewMarkdownFile?.(found);
+          if (note) app.workspace.getLeaf(Keymap.isModEvent(e)).openFile(note, { active: true, state: { mode: "source" }, eState: { rename: "all" } });
+        }),
+    );
+    const explorer = app.internalPlugins?.getEnabledPluginById?.("file-explorer");
+    if (explorer) {
+      menu.addItem((item) =>
+        item
+          .setSection("action-primary")
+          .setTitle("New folder")
+          .setIcon("lucide-folder-open")
+          .onClick(async () => {
+            const created = await app.fileManager?.createNewFolder?.(found);
+            if (created) app.workspace.ensureSideLeaf?.("file-explorer", "left", { active: true, reveal: true, state: { newFile: created.path } });
+          }),
+      );
+      menu.addItem((item) =>
+        item
+          .setSection("system")
+          .setTitle("Reveal in file explorer")
+          .setIcon("lucide-folder-open")
+          .onClick(() => explorer.revealInFolder?.(found)),
+      );
+    }
+    const crumb = (evt as { currentTarget?: unknown } | null)?.currentTarget;
+    if (typeof HTMLElement !== "undefined" && crumb instanceof HTMLElement) menu.setParentElement(crumb);
+    app.workspace.trigger("file-menu", menu, found, FILE_EXPLORER_SOURCE);
+  }
+
+  /**
+   * Drag start on a path crumb: Obsidian's drag manager (not in its typings) starts a drag of the folder, as for a note's crumb.
+   * False when the manager or the folder is missing.
+   */
+  dragFolder(folder: string, evt: unknown): boolean {
+    const manager = (this.app as unknown as { dragManager?: { dragFolder?(e: unknown, f: unknown): unknown; onDragStart?(e: unknown, d: unknown): void } }).dragManager;
+    const found = this.findFolder(folder);
+    if (!found || !manager?.dragFolder || !manager.onDragStart) return false;
+    const drag = manager.dragFolder(evt, found);
+    if (!drag) return false;
+    manager.onDragStart(evt, drag);
+    return true;
   }
 
   /** The size and binary guard (E6). A refused file gets a notice and goes to the system app. */
@@ -1031,17 +1416,26 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
    * Open a file in a Code tab, or focus the one that already shows it (one tab per file; a second
    * call while the first is still opening waits for it). The guard comes first, then the server (and,
    * the first time, the licence modal): a refused file or a failed start leaves no tab, and a declined
-   * licence opens the file in the system app instead.
+   * licence opens the file in the system app instead. `line` (a file opened from the editor at a definition) puts the cursor
+   * there, in a new tab and in the tab that already shows the file; zero, negative or non-numeric is line 1, and one past the
+   * end of the file is the last line. Without it the cursor stays where VS Code puts it.
    */
-  async openCodeFile(file: string): Promise<void> {
-    await this.openFiles.openOnce(
-      file,
-      () => this.createCodeTab(file),
-      (leaf) => this.focusLeaf(leaf),
-    );
+  async openCodeFile(file: string, line?: unknown): Promise<void> {
+    const at = line === undefined ? null : normalizeLine(line);
+    await openCodeTabOnce(this.openFiles, file, at, {
+      create: () => this.createCodeTab(file, at),
+      focus: (leaf) => this.focusLeaf(leaf),
+      placeCursor: (leaf, n) => this.placeCursor(leaf, n),
+    });
   }
 
-  private async createCodeTab(file: string): Promise<void> {
+  /** Put the cursor of the Code tab in `leaf` on `line`; a tab restored from the last session and not loaded yet is loaded first. */
+  private async placeCursor(leaf: WorkspaceLeaf, line: number): Promise<void> {
+    await (leaf as unknown as { loadIfDeferred?: () => Promise<void> }).loadIfDeferred?.();
+    if (leaf.view instanceof CodeView) await leaf.view.goToLine(line);
+  }
+
+  private async createCodeTab(file: string, line: number | null = null): Promise<void> {
     const kind = decideFile(file).kind;
     if (kind === "never" || kind === "hidden") {
       new Notice(`VS Code Workbench: ${fileName(file)} is not opened in a Code tab; Obsidian's own view handles it.`);
@@ -1056,7 +1450,7 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     }
     if (this.unloaded) return; // unloaded while the server started: no tab on a plugin that is gone
     const leaf = this.app.workspace.getLeaf("tab");
-    await leaf.setViewState({ type: VIEW_TYPE_CODE, state: { file }, active: true });
+    await leaf.setViewState({ type: VIEW_TYPE_CODE, state: line === null ? { file } : { file, line }, active: true });
     await this.app.workspace.revealLeaf(leaf);
   }
 }

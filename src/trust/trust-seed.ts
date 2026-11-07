@@ -21,7 +21,7 @@ export const TRUST_KEY = "content.trust.model.key";
  *                      `uriTrustInfo` is not a list); it is left exactly as it was.
  *  - no-store:         the database exists but has no `ItemTable` store (VS Code renamed it); it is not touched.
  *  - error:<name>:     anything else the page refused.
- * The Code tab adds `timeout` and `unsupported` (see `runInWebview`).
+ * The Code tab adds `timeout` and `unsupported` (see `runInWebview`), and `build-failed` when it could not build this script at all.
  */
 export type TrustOutcome = "seeded" | "version-mismatch" | "no-store" | `error:${string}`;
 

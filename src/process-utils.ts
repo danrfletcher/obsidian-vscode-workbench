@@ -3,7 +3,7 @@
  * orphan sweep. Everything here is synchronous or tiny so that quit and unload
  * can signal children before the app goes away.
  */
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 
 /** Parse `ps -A -o pid=,ppid=` output into all descendant pids of `rootPid`. */
 export function descendantsFromPs(psOutput: string, rootPid: number): number[] {
@@ -39,6 +39,16 @@ export function listDescendants(rootPid: number): number[] {
   }
 }
 
+/**
+ * The whole process table as `ps -A -o pid=,ppid=,command=` text, read without blocking the app. Rejects when `ps` fails;
+ * the caller decides what a failed read means. `descendantsFromPs` reads the same text (it uses the first two columns).
+ */
+export function readProcessTable(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile("ps", ["-A", "-ww", "-o", "pid=,ppid=,command="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
+  });
+}
+
 /** The full command line of a live pid, or null when no such process exists. */
 export function commandLineOf(pid: number): string | null {
   try {
@@ -61,6 +71,26 @@ export function pidsWithCommandContaining(marker: string): number[] {
     for (const line of out.split("\n")) {
       const m = /^\s*(\d+)\s+(.*)$/.exec(line);
       if (m && Number(m[1]) !== process.pid && m[2].includes(marker)) pids.push(Number(m[1]));
+    }
+    return pids;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Pids (other than this process) whose process group id is `pgid`. After the leader of a group has exited, whatever is still in
+ * the group is what it left behind, and the group id cannot be given to another process while any of them lives (POSIX). A leader
+ * that is still alive is not asked about here: the caller checks that first.
+ */
+export function pidsInProcessGroup(pgid: number): number[] {
+  if (!Number.isInteger(pgid) || pgid <= 1) return [];
+  try {
+    const out = execFileSync("ps", ["-A", "-o", "pid=,pgid="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const pids: number[] = [];
+    for (const line of out.split("\n")) {
+      const [pid, group] = line.trim().split(/\s+/).map(Number);
+      if (pid && group === pgid && pid !== process.pid) pids.push(pid);
     }
     return pids;
   } catch {

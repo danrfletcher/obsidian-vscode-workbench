@@ -4,23 +4,24 @@ import { DEVICE_ID_KEY, DRAWER_KEY, deviceId, readDrawerState, withDrawerState }
 
 const WINDOW = 900;
 
-describe("per-device drawer state in data.json (G9)", () => {
+describe("per-device drawer state in data.json (G3)", () => {
   it("defaults to the default height, closed, when nothing is stored", () => {
     expect(readDrawerState({}, "dev-a", WINDOW)).toEqual({ height: DEFAULT_HEIGHT, open: false });
     expect(readDrawerState(null, "dev-a", WINDOW)).toEqual({ height: DEFAULT_HEIGHT, open: false });
     expect(readDrawerState(undefined, "dev-a", WINDOW)).toEqual({ height: DEFAULT_HEIGHT, open: false });
   });
 
-  it("round trips through the JSON that saveData writes", () => {
+  it("round trips the height through the JSON that saveData writes, and writes no open flag", () => {
     const saved = withDrawerState({}, "dev-a", { height: 410, open: true });
     const reloaded = JSON.parse(JSON.stringify(saved));
-    expect(readDrawerState(reloaded, "dev-a", WINDOW)).toEqual({ height: 410, open: true });
+    expect(reloaded[DRAWER_KEY]).toEqual({ "dev-a": { height: 410 } });
+    expect(readDrawerState(reloaded, "dev-a", WINDOW)).toEqual({ height: 410, open: false });
   });
 
   it("keeps each device's own value: another device id sees its own, or the default", () => {
     let data = withDrawerState({}, "dev-a", { height: 410, open: true });
     data = withDrawerState(data, "dev-b", { height: 200, open: false });
-    expect(readDrawerState(data, "dev-a", WINDOW)).toEqual({ height: 410, open: true });
+    expect(readDrawerState(data, "dev-a", WINDOW)).toEqual({ height: 410, open: false });
     expect(readDrawerState(data, "dev-b", WINDOW)).toEqual({ height: 200, open: false });
     expect(readDrawerState(data, "dev-c", WINDOW)).toEqual({ height: DEFAULT_HEIGHT, open: false });
   });
@@ -37,7 +38,7 @@ describe("per-device drawer state in data.json (G9)", () => {
   it("replaces a corrupt drawer value when writing", () => {
     for (const bad of ["oops", 7, [1, 2], null]) {
       const after = withDrawerState({ [DRAWER_KEY]: bad }, "dev-a", { height: 300, open: true });
-      expect(after[DRAWER_KEY]).toEqual({ "dev-a": { height: 300, open: true } });
+      expect(after[DRAWER_KEY]).toEqual({ "dev-a": { height: 300 } });
     }
   });
 
@@ -54,15 +55,15 @@ describe("per-device drawer state in data.json (G9)", () => {
     expect(readDrawerState(data, "dev-a", WINDOW).height).toBe(DEFAULT_HEIGHT);
   });
 
-  it("treats an open value that is not exactly true as closed", () => {
-    for (const open of ["true", 1, null, undefined]) {
+  it("never reads the open flag back: a data.json saved with the drawer open starts closed (also the 0.1.0 shape)", () => {
+    for (const open of [true, "true", 1, null, undefined]) {
       expect(readDrawerState({ [DRAWER_KEY]: { "dev-a": { height: 300, open } } }, "dev-a", WINDOW).open).toBe(false);
     }
   });
 
   it("clamps a stored height on restore (E14)", () => {
     const data = { [DRAWER_KEY]: { "dev-a": { height: 5000, open: true } } };
-    expect(readDrawerState(data, "dev-a", 700)).toEqual({ height: 700 - HEADROOM, open: true });
+    expect(readDrawerState(data, "dev-a", 700)).toEqual({ height: 700 - HEADROOM, open: false });
     expect(readDrawerState({ [DRAWER_KEY]: { "dev-a": { height: 3, open: false } } }, "dev-a", 700).height).toBe(120);
   });
 
@@ -73,7 +74,7 @@ describe("per-device drawer state in data.json (G9)", () => {
 
   it("stores a device named __proto__ as an ordinary key", () => {
     const data = withDrawerState({}, "__proto__", { height: 333, open: true });
-    expect(readDrawerState(JSON.parse(JSON.stringify(data)), "__proto__", WINDOW)).toEqual({ height: 333, open: true });
+    expect(readDrawerState(JSON.parse(JSON.stringify(data)), "__proto__", WINDOW)).toEqual({ height: 333, open: false });
     expect(({} as Record<string, unknown>).height).toBeUndefined();
   });
 });

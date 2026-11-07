@@ -218,7 +218,7 @@ describe("readExtHostLog", () => {
     expect(await readExtHostLog(fresh, ALL)).toEqual({ found: false });
   });
 
-  it("merges the hosts of the run: a failure in any host stands over an activation in another", async () => {
+  it("merges the hosts of the run: the newest host that mentions an extension decides for it, the others fill in the rest", async () => {
     const dir = logTree({ r1: { exthost1: logText("healthy"), exthost2: logText("failing") } });
     const r = await readExtHostLog(dir, ALL);
     expect(r.found).toBe(true);
@@ -234,6 +234,29 @@ describe("readExtHostLog", () => {
     });
     const m = await readExtHostLog(both, ids("ms-python.python"));
     expect(m.found && m.facts.get("ms-python.python")).toEqual({ kind: "failed", reason: "ms-python.python failed" });
+  });
+
+  it("an extension that failed in an earlier host and activated cleanly in the newest one reads active (PR-7 R1); one the newest host never mentions keeps what an older host said", async () => {
+    const dir = logTree({
+      r1: {
+        exthost1: `${stamp(1)} [error] ms-python.python failed\n${stamp(1)} [error] ms-vscode.cpptools failed\n`,
+        exthost2: `${stamp(2)} [info] ExtensionService#_doActivateExtension ms-python.python, startup: false\n`,
+      },
+    });
+    const r = await readExtHostLog(dir, ids("ms-python.python", "ms-vscode.cpptools"));
+    expect(r.found && r.facts.get("ms-python.python")).toEqual({ kind: "active" });
+    expect(r.found && r.facts.get("ms-vscode.cpptools")?.kind).toBe("failed");
+  });
+
+  it("the newest host's latest line decides even when an older host activated it: failed then stays failed", async () => {
+    const dir = logTree({
+      r1: {
+        exthost1: `${stamp(1)} [info] ExtensionService#_doActivateExtension ms-python.python, startup: false\n`,
+        exthost2: `${stamp(2)} [error] ms-python.python failed\n${stamp(3)} [info] ExtensionService#_doActivateExtension ms-python.python, startup: false\n`,
+      },
+    });
+    const r = await readExtHostLog(dir, ids("ms-python.python"));
+    expect(r.found && r.facts.get("ms-python.python")).toEqual({ kind: "active" });
   });
 
   it("reads at most the newest MAX_HOSTS hosts, numbered by their number rather than their text (exthost10 is newer than exthost9)", async () => {

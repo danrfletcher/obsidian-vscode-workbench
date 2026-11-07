@@ -9,9 +9,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileSystemAdapter, Notice, Plugin, Setting, TFile, WorkspaceLeaf, type FakeNode, type MockApp } from "../mocks/obsidian";
+import { EXTENSION_DIR_NAME } from "../../src/terminal-host/terminal-at-extension";
 import VSCodeWorkbenchPlugin, { SPIKE_FILE } from "../../src/main";
 import { FAKE_CODE, isAlive, tempDir } from "../helpers";
 import { stateDb } from "../mirror-tree";
+import { fakeIndexedDB, fakeStorage } from "../fake-seed-page";
+import { removeOverlay, rulesOf } from "../overlay-runner";
+import { BROWSER_APP_SETTINGS, buildBrowserSeedScript } from "../../src/settings";
 import { HANG_SCRIPT, makeApp as makeBundle, makeReadOnly, makeWritable, treeDigest } from "../instance-helpers";
 
 const PLUGIN_DIR = ".obsidian/plugins/obsidian-vscode-workbench";
@@ -320,7 +324,8 @@ describe("the settings tab", () => {
     Setting.reset();
     tab.display();
     expect(tab.containerEl.textContent()).toContain("Scanning…");
-    expect(Setting.all.map((s) => s.name)).toEqual(expect.arrayContaining(["Excluded file extensions", "Terminal drawer over non-code views", "Shell", "Restart server"]));
+    expect(Setting.all.map((s) => s.name)).toEqual(expect.arrayContaining(["Excluded file extensions", "Terminal drawer over non-code views", "Restart server"]));
+    expect(Setting.all.map((s) => s.name)).not.toContain("Shell");
     await vi.waitFor(() => expect(tab.containerEl.textContent()).not.toContain("Scanning…"), { timeout: 5000, interval: 10 });
   });
 
@@ -382,7 +387,7 @@ describe("the settings tab", () => {
     });
   });
 
-  describe("exclude list, drawer toggle and shell", () => {
+  describe("exclude list and drawer toggle", () => {
     it("adds an extension normalised, de-duplicates it, rejects bad input and removes it again", async () => {
       await load();
       let t = await openTab();
@@ -407,23 +412,31 @@ describe("the settings tab", () => {
       expect(Setting.all.filter((s) => s.name === "md")).toHaveLength(1);
     });
 
-    it("the drawer toggle defaults on, saves false, and survives a reload; the shell saves and defaults to $SHELL", async () => {
+    it("the drawer toggle defaults on, saves false, and survives a reload; there is no Shell field", async () => {
       await load({});
       let t = await openTab();
       const toggle = t.one("Terminal drawer over non-code views").toggle!;
       expect(toggle.value).toBe(true);
       toggle.handler!(false);
-      const shell = t.one("Shell");
-      expect(shell.text!.placeholder).toBe(process.env.SHELL && path.isAbsolute(process.env.SHELL) ? process.env.SHELL : "/bin/zsh");
-      shell.text!.handler!(" /bin/bash ");
-      await vi.waitFor(() => expect(stored()).toMatchObject({ nonCodeDrawer: false, shellPath: "/bin/bash" }));
+      expect(Setting.all.some((s) => s.name === "Shell")).toBe(false);
+      await vi.waitFor(() => expect(stored()).toMatchObject({ nonCodeDrawer: false }));
+      expect(stored()).not.toHaveProperty("shellPath");
       const saved = { ...stored() };
       plugin.onunload();
       Plugin.reset();
       await load(saved);
       t = await openTab();
       expect(t.one("Terminal drawer over non-code views").toggle!.value).toBe(false);
-      expect(t.one("Shell").text!.value).toBe("/bin/bash");
+    });
+
+    it("a data.json from 0.1.0 (shellPath and the old drawer open state) loads, ignores both, and keeps both in the file after the next save", async () => {
+      const old = { serverLicenceAccepted: true, shellPath: "/bin/bash", drawer: { "device-aaaa-0001": { height: 420, open: true } } };
+      await load(old);
+      const t = await openTab();
+      expect(Setting.all.some((s) => s.name === "Shell")).toBe(false);
+      t.one("Terminal drawer over non-code views").toggle!.handler!(false);
+      await vi.waitFor(() => expect(stored().nonCodeDrawer).toBe(false));
+      expect(stored()).toMatchObject({ shellPath: "/bin/bash", drawer: old.drawer, serverLicenceAccepted: true });
     });
 
     it("saving a setting keeps the unknown fields already in data.json (the licence flag)", async () => {
@@ -445,7 +458,6 @@ describe("the settings tab", () => {
       await load(data as Record<string, unknown> | null);
       const t = await openTab();
       expect(t.one("Terminal drawer over non-code views").toggle!.value).toBe(true);
-      expect(t.one("Shell").text!.value).toBe("");
       expect(t.one("VS Code instance").dropdown!.value).toMatch(/^vscode-insiders:/);
     });
 
@@ -506,6 +518,50 @@ describe("the copy of the instance's settings (G16, G17)", () => {
     for (const key of ["files.watcherExclude", "search.exclude"]) expect(machine[key]).toMatchObject({ "**/.obsidian": true, "**/Attachments": true });
     await plugin.restartServer();
     expect(plugin.userDataCopy()!.id).not.toBe(firstId); // a new start is a new copy, applied again
+  });
+
+  it("GP1: an instance whose settings.json and keybindings.json turn each hidden part back on cannot win: the seed keeps the plugin's values on every load (same copy id, three loads)", async () => {
+    bothMicrosoft();
+    const u = userDir("Code - Insiders");
+    fs.writeFileSync(
+      path.join(u, "settings.json"),
+      '{\n  "workbench.statusBar.visible": true,\n  "zenMode.centerLayout": true,\n  "workbench.editor.showTabs": "multiple",\n  "breadcrumbs.enabled": true,\n  "workbench.activityBar.location": "default",\n  "editor.fontSize": 15,\n}\n',
+    );
+    // keybindings that undo ours: take our chord for the side bar, and one of their own
+    const theirs = '[\n  { "key": "ctrl+alt+shift+1", "command": "workbench.action.toggleSidebarVisibility" },\n  { "key": "cmd+b", "command": "workbench.action.toggleSidebarVisibility" },\n]\n';
+    fs.writeFileSync(path.join(u, "keybindings.json"), theirs);
+    await load();
+    await plugin.openSpikeFile();
+    const copy = plugin.userDataCopy()!;
+    expect(copy.settings).toMatchObject({ "workbench.statusBar.visible": true, "zenMode.centerLayout": true }); // the copy carries them: it is the seed that must win
+
+    // What CodeView.loadWorkbench runs in the webview, from the host's own methods, against one browser profile, three times.
+    const fake = fakeIndexedDB();
+    const storage = fakeStorage();
+    const hiding = plugin.chromeHiding();
+    const script = buildBrowserSeedScript({ ...BROWSER_APP_SETTINGS, ...plugin.workbenchOverlay() }, plugin.userDataCopy(), hiding.keybindings, hiding.unbind);
+    const run = () => (new Function("indexedDB", "localStorage", "TextEncoder", "TextDecoder", `return ${script}`) as (...a: unknown[]) => Promise<string>)(fake.indexedDB, storage, TextEncoder, TextDecoder);
+    const file = (name: string) => new TextDecoder().decode(fake.stores.get("vscode-userdata-store")!.get(`/User/${name}`) as Uint8Array);
+    let firstKeybindings = "";
+    for (let load = 1; load <= 3; load++) {
+      expect(await run(), `load ${load}`).toBe("seeded");
+      const settings = JSON.parse(file("settings.json")) as Record<string, unknown>;
+      expect(settings, `load ${load}`).toMatchObject(plugin.workbenchOverlay());
+      expect(settings["workbench.statusBar.visible"], `load ${load}`).toBe(false);
+      expect(settings["zenMode.centerLayout"], `load ${load}`).toBe(false);
+      expect(settings["workbench.editor.showTabs"], `load ${load}`).toBe("none");
+      expect(settings["breadcrumbs.enabled"], `load ${load}`).toBe(false);
+      expect(settings["editor.fontSize"], `load ${load}`).toBe(15); // theirs otherwise
+      // keybindings: the user's text kept byte for byte, ours after it, once, and the copied rules that bring a bar back unbound last
+      const text = file("keybindings.json");
+      expect(removeOverlay(text), `load ${load}`).toBe(theirs);
+      const rules = rulesOf(text);
+      expect(rules.filter((r) => r.key === "cmd+b").map((r) => r.command), `load ${load}`).toEqual(["workbench.action.toggleSidebarVisibility", "-workbench.action.toggleSidebarVisibility", ""]);
+      expect(rules.filter((r) => r.key === "ctrl+alt+shift+1").map((r) => r.command), `load ${load}`).toEqual(["workbench.action.toggleSidebarVisibility", "workbench.action.closeSidebar", ""]);
+      expect(rules.slice(2, 2 + hiding.keybindings.length), `load ${load}`).toEqual(hiding.keybindings);
+      if (load === 1) firstKeybindings = file("keybindings.json");
+      else expect(file("keybindings.json"), `load ${load}`).toBe(firstKeybindings);
+    }
   });
 
   it("a copy of the instance that is not the default: the stable build's folder, not Insiders'", async () => {
@@ -624,7 +680,7 @@ describe("extensions of other instances are never combined (F3)", () => {
     const digestA = treeDigest(path.join(home, ".ext-a"));
     const digestB = treeDigest(path.join(home, ".ext-b"));
     await load();
-    const shared = () => fs.readdirSync(path.join(inner().manager.serverInstance!.serverDataDir, "extensions")).filter((n) => n !== "extensions.json").sort();
+    const shared = () => fs.readdirSync(path.join(inner().manager.serverInstance!.serverDataDir, "extensions")).filter((n) => n !== "extensions.json" && n !== EXTENSION_DIR_NAME).sort();
 
     await plugin.openSpikeFile(); // default: Insiders, so .ext-b
     expect(shared()).toEqual(["beta.two-2.0.0"]);

@@ -27,7 +27,8 @@ import {
   type MirrorState,
   type ProfileExtension,
 } from "./server/shared-extensions";
-import { isAlive, listDescendants, pidsWithCommandContaining, signal, signalGroup } from "./process-utils";
+import { installTerminalAtExtension } from "./terminal-host/terminal-at-extension";
+import { isAlive, listDescendants, pidsInProcessGroup, pidsWithCommandContaining, signal, signalGroup } from "./process-utils";
 
 export { descendantsFromPs, listDescendants } from "./process-utils";
 
@@ -618,6 +619,11 @@ export interface ServerOptions {
   reuseMirror?: MirrorState | null;
   /** Called with everything a read produced (the disabled lists and the profile's list), for the plugin to keep. */
   onMirrorState?: (state: MirrorState) => void;
+  /**
+   * Put the plugin-owned terminal-at extension in the server's own extension dir at each start ("New terminal at folder",
+   * src/terminal-host/terminal-at-extension.ts). Only the plugin asks for it; a server made without it shares extensions only.
+   */
+  installTerminalAt?: boolean;
   /** Tests only: the file system and `sqlite3` runner the read uses. */
   mirrorDeps?: MirrorOptions["deps"];
 }
@@ -725,6 +731,7 @@ export class WorkbenchServer {
     const token = createTokenFile(tokenFile);
     // Only now, with the previous server already stopped (restart awaits stop before it creates the next one), are the links rebuilt.
     shareExtensions(build.extensionsDir, this.serverDataDir, enabledExtensions(this.mirrorState));
+    if (this.opts.installTerminalAt) installTerminalAtExtension(this.serverDataDir); // after the share: it keeps the entries just written
     const picked = await pickPort(this.opts.findPort, this.opts.storedPort ?? null);
     const port = picked.port;
     if (this.stopRequested) throw new StartCancelledError(); // stop() came in before the spawn: nothing to kill
@@ -944,7 +951,12 @@ export class WorkbenchServer {
       // The wrapper is already gone, so its pid (and process group id) may have been reused by
       // another program: never signal it. Stragglers are found by our own token-file path, which
       // appears on the command line of every process the wrapper started.
-      const stragglers = this.tokenFile ? pidsWithCommandContaining(this.tokenFile) : [];
+      // What the wrapper left in its own process group (it was spawned detached, so the group id is its pid) is ours too, with no
+      // reliance on a command line: a shell the dead server had started that stayed in the group (a server killed with `kill -9`
+      // leaves its children behind). The group id is not given to another process while any member lives, so members are ours;
+      // a live process with that pid means the id was reused already, and the group is left alone.
+      const left = isAlive(pid) ? [] : pidsInProcessGroup(pid);
+      const stragglers = [...new Set([...(this.tokenFile ? pidsWithCommandContaining(this.tokenFile) : []), ...left])];
       for (const d of stragglers) signal(d, "SIGTERM");
       this.stopping = (async () => {
         const deadline = Date.now() + 3000;

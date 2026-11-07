@@ -5,7 +5,6 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeNode, WorkspaceLeaf } from "../mocks/obsidian";
-import { fileDirtyScript } from "../../src/dirty-script";
 import { CRASH_TEXT, CodeView, DIRTY_SCRIPT, RESTART_FAILED_TEXT, saveAllKeys, type CodeViewHost } from "../../src/code-view";
 import type { ServerState } from "../../src/server-manager";
 
@@ -76,6 +75,9 @@ function makeView() {
     admitFile: async () => true,
     releaseFile: () => undefined,
     openInSystemApp: () => undefined,
+    // A host like the plugin's: it gives the chrome-hiding script and opens files from the editor, so a clean title is trusted (PR-5 R10).
+    chromeHiding: () => ({ keybindings: [], script: "0" }),
+    openFromEditor: async () => undefined,
   };
   const leaf = new WorkspaceLeaf();
   const view = new CodeView(leaf as never, host);
@@ -266,36 +268,128 @@ describe("unsaved buffer detection", () => {
     await expect(v.view.isDirty()).resolves.toBe(false);
   });
 
-  // The script is run against stand-in pages: the title mark VS Code puts on a dirty window, a dirty tab, and a clean page.
+  // The script is run against stand-in pages shaped like the chosen signal (docs/spike-chrome.md S5): a workbench whose window title
+  // carries "●" while the active editor is dirty. There is no VS Code tab strip in any of them.
+  const MARK = "\u25cf";
+  const run = (page: { title: string; workbench?: boolean; dirtyTab?: boolean; editor?: boolean }) => {
+    const doc = {
+      title: page.title,
+      querySelector: (sel: string) => {
+        if (sel.includes(".tab")) return page.dirtyTab ? {} : null; // an old tab marker: ignored by the script
+        if (sel.includes("data-uri")) return page.editor ? {} : null; // an editor on screen
+        return sel === ".monaco-workbench" && page.workbench !== false ? {} : null;
+      },
+    };
+    return new Function("document", `return ${DIRTY_SCRIPT}`)(doc);
+  };
+
   it.each([
-    ["a window title starting with the dirty mark", { title: "\u25cf a.py - vault", dirtyTab: false }, true],
-    ["a dirty editor tab", { title: "a.py - vault", dirtyTab: true }, true],
-    ["a clean page", { title: "a.py - vault", dirtyTab: false }, false],
-    ["no title at all", { title: "", dirtyTab: false }, false],
+    ["dirty: the title starts with the mark", { title: `${MARK} a.py \u2014 Visual Studio Code` }, true],
+    ["clean: the title has no mark", { title: "a.py \u2014 Visual Studio Code" }, false],
+    ["nothing open: the title is the bare app name", { title: "Visual Studio Code" }, false],
+    ["a restored, unsaved editor that is not the active one: the title names the active editor only", { title: "b.py \u2014 Visual Studio Code" }, false],
+    ["a file name that has quotes: the signal does not use the name", { title: `${MARK} a"b.py \u2014 Visual Studio Code` }, true],
+    ["a non-ASCII file name", { title: `${MARK} \u00e4\u6587.py \u2014 Visual Studio Code` }, true],
+    ["a mark that is not at the start is not the dirty mark", { title: `a.py ${MARK} Visual Studio Code` }, false],
+    ["a tab marked dirty in the page but a clean title: the old tab signal is not read", { title: "a.py \u2014 Visual Studio Code", dirtyTab: true }, false],
   ])("the dirty script says %s -> %s", (_n, page, expected) => {
-    const doc = { title: page.title, querySelector: (sel: string) => (sel.includes(".tab.dirty") && page.dirtyTab ? {} : null) };
-    expect(new Function("document", `return ${DIRTY_SCRIPT}`)(doc)).toBe(expected);
+    expect(run(page)).toBe(expected);
   });
 
-  // fileDirtyScript is run against stand-in tabs: its answer is about the tab with the file's name only.
+  // PR-5 R2/R3: with an editor on screen a title that does not have the shape of the plugin's own template (name, separator, app name) is
+  // not trusted to be clean: a workspace `window.title` that wins over the plugin's, or a VS Code update that builds the title another way.
   it.each([
-    ["its tab is clean while another tab is dirty", "a.py", [{ name: "a.py", dirty: false }, { name: "b.py", dirty: true }], "clean"],
-    ["its tab is dirty", "a.py", [{ name: "a.py", dirty: true }, { name: "b.py", dirty: false }], "dirty"],
-    ["two tabs share its name and one is dirty", "a.py", [{ name: "a.py", dirty: false }, { name: "a.py", dirty: true }], "dirty"],
-    ["no tab has its name", "a.py", [{ name: "b.py", dirty: true }], "none"],
-    ["no tabs at all", "a.py", [], "none"],
-    ["a name with quotes is matched literally", 'a"b.py', [{ name: 'a"b.py', dirty: false }], "clean"],
-  ])("the file dirty script says %s -> %s", (_n, file, tabs, expected) => {
-    const doc = {
-      querySelectorAll: (sel: string) =>
-        sel === ".monaco-workbench .tab"
-          ? tabs.map((t) => ({
-              getAttribute: (a: string) => (a === "data-resource-name" ? t.name : null),
-              classList: { contains: (c: string) => c === "dirty" && t.dirty },
-            }))
-          : [],
-    };
-    expect(new Function("document", `return ${fileDirtyScript(file)}`)(doc)).toBe(expected);
+    ["the plugin's template, em dash (macOS)", "a.py \u2014 Visual Studio Code"],
+    ["the plugin's template, hyphen (other platforms)", "a.py - Visual Studio Code"],
+    ["the Insiders app name", "a.py \u2014 Visual Studio Code - Insiders"],
+  ])("an editor on screen and a title of the right shape (%s) reads clean", (_n, title) => {
+    expect(run({ title, editor: true })).toBe(false);
+  });
+
+  it.each([
+    ["a workspace window.title of just the file name", "a.py"],
+    ["the app name alone while an editor is on screen", "Visual Studio Code"],
+    ["a title whose dirty mark moved", `a.py ${MARK} Visual Studio Code`],
+  ])("an editor on screen and a title of the wrong shape (%s) throws, so the tab reads unreadable and not clean", (_n, title) => {
+    expect(() => run({ title, editor: true })).toThrow(/shape/);
+  });
+
+  it("a dirty title is dirty whatever its shape, and no editor on screen needs no shape", () => {
+    expect(run({ title: `${MARK} a.py`, editor: true })).toBe(true);
+    expect(run({ title: "a.py", editor: false })).toBe(false);
+  });
+
+  it("two files with one name in different folders cannot be mixed up: the title of the active editor decides, whichever folder it is in", () => {
+    // VS Code's title is `${dirty}${activeEditorShort} - ...`: the short name is the same for x/a.py and y/a.py, and only the mark differs.
+    expect(run({ title: `${MARK} a.py \u2014 Visual Studio Code` })).toBe(true); // x/a.py typed in this tab
+    expect(run({ title: "a.py \u2014 Visual Studio Code" })).toBe(false); // y/a.py in another tab, nothing typed
+  });
+
+  it.each([
+    ["an empty title", { title: "" }],
+    ["no workbench in the page", { title: "Visual Studio Code", workbench: false }],
+    ["no workbench and an empty title", { title: "", workbench: false }],
+  ])("the signal missing (%s): the script throws, so the tab reads unreadable and not clean", (_n, page) => {
+    expect(() => run(page)).toThrow();
+  });
+
+  it("the script names no VS Code tab-strip selector and no data-resource-name", () => {
+    expect(DIRTY_SCRIPT).not.toContain(".tab");
+    expect(DIRTY_SCRIPT).not.toContain("data-resource-name");
+  });
+
+  it("answers exactly true or false when it answers", () => {
+    for (const title of [`${MARK} x`, "x", "Visual Studio Code"]) expect(typeof run({ title })).toBe("boolean");
+  });
+
+  describe("bufferState", () => {
+    it("is clean, dirty or unreadable by what the page answers", async () => {
+      const { view, contentEl } = await open();
+      const f = frame(contentEl);
+      f.dirtyAnswer = async () => true;
+      await expect(view.bufferState()).resolves.toBe("dirty");
+      f.dirtyAnswer = async () => false;
+      await expect(view.bufferState()).resolves.toBe("clean");
+    });
+
+    it("is unreadable when executeJavaScript throws (the signal is missing, the page is gone)", async () => {
+      const { view, contentEl } = await open();
+      frame(contentEl).dirtyAnswer = async () => {
+        throw new Error("the window title is not readable");
+      };
+      await expect(view.bufferState()).resolves.toBe("unreadable");
+    });
+
+    it("is unreadable when executeJavaScript throws synchronously", async () => {
+      const { view, contentEl } = await open();
+      frame(contentEl).dirtyAnswer = () => {
+        throw new Error("webview destroyed");
+      };
+      await expect(view.bufferState()).resolves.toBe("unreadable");
+    });
+
+    it("is unreadable when the page does not answer in time", async () => {
+      const { view, contentEl } = await open();
+      frame(contentEl).dirtyAnswer = () => new Promise(() => undefined);
+      vi.useFakeTimers();
+      try {
+        const asked = view.bufferState();
+        await vi.advanceTimersByTimeAsync(3500);
+        await expect(asked).resolves.toBe("unreadable");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("is unreadable when the frame is not domReady, and the page is not asked", async () => {
+      const { view, contentEl } = await open();
+      const f = frame(contentEl);
+      f.dirtyAnswer = async () => false; // would read clean if it were asked
+      (view as unknown as { domReady: boolean }).domReady = false;
+      const before = f.executed.length;
+      await expect(view.bufferState()).resolves.toBe("unreadable");
+      expect(f.executed.length).toBe(before);
+    });
   });
 });
 

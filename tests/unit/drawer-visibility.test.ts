@@ -24,43 +24,42 @@ describe("viewKind", () => {
   });
 });
 
-describe("drawerVisibility", () => {
-  const kinds: ViewKind[] = ["markdown", "canvas", "graph", "pdf", "other", "code"];
+describe("drawerVisibility (G6)", () => {
+  const kinds: ViewKind[] = ["code", "markdown", "canvas", "graph", "pdf", "other"];
 
-  // view kind × non-code setting × drawer open → strip, drawer, hotkey
+  // view kind × non-code setting × drawer open → edge, drawer, hotkey. The hotkey is true in every row (0.1.0 made it follow the setting).
   const table: Array<[ViewKind, boolean, boolean, boolean, boolean, boolean]> = [];
   for (const kind of kinds) {
-    for (const toggle of [true, false]) {
+    for (const setting of [true, false]) {
       for (const open of [true, false]) {
-        const available = kind === "code" || toggle;
-        table.push([kind, toggle, open, available, available && open, available]);
+        table.push([kind, setting, open, kind === "code" || setting, open, true]);
       }
     }
   }
+  it("covers every view kind by setting by open state", () => expect(table).toHaveLength(24));
 
-  it.each(table)("%s, setting %s, drawer open %s → strip %s, drawer %s, hotkey %s", (kind, nonCodeDrawer, drawerOpen, strip, drawer, hotkey) => {
-    expect(drawerVisibility({ kind, nonCodeDrawer, drawerOpen })).toEqual({ strip, drawer, hotkey });
+  it.each(table)("%s, setting %s, drawer open %s → edge %s, drawer %s, hotkey %s", (kind, nonCodeDrawer, drawerOpen, edge, drawer, hotkey) => {
+    expect(drawerVisibility({ kind, nonCodeDrawer, drawerOpen })).toEqual({ edge, drawer, hotkey });
   });
 
-  it("G11: with the setting on, notes, canvas, graph and PDF show the strip and the open drawer, like a Code tab", () => {
-    for (const kind of ["markdown", "canvas", "graph", "pdf"] as const) {
-      expect(drawerVisibility({ kind, nonCodeDrawer: true, drawerOpen: true })).toEqual({ strip: true, drawer: true, hotkey: true });
+  it("with the setting on, notes, canvas, graph and PDF have the edge, like a Code tab", () => {
+    for (const kind of ["markdown", "canvas", "graph", "pdf", "other", "code"] as const) {
+      expect(drawerVisibility({ kind, nonCodeDrawer: true, drawerOpen: false }).edge).toBe(true);
     }
   });
 
-  it("G11: with the setting off, notes, canvas, graph and PDF lose the strip, the drawer and the hotkey, identically", () => {
-    const results = (["markdown", "canvas", "graph", "pdf"] as const).map((kind) => drawerVisibility({ kind, nonCodeDrawer: false, drawerOpen: true }));
-    for (const r of results) expect(r).toEqual({ strip: false, drawer: false, hotkey: false });
-  });
-
-  it("G11: a Code tab always has them, whatever the setting", () => {
-    for (const nonCodeDrawer of [true, false]) {
-      expect(drawerVisibility({ kind: "code", nonCodeDrawer, drawerOpen: true })).toEqual({ strip: true, drawer: true, hotkey: true });
-      expect(drawerVisibility({ kind: "code", nonCodeDrawer, drawerOpen: false })).toEqual({ strip: true, drawer: false, hotkey: true });
+  it("with the setting off, the four non-code views lose the edge identically; an open drawer and the hotkey stay", () => {
+    for (const kind of ["markdown", "canvas", "graph", "pdf", "other"] as const) {
+      expect(drawerVisibility({ kind, nonCodeDrawer: false, drawerOpen: true })).toEqual({ edge: false, drawer: true, hotkey: true });
+      expect(drawerVisibility({ kind, nonCodeDrawer: false, drawerOpen: false })).toEqual({ edge: false, drawer: false, hotkey: true });
     }
   });
 
-  it("GP6: going off and back on over a note gives the same result as before, because the open state is an input and never changed", () => {
+  it("a Code tab always has the edge, whatever the setting", () => {
+    for (const nonCodeDrawer of [true, false]) expect(drawerVisibility({ kind: "code", nonCodeDrawer, drawerOpen: false }).edge).toBe(true);
+  });
+
+  it("going off and back on over a note gives the same result as before, because the open state is an input and never changed", () => {
     const before = drawerVisibility({ kind: "markdown", nonCodeDrawer: true, drawerOpen: true });
     drawerVisibility({ kind: "markdown", nonCodeDrawer: false, drawerOpen: true });
     expect(drawerVisibility({ kind: "markdown", nonCodeDrawer: true, drawerOpen: true })).toEqual(before);

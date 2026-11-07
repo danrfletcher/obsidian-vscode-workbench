@@ -171,7 +171,7 @@ describe("LayoutController", () => {
     expect(px("--vscw-status-lift")).toBe("0px");
   });
 
-  it("closing the drawer clears the offset and the lift completely, and keeps the last edges so the slide-down stays in place", () => {
+  it("closing the drawer clears the offset and the lift completely, and the edges follow the main pane area, since the edge is drawn while closed", () => {
     const layout = make();
     layout.setOpenHeight(300);
     current = RIGHT_COLLAPSED;
@@ -182,6 +182,20 @@ describe("LayoutController", () => {
     expect(px("--vscw-status-lift")).toBe("0px");
     expect(layout.bounds.left).toBe(260);
     expect(layout.bounds.width).toBe(1340);
+  });
+
+  it("G4: a drawer that never opened still measures the main pane area for the edge, and the sidebars' own boxes are never written", () => {
+    const layout = make();
+    layout.setOpenHeight(0);
+    expect(px("--vscw-left")).toBe("260px");
+    expect(px("--vscw-width")).toBe("1040px");
+    expect(layout.bounds).toEqual({ left: 260, width: 1040, offset: 0, statusLift: 0 });
+    current = LEFT_COLLAPSED;
+    layout.refresh();
+    expect(px("--vscw-left")).toBe("0px");
+    expect(px("--vscw-width")).toBe("1300px");
+    const names = [...Array(document.body.style.length).keys()].map((i) => document.body.style.item(i));
+    expect(names.sort()).toEqual(["--vscw-left", "--vscw-status-lift", "--vscw-width"]); // no height or top: the sidebars keep the full window height
   });
 
   it("a closed drawer does not report layout changes (nothing to fit)", () => {

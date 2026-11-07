@@ -7,7 +7,9 @@
  * buildBrowserSeedScript) against a scratch dir, starts `serve-web` on a free loopback port, loads the
  * workbench in headless Chrome and asserts:
  *   1. editor.fontSize copied from the instance's settings.json is the font size of an open editor;
- *   2. a keybinding copied from the instance's keybindings.json runs its command (it toggles the side bar);
+ *   2. a keybinding copied from the instance's keybindings.json runs its command, except one that would bring a bar back: the
+ *      copy is seeded with the Code tab's keybinding overlay (PR-3, GP4/E9), so a copied ctrl+alt+n for
+ *      toggleSidebarVisibility does NOT toggle the side bar, and a copied ctrl+alt+k for the command palette still opens it;
  *   3. a search for a word that occurs in src/a.txt, .obsidian/, Attachments/ and a folder the instance
  *      excluded itself finds only src/a.txt: the five workspace excludes and the instance's own exclude
  *      are all in force together.
@@ -97,11 +99,12 @@ function freePort() {
 
 // --- the plugin's own code ---------------------------------------------------------------------------
 await build({
-  entryPoints: { "user-data-seed": path.join(root, "src/server/user-data-seed.ts"), settings: path.join(root, "src/settings.ts") },
+  entryPoints: { "user-data-seed": path.join(root, "src/server/user-data-seed.ts"), settings: path.join(root, "src/settings.ts"), "chrome-settings": path.join(root, "src/chrome-settings.ts") },
   bundle: true, format: "esm", platform: "node", outdir: path.join(work, "plugin"), outExtension: { ".js": ".mjs" }, logLevel: "error",
 });
 const seed = await import(pathToFileURL(path.join(work, "plugin/user-data-seed.mjs")).href);
 const settings = await import(pathToFileURL(path.join(work, "plugin/settings.mjs")).href);
+const chrome_ = await import(pathToFileURL(path.join(work, "plugin/chrome-settings.mjs")).href);
 
 // --- the PR-6 fixture instance (profiles) -----------------------------------------------------------
 await build({
@@ -160,7 +163,7 @@ const FONT = 31;
 const instanceUser = path.join(work, "instance-user");
 fs.mkdirSync(instanceUser, { recursive: true });
 fs.writeFileSync(path.join(instanceUser, "settings.json"), `{\n  // mine\n  "editor.fontSize": ${FONT},\n  "search.exclude": { "**/skipme": true },\n}\n`);
-fs.writeFileSync(path.join(instanceUser, "keybindings.json"), '// mine\n[ { "key": "ctrl+alt+n", "command": "workbench.action.toggleSidebarVisibility" } ]\n');
+fs.writeFileSync(path.join(instanceUser, "keybindings.json"), '// mine\n[ { "key": "ctrl+alt+n", "command": "workbench.action.toggleSidebarVisibility" }, { "key": "ctrl+alt+k", "command": "workbench.action.showCommands" } ]\n');
 
 const runtime = path.join(work, "runtime");
 const serverData = path.join(runtime, "server-data");
@@ -204,9 +207,11 @@ for (let i = 0; ; i++) {
 await sleep(3);
 
 // --- one browser run ---------------------------------------------------------------------------------
-async function scenario(name, seedBrowser, copyArg = copy, extra = null) {
+// `overlay`: seed the way the Code tab does, with the keybinding overlay (the GP7 runs below check which profile's keybinding reaches the tab, not the overlay)
+// `browserProfile`: reuse the Chrome profile (and so the IndexedDB files) of an earlier run instead of a fresh one
+async function scenario(name, seedBrowser, copyArg = copy, extra = null, overlay = false, browserProfile = name) {
   const cdpPort = await freePort();
-  const chrome = spawn(CHROME, ["--headless=new", `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${path.join(work, "chrome-" + name)}`, "--no-first-run", "--disable-background-networking", "about:blank"], { stdio: "ignore" });
+  const chrome = spawn(CHROME, ["--headless=new", `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${path.join(work, "chrome-" + browserProfile)}`, "--no-first-run", "--disable-background-networking", "about:blank"], { stdio: "ignore" });
   started.push(chrome.pid);
   await sleep(5);
   const page = (await (await fetch(`http://127.0.0.1:${cdpPort}/json`)).json()).find((t) => t.type === "page");
@@ -233,7 +238,7 @@ async function scenario(name, seedBrowser, copyArg = copy, extra = null) {
     // what the Code tab does: the bare origin first, the seed script, then the workbench
     await send("Page.navigate", { url: `${origin}/` });
     await sleep(3);
-    const outcome = await ev(settings.buildBrowserSeedScript(settings.BROWSER_APP_SETTINGS, copyArg));
+    const outcome = await ev(overlay ? settings.buildBrowserSeedScript(settings.BROWSER_APP_SETTINGS, copyArg, chrome_.overlayKeybindings(), chrome_.unbindCommands()) : settings.buildBrowserSeedScript(settings.BROWSER_APP_SETTINGS, copyArg));
     check(outcome === "seeded", `${name}: the seed script ran in the page`, outcome);
   }
   await send("Page.navigate", { url: `${origin}/?tkn=${token}&folder=${encodeURIComponent(vault)}` });
@@ -248,7 +253,7 @@ async function scenario(name, seedBrowser, copyArg = copy, extra = null) {
   await sleep(4);
   const fontSize = await ev("(() => { const s = document.querySelector('.monaco-editor .view-line span'); return s ? getComputedStyle(s).fontSize : 'no editor'; })()");
 
-  // the keybinding: Ctrl+Alt+N toggles the side bar
+  // the keybindings: Ctrl+Alt+N toggles the side bar without the overlay and does nothing with it; Ctrl+Alt+K opens the command palette
   const sidebar = () => ev("(() => { const e = document.querySelector('.part.sidebar'); return !!e && e.offsetWidth > 0; })()");
   const before = await sidebar();
   await key("n", "KeyN", 78, CTRL | ALT);
@@ -256,6 +261,11 @@ async function scenario(name, seedBrowser, copyArg = copy, extra = null) {
   const after = await sidebar();
   if (after === false) await key("n", "KeyN", 78, CTRL | ALT); // search below needs the side bar
   await sleep(1);
+  await key("k", "KeyK", 75, CTRL | ALT);
+  await sleep(1.5);
+  const paletteOpened = (await ev("(() => { const e = document.querySelector('.quick-input-widget'); return !!e && e.offsetWidth > 0 && e.offsetHeight > 0; })()")) === true;
+  await key("Escape", "Escape", 27);
+  await sleep(0.5);
 
   // search
   await key("F", "KeyF", 70, META | SHIFT);
@@ -269,13 +279,14 @@ async function scenario(name, seedBrowser, copyArg = copy, extra = null) {
   const extraResult = extra ? await extra({ ev, key, send, sleep, origin }) : null;
   ws.close();
   for (const pid of [...descendants(chrome.pid), chrome.pid]) try { process.kill(pid); } catch { /* gone */ }
-  return { fontSize, sidebarToggled: before !== after, hits: hits ?? [], extra: extraResult };
+  return { fontSize, sidebarToggled: before !== after, paletteOpened, hits: hits ?? [], extra: extraResult };
 }
 
-const copied = await scenario("copied", true);
+const copied = await scenario("copied", true, copy, null, true);
 console.log("copied run:", JSON.stringify(copied));
 check(copied.fontSize === `${FONT}px`, "copied editor.fontSize is the font size of an open editor", copied.fontSize);
-check(copied.sidebarToggled, "the copied keybinding (ctrl+alt+n) runs its command");
+check(!copied.sidebarToggled, "the copied keybinding (ctrl+alt+n -> toggleSidebarVisibility) does not bring the side bar back: the overlay unbinds it (E9)");
+check(copied.paletteOpened, "a copied keybinding that brings no bar back (ctrl+alt+k -> the command palette) still runs its command");
 const text = copied.hits.join(" | ");
 check(/a\.txt/.test(text), "search finds the visible file", text);
 for (const [folder, file] of [[".obsidian", "hit.txt"], ["Attachments", "att.txt"], ["skipme", "mine.txt"]]) {
@@ -285,7 +296,7 @@ for (const [folder, file] of [[".obsidian", "hit.txt"], ["Attachments", "att.txt
 const control = await scenario("control", false);
 console.log("control run:", JSON.stringify(control));
 check(control.fontSize !== `${FONT}px`, "control: without the browser seed the font size is not the copied one (the data/User file alone does nothing)", control.fontSize);
-check(!control.sidebarToggled, "control: without the browser seed the copied keybinding does nothing");
+check(!control.sidebarToggled && !control.paletteOpened, "control: without the browser seed the copied keybindings do nothing");
 check(control.hits.join(" | ").includes("mine.txt"), "control: the instance's own exclude (skipme) is not in force without the browser seed");
 check(!control.hits.join(" | ").includes("hit.txt") && !control.hits.join(" | ").includes("att.txt"), "control: the workspace excludes still are (they are in the Machine file)");
 
@@ -343,11 +354,18 @@ check(!(gp7Fde.extra.idb.settings ?? "").includes(TRUST), "G12: no security.work
 check(!gp7Fde.extra.settingsJsonText.includes(TRUST), "G12: the tab's settings JSON has no security.workspace.trust. line (FDE Practice)");
 check(!(gp7Fde.extra.idb.keybindings ?? "").includes("toggleSidebarVisibility"), "GP7: nothing of Default's keybinding is in the IndexedDB keybindings.json");
 
-// Moving the association back: the next start's copy replaces the whole IndexedDB file (same browser profile is not reused here;
-// the seed script's replace-whole rule is covered by tests/unit/settings.test.ts).
+// Moving the association back: the next start's copy replaces the whole IndexedDB file. The tab is loaded again in the
+// browser profile the FDE Practice run used, so what is checked is the files that profile holds, not just the copy object.
+// The fixture's FDE Practice settings carry its name (settings(22, name)); neither it nor its keybinding may be left.
 associate("__default__profile__");
 const back = copyForMirroredProfile();
 check(back.name === "Default" && back.copy.settings["editor.fontSize"] === 14 && !JSON.stringify(back.copy.settings).includes("FDE Practice"), "GP7: association back on Default: the copy holds Default's values and nothing of FDE Practice");
+const gp7Back = await scenario("gp7-back", true, back.copy, profileExtra("gp7-back"), false, "gp7-fde");
+console.log("gp7 back on Default run:", JSON.stringify({ ...gp7Back, extra: undefined }));
+check(gp7Back.fontSize === "14px", "GP7 back on Default: the same browser profile now shows Default's editor.fontSize", gp7Back.fontSize);
+check(!(gp7Back.extra.idb.settings ?? "").includes("FDE Practice"), "GP7: nothing of FDE Practice remains in the IndexedDB /User/settings.json after the association moved back", gp7Back.extra.idb.settings);
+check(!gp7Back.extra.panelToggled, "GP7 back on Default: FDE Practice's keybinding (ctrl+alt+m) is gone");
+check(!(gp7Back.extra.idb.settings ?? "").includes(TRUST) && !gp7Back.extra.settingsJsonText.includes(TRUST), "G12: no security.workspace.trust. key after the move back");
 
 // F9: the fixture's other instances, and the chosen instance's own folder, are byte-identical. The association edits above
 // changed only storage.json in the chosen instance's folder, so that one is compared with its post-edit state.
@@ -357,7 +375,7 @@ guardedFolders.forEach((d, i) => {
   if (name === "Code - Insiders") {
     const after = fs.readdirSync(path.join(d, "User", "profiles")).sort().join(",");
     console.log(`F9 ${name}: hash before ${hashesBefore[i].slice(0, 16)} after ${hashesAfter[i].slice(0, 16)} (only storage.json was edited by this script)`);
-    check(after === `${fx.PROFILES.agents.location},${fx.PROFILES.custom.location}`, "F9: the chosen instance's profile folders are unchanged by the seed runs", after);
+    check(after === [fx.PROFILES.agents.location, fx.PROFILES.custom.location].sort().join(","), "F9: the chosen instance's profile folders are unchanged by the seed runs", after);
   } else {
     console.log(`F9 ${name}: hash before ${hashesBefore[i].slice(0, 16)} after ${hashesAfter[i].slice(0, 16)}`);
     check(hashesBefore[i] === hashesAfter[i], `F9: ${name} hashes the same before and after`);

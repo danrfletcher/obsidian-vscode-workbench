@@ -158,6 +158,20 @@ describe("ChoiceModal", () => {
     await expect(r).resolves.toBe("save");
   });
 
+  it("the close prompt of an editor that is not ready, and the two causes of an editor opened from the tab, say what is true", () => {
+    const text = (req: Parameters<typeof promptCloseDirty>[1]) => {
+      void promptCloseDirty(app, req);
+      return lastModal().contentEl.all().filter((n) => n.tag === "p").map((n) => n.text).join(" ");
+    };
+    expect(text({ file: "a.py", state: "unreadable" })).toContain("The editor for a.py is not ready");
+    const unsaved = text({ file: "a.py", state: "unreadable", otherEditor: "unsaved" });
+    expect(unsaved).toContain("has unsaved changes");
+    expect(unsaved).not.toContain("is not ready");
+    const unknown = text({ file: "a.py", state: "unreadable", otherEditor: "unknown" });
+    expect(unknown).toContain("cannot tell whether it has unsaved changes");
+    expect(unknown).not.toContain("is not ready");
+  });
+
   it("lets the title and the text break anywhere, so a long file name stays inside the modal (C32)", () => {
     void promptCloseDirty(app, { file: "a_very_long_file_name_with_no_spaces_at_all.py", state: "dirty" });
     const nodes = lastModal().contentEl.all();

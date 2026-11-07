@@ -224,7 +224,7 @@ describe("ThemeSync: follows Obsidian without piling up work", () => {
 });
 
 describe("F5: the sync and theme code makes no network request", () => {
-  it.each(["theme-map", "vault-sync", "tab-registry", "chrome-settings", "dirty-guard"])("src/%s.ts has no network API and no outside address", (name) => {
+  it.each(["theme-map", "vault-sync", "tab-registry", "chrome-settings", "chrome-script", "dirty-guard"])("src/%s.ts has no network API and no outside address", (name) => {
     const code = fs.readFileSync(path.join(__dirname, "..", "..", "src", `${name}.ts`), "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
     expect(code).not.toMatch(/\bfetch\(|XMLHttpRequest|WebSocket|sendBeacon|node:https?|node:net|require\(["']https?["']\)/);
     expect(code).not.toMatch(/https?:\/\/(?!127\.0\.0\.1)/);

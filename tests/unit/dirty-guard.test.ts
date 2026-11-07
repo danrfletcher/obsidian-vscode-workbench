@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import {
   AUTO_SAVE_KEY,
@@ -11,6 +12,7 @@ import {
   type Choice,
   type GuardAction,
 } from "../../src/dirty-guard";
+import { DIRTY_SCRIPT } from "../../src/dirty-script";
 
 describe("decide: the unsaved-buffer rule for close, idle and quit", () => {
   // caller, buffer state, auto-save -> what happens next
@@ -90,5 +92,50 @@ describe("auto-save from the instance's settings", () => {
     const none = {};
     withAutoSaveDefault(none);
     expect(none).toEqual({});
+  });
+});
+
+// The dirty script on real DOM pages with the tab strip hidden (chrome spike S5, docs/spike-chrome.md): there is no `.tab` element, and
+// the window title's leading "●" is the signal. The rule table above did not move; only the signal the script reads did (PR-5).
+describe("the dirty script on a workbench page with no tab strip (S5)", () => {
+  /** The shape measured on VS Code 1.143.1 and 1.144.0 with `workbench.editor.showTabs: none`: an editor, no `.tab`. */
+  function page(title: string, workbench = true, editor = true): Document {
+    const html = `<!doctype html><title>${title}</title>
+      ${workbench ? `<div class="monaco-workbench"><div class="part editor"><div class="editor-group-container">
+        ${editor ? `<div class="monaco-editor" data-uri="vscode-remote://127.0.0.1:1/vault/a.js"><textarea class="inputarea"></textarea></div>` : ""}
+      </div></div></div>` : ""}`;
+    return new DOMParser().parseFromString(html, "text/html");
+  }
+  const dirtyOf = (doc: Document) => new Function("document", `return ${DIRTY_SCRIPT}`)(doc) as boolean;
+
+  it("has no `.tab` to read, whatever the editor holds", () => {
+    expect(page("a.js \u2014 vault \u2014 Visual Studio Code").querySelector(".monaco-workbench .tab")).toBeNull();
+  });
+
+  it("reads a dirty active editor through the window title mark, and a saved one as clean", () => {
+    expect(dirtyOf(page("\u25cf a.js \u2014 Visual Studio Code"))).toBe(true);
+    expect(dirtyOf(page("a.js \u2014 Visual Studio Code"))).toBe(false);
+  });
+
+  it("reads a page with nothing open as clean", () => {
+    expect(dirtyOf(page("Visual Studio Code", true, false))).toBe(false); // no editor on screen: the bare app name is the right title
+  });
+
+  it("does not answer clean for an editor on screen under a title of the wrong shape (a workspace window.title without the template)", () => {
+    expect(() => dirtyOf(page("a.js"))).toThrow(/shape/);
+    expect(() => dirtyOf(page("Visual Studio Code"))).toThrow(/shape/);
+  });
+
+  it("does not answer clean when the title is empty or the workbench is not in the page: it throws, and the tab reads unreadable", () => {
+    expect(() => dirtyOf(page(""))).toThrow();
+    expect(() => dirtyOf(page("Visual Studio Code", false))).toThrow();
+  });
+
+  it("ignores a `dirty` class on a tab-like element: the tab strip is not the signal", () => {
+    const doc = new DOMParser().parseFromString(
+      `<!doctype html><title>a.js</title><div class="monaco-workbench"><div class="tab dirty" data-resource-name="a.js"></div></div>`,
+      "text/html",
+    );
+    expect(dirtyOf(doc)).toBe(false);
   });
 });

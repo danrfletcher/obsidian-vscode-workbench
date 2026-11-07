@@ -1,13 +1,14 @@
 /**
- * Where the drawer sits and how much room it takes (G11). The drawer spans only the main
- * pane area (Obsidian's root split), not the sidebars: it takes that area's left edge and
- * width, and the area is shortened by the drawer's height with a bottom margin, so the
- * sidebars keep the full window height. Closing the drawer, or hiding it, sets the offset
+ * Where the drawer and its edge sit and how much room the drawer takes (G4). They span only the main
+ * pane area (Obsidian's root split), not the sidebars: they take that area's left edge and
+ * width, and the area is shortened by the drawer's height (styles.css: its height and bottom margin, only in the main window), so the
+ * sidebars keep the full window height. The left edge and width are measured whether or not the
+ * drawer is open, because the always-visible edge needs them. Closing the drawer sets the offset
  * to zero (the bottom margin is gone, so no gap is left); disposing removes every variable.
  *
  * The page variables, all on <body>:
- *   --vscw-left         the drawer's left edge (px)
- *   --vscw-width        the drawer's width (px)
+ *   --vscw-left         the main pane area's left edge (px)
+ *   --vscw-width        the main pane area's width (px)
  *   --vscw-status-lift  how far the status bar moves up to clear the drawer (px)
  */
 
@@ -29,7 +30,7 @@ export interface Bounds {
 export const NO_BOUNDS: Readonly<Bounds> = { left: 0, width: 0, offset: 0, statusLift: 0 };
 
 /**
- * The drawer's bounds from the main pane area's rectangle. With no rectangle (no root split on the
+ * The bounds from the main pane area's rectangle. With no rectangle (no root split on the
  * page) the drawer spans the window. `openHeight` is the drawer's height while it is open and 0 when it is
  * closed or hidden; a negative or non-numeric height counts as 0.
  */
@@ -48,7 +49,7 @@ const VARS = ["--vscw-left", "--vscw-width", "--vscw-status-lift"];
 export interface LayoutOptions {
   document: Document;
   window: Window;
-  /** The drawer's left edge or width changed: its terminal needs to fit again. */
+  /** The left edge or width changed while the drawer is open. */
   onChange?(bounds: Bounds): void;
 }
 
@@ -79,8 +80,8 @@ export class LayoutController {
   /** Measure the main pane area again and write the variables. Safe to call at any time. */
   refresh(): void {
     if (this.disposed) return;
-    // Closed or hidden: no offset and no lift, but the last left and width stay, so a closing drawer slides down in place.
-    const next = this.openHeight > 0 ? computeBounds(this.measure(), this.opts.window.innerWidth, this.openHeight) : { ...this.current, offset: 0, statusLift: 0 };
+    // Closed: no offset and no lift (computeBounds gives 0 for a zero height), but the left and width are still measured for the edge.
+    const next = computeBounds(this.measure(), this.opts.window.innerWidth, this.openHeight);
     const moved = next.left !== this.current.left || next.width !== this.current.width;
     this.current = next;
     this.write(next);

@@ -3,7 +3,7 @@
  *
  * `docs/spike-decision.md` records the same value in its header key `hotkey_bridge` (a test keeps the two
  * equal). `yes` installs the key relay in every Code tab; `no` installs nothing and the plugin falls back to the
- * strip and to the hotkey outside the embed. Nothing else in the plugin hard-codes either answer: the relay
+ * bottom edge and to the hotkey outside the embed. Nothing else in the plugin hard-codes either answer: the relay
  * asks `bridgeEnabled()`, and tests pass the other value in to cover the fallback.
  */
 export type HotkeyBridgeDecision = "yes" | "no";

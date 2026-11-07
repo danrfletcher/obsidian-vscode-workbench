@@ -9,7 +9,9 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileSystemAdapter, Modal, Notice, Plugin, TFile, WorkspaceLeaf, type MockApp } from "../mocks/obsidian";
 import VSCodeWorkbenchPlugin from "../../src/main";
-import { CodeView } from "../../src/code-view";
+import { CodeView, DIRTY_SCRIPT } from "../../src/code-view";
+import { LicenceDeclinedError } from "../../src/licence";
+import { buildFileUri, targetOfUri } from "../../src/paths";
 import { FAKE_CODE, isAlive, tempDir } from "../helpers";
 
 const VIEW = "vscode-workbench-code";
@@ -407,7 +409,7 @@ describe("the real CodeView (PR-4 R7)", () => {
       for (const fn of this.listeners[n]?.splice(0) ?? []) fn();
     }
     async executeJavaScript(code: string) {
-      return code.includes("tab.dirty") ? false : "seeded"; // DIRTY_SCRIPT: clean
+      return code === DIRTY_SCRIPT ? false : "seeded"; // clean
     }
     focused = 0;
     focus() {
@@ -519,15 +521,14 @@ describe("the real CodeView (PR-4 R7)", () => {
     expect(realLive()).toHaveLength(2);
   });
 
-  it("hiding the drawer from the terminal over a Code tab focuses the real CodeView's embed (GP5e, PR-8 R4)", async () => {
+  it("hiding the drawer over a Code tab hands keyboard focus to that leaf's real CodeView embed (G1)", async () => {
     const f = write("a.py");
     await loadReal();
     await plugin.openCodeFile(f);
     const tab = realLive()[0];
     const embed = (tab.view as unknown as { frame: FakeEmbed }).frame;
-    (app.workspace as unknown as { getActiveViewOfType: () => unknown }).getActiveViewOfType = () => tab.view; // the real CodeView, not a plain object
     const before = embed.focused;
-    (plugin as unknown as { focusActiveEditor(): void }).focusActiveEditor();
+    (plugin as unknown as { focusLeafView(leaf: unknown): void }).focusLeafView(tab); // what the drawer's focus-return calls on hide
     expect(embed.focused).toBe(before + 1);
   });
 
@@ -542,5 +543,441 @@ describe("the real CodeView (PR-4 R7)", () => {
     await plugin.openCodeFile(f);
     expect(realLive()).toHaveLength(1);
     expect(realLive()[0]).not.toBe(first);
+  });
+
+  describe("a file opened from inside a Code tab's editor (PR-4)", () => {
+    const AUTH = "127.0.0.1:5555";
+    const target = (abs: string) => targetOfUri(buildFileUri(`http://${AUTH}`, abs), AUTH, vault);
+    const inVault = (rel: string) => target(path.join(vault, rel));
+    const script = (leaf: RealLeaf) => ((leaf.view as unknown as { frame: FakeEmbed }).frame as FakeEmbed & { ran: string[] }).ran;
+    const opened: Array<{ file: string; active: unknown }> = [];
+    /** Every leaf the plugin asked the workspace for, with the kind it asked for and the view state it gave that leaf. */
+    const asked: Array<{ kind: unknown; viewState: { type: string; state?: unknown; active?: unknown } | null }> = [];
+
+    /** The real plugin and real CodeViews; the fake webview records every script run in it, and Obsidian's own open is recorded. */
+    async function setup(): Promise<void> {
+      await loadReal();
+      opened.length = 0;
+      asked.length = 0;
+      vi.stubGlobal("document", {
+        body: { classList: { contains: () => false } },
+        createElement: () => {
+          const e = new FakeEmbed() as FakeEmbed & { ran: string[] };
+          e.ran = [];
+          // a real webview reports dom-ready for the server's origin page and again for the workbench page
+          const set = e.setAttribute.bind(e);
+          let srcs = 0;
+          e.setAttribute = (k: string, v: string) => {
+            set(k, v);
+            if (k === "src" && ++srcs === 2) setTimeout(() => e.fire("dom-ready"), 0);
+          };
+          const run = e.executeJavaScript.bind(e);
+          e.executeJavaScript = async (code: string) => (e.ran.push(code), run(code));
+          return e;
+        },
+      });
+      const getLeaf = app.workspace.getLeaf;
+      app.workspace.getLeaf = ((kind: string) => {
+        const l = getLeaf(kind) as unknown as RealLeaf & { openFile?: (f: TFile, o: unknown) => Promise<void> };
+        const record: (typeof asked)[number] = { kind, viewState: null };
+        asked.push(record);
+        const setViewState = l.setViewState.bind(l);
+        l.setViewState = async (s: { type: string; state?: unknown; active?: unknown }) => {
+          record.viewState = { ...s };
+          await setViewState(s);
+        };
+        l.openFile = async (f, o) => void opened.push({ file: f.path, active: (o as { active?: unknown }).active });
+        return l as never;
+      }) as never;
+    }
+    const goLines = (leaf: RealLeaf) => script(leaf).filter((c) => c.includes("quick-input-widget"));
+    const settle = () => new Promise((r) => setTimeout(r, 20));
+
+    it("a code file becomes a new Code tab at the line, and the tab it came from is untouched", async () => {
+      const a = write("t/pd.js");
+      const helper = write("t/helper.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      const first = realLive()[0];
+      await plugin.openFromEditor(first as never, inVault(helper), 5);
+      await settle();
+      expect(realLive()).toHaveLength(2);
+      const second = realLive()[1];
+      expect(second.file).toBe(helper);
+      expect(first.file).toBe(a);
+      expect(second.viewState).toEqual({ type: VIEW, state: { file: helper } }); // the line is not persisted
+      expect(goLines(second)).toHaveLength(1);
+      expect(goLines(second)[0]).toContain("const line = 5;");
+      expect(goLines(first)).toEqual([]);
+      expect(revealed[revealed.length - 1]).toBe(second as never); // in front
+    });
+
+    it("C25: the open asks the workspace for a new tab (getLeaf('tab')) and gives it active: true; the same file again asks for no leaf and focuses (Code tab and Obsidian view)", async () => {
+      const a = write("t/pd.js");
+      const helper = write("t/helper.js");
+      const note = write("n/daily.md", "x\n");
+      await setup();
+      await plugin.openCodeFile(a);
+      asked.length = 0;
+      const first = realLive()[0];
+      await plugin.openFromEditor(first as never, inVault(helper), 5);
+      expect(asked).toHaveLength(1);
+      expect(asked[0].kind).toBe("tab");
+      expect(asked[0].viewState).toEqual({ type: VIEW, state: { file: helper, line: 5 }, active: true }); // the line travels in the state of the view being made
+      const second = realLive()[1];
+      // the same file reached again: no leaf is asked for, the tab it has is revealed
+      asked.length = 0;
+      await plugin.openFromEditor(first as never, inVault(helper), 9);
+      expect(asked).toEqual([]);
+      expect(revealed[revealed.length - 1]).toBe(second as never);
+      // an Obsidian view is also opened in a new tab, active
+      await plugin.openFromEditor(first as never, inVault(note), 1);
+      expect(asked).toHaveLength(1);
+      expect(asked[0].kind).toBe("tab");
+      expect(opened).toEqual([{ file: note, active: true }]);
+    });
+
+    it("C16: a declined licence on an opened-from-editor file opens it in the system app; a failed server start gives the notice the plugin already shows; neither leaves a blank or extra tab", async () => {
+      const a = write("t/pd.js");
+      const declined = write("t/declined.js");
+      const failed = write("t/failed.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      const first = realLive()[0];
+      const before = created.length;
+      const ensure = vi.spyOn(plugin as unknown as { ensureServer: () => Promise<unknown> }, "ensureServer");
+      ensure.mockRejectedValueOnce(new LicenceDeclinedError());
+      await plugin.openFromEditor(first as never, inVault(declined), 3);
+      expect(systemApp).toEqual([declined]);
+      expect(created).toHaveLength(before); // no leaf was made for it, so nothing blank
+      ensure.mockRejectedValueOnce(new Error("server broke")); // main.ts has shown the reason before it rejects
+      await plugin.openFromEditor(first as never, inVault(failed), 3);
+      expect(systemApp).toEqual([declined]);
+      expect(created).toHaveLength(before);
+      expect(realLive()).toEqual([first]);
+      expect(first.file).toBe(a);
+    });
+
+    it("E4: the open is made from the tab it came from: that tab is made the active one first when it is not (a Code tab in a split pane)", async () => {
+      const a = write("t/pd.js");
+      const helper = write("t/helper.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      const first = realLive()[0];
+      const order: string[] = [];
+      let active: unknown = null;
+      const ws = app.workspace as unknown as { activeLeaf: unknown; setActiveLeaf: (l: unknown, o: unknown) => void; getLeaf: (k: string) => unknown };
+      ws.setActiveLeaf = (l: unknown) => void (order.push("activate"), (active = l));
+      const getLeaf = ws.getLeaf;
+      ws.getLeaf = (k: string) => (order.push(`getLeaf:${k}:from-active=${active === first}`), getLeaf(k));
+      active = new RealLeaf(); // another pane has the focus
+      await plugin.openFromEditor(first as never, inVault(helper), 5);
+      expect(order.slice(0, 2)).toEqual(["activate", "getLeaf:tab:from-active=true"]);
+    });
+
+    it("E4: with two Code tabs in two panes, an open from each lands as a new tab in that pane's own tab group, and the other pane gets none", async () => {
+      const a = write("t/pd.js");
+      const b = write("t/other.js");
+      const helperA = write("t/helper-a.js");
+      const helperB = write("t/helper-b.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      await plugin.openCodeFile(b);
+      const [left, right] = realLive();
+      // a model of panes: a new tab (getLeaf("tab")) joins the group of whichever leaf is active
+      const group = new Map<unknown, string>([[left, "left"], [right, "right"]]);
+      let active: unknown = left; // the user is in the left pane
+      const ws = app.workspace as unknown as { getMostRecentLeaf: () => unknown; setActiveLeaf: (l: unknown) => void; getLeaf: (k: string) => unknown };
+      ws.getMostRecentLeaf = () => active;
+      ws.setActiveLeaf = (l) => void (active = l);
+      const getLeaf = ws.getLeaf;
+      ws.getLeaf = (k) => {
+        const l = getLeaf(k);
+        group.set(l, group.get(active) ?? "none");
+        return l;
+      };
+      await plugin.openFromEditor(right as never, inVault(helperB), 2); // from the right pane while the left one is active
+      await plugin.openFromEditor(left as never, inVault(helperA), 2); // from the left pane, now that the right one is active
+      await settle();
+      const byFile = (f: string) => realLive().find((l) => l.file === f) as RealLeaf;
+      expect(realLive()).toHaveLength(4);
+      expect(group.get(byFile(helperB))).toBe("right");
+      expect(group.get(byFile(helperA))).toBe("left");
+      // each tab still shows only its own file
+      expect([left.file, right.file]).toEqual([a, b]);
+      expect(realLive().map((l) => l.file).sort()).toEqual([a, b, helperA, helperB].sort());
+    });
+
+    it("the same definition reached again focuses the tab that already shows it and moves its cursor, with no second tab (E3)", async () => {
+      const a = write("t/pd.js");
+      const helper = write("t/helper.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      const first = realLive()[0];
+      await plugin.openFromEditor(first as never, inVault(helper), 5);
+      const second = realLive()[1];
+      const before = created.length;
+      await plugin.openFromEditor(first as never, inVault(helper), 7);
+      await settle();
+      expect(created).toHaveLength(before);
+      expect(realLive()).toHaveLength(2);
+      expect(revealed[revealed.length - 1]).toBe(second as never);
+      // the second ask came before the new tab's workbench page had loaded: the latest line wins and the cursor is moved once
+      expect(goLines(second).map((c) => /const line = (\d+);/.exec(c)?.[1])).toEqual(["7"]);
+      // and once the page is up, a further ask moves the cursor there at once
+      await plugin.openFromEditor(first as never, inVault(helper), 9);
+      await settle();
+      expect(goLines(second).map((c) => /const line = (\d+);/.exec(c)?.[1])).toEqual(["7", "9"]);
+    });
+
+    it("a definition in the file the first tab shows (its own file) is the same file: that tab is focused, no new tab", async () => {
+      const a = write("t/pd.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      const first = realLive()[0];
+      await plugin.openFromEditor(first as never, inVault(a), 2);
+      await settle();
+      expect(realLive()).toEqual([first]);
+      expect(goLines(first)).toHaveLength(1);
+    });
+
+    it("two opens of one new file at once make one tab", async () => {
+      const a = write("t/pd.js");
+      const helper = write("t/helper.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      const first = realLive()[0];
+      await Promise.all([plugin.openFromEditor(first as never, inVault(helper), 5), plugin.openFromEditor(first as never, inVault(helper), 6)]);
+      expect(realLive().map((l) => l.file).sort()).toEqual([a, helper].sort());
+    });
+
+    it("an open tab restored from the last session counts: it is focused, not duplicated", async () => {
+      const a = write("t/pd.js");
+      const helper = write("t/helper.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      const restored = new RealLeaf();
+      created.push(restored as never);
+      restored.viewState = { type: VIEW, state: { file: helper } }; // saved layout state, the view never loaded
+      (restored as unknown as { loadIfDeferred: () => Promise<void> }).loadIfDeferred = async () => void (await restored.setViewState({ type: VIEW, state: { file: helper } }));
+      await plugin.openFromEditor(realLive()[0] as never, inVault(helper), 4);
+      await settle();
+      expect(realLive().filter((l) => l.viewState?.type === VIEW)).toHaveLength(2);
+      expect(revealed[revealed.length - 1]).toBe(restored as never);
+      expect(restored.file).toBe(helper);
+    });
+
+    it.each(["Notes/daily note.md", "Board.canvas", "Tasks.base", "img/shot.png", "docs/paper.pdf"])("%s opens through Obsidian, in a new tab and in front, and no Code tab is made", async (rel) => {
+      const a = write("t/pd.js");
+      write(rel, rel.endsWith(".png") || rel.endsWith(".pdf") ? Buffer.from([1, 2, 3]) : "x\n");
+      await setup();
+      await plugin.openCodeFile(a);
+      await plugin.openFromEditor(realLive()[0] as never, inVault(rel), 3);
+      expect(opened).toEqual([{ file: rel, active: true }]);
+      expect(realLive()).toHaveLength(1);
+    });
+
+    it("a note that is not in the vault index says so and opens nothing", async () => {
+      const a = write("t/pd.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      await plugin.openFromEditor(realLive()[0] as never, inVault("gone/missing.md"), 3);
+      expect(opened).toEqual([]);
+      expect(Notice.messages.at(-1)).toContain("missing.md is not in this vault");
+    });
+
+    it("a file outside the vault opens nothing and shows a notice naming it", async () => {
+      const a = write("t/pd.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      await plugin.openFromEditor(realLive()[0] as never, target("/usr/lib/node_modules/typescript/lib/lib.d.ts"), 3);
+      expect(realLive()).toHaveLength(1);
+      expect(opened).toEqual([]);
+      expect(Notice.messages.at(-1)).toContain("lib.d.ts is outside this vault");
+    });
+
+    it("a binary and an over-2 MB file go through the Code tab path and are refused there, exactly as an explorer click is", async () => {
+      const a = write("t/pd.js");
+      const zip = write("bin/tool.zip", Buffer.from([0x50, 0x4b, 3, 4, 0, 0, 0, 0]));
+      const huge = write("data/huge.json", Buffer.alloc(2 * 1024 * 1024 + 10, "a"));
+      await setup();
+      await plugin.openCodeFile(a);
+      const noticesBefore = Notice.messages.length;
+      await plugin.openFromEditor(realLive()[0] as never, inVault(zip), 1);
+      await plugin.openFromEditor(realLive()[0] as never, inVault(huge), 1);
+      await settle();
+      expect(realLive().map((l) => l.file)).toEqual([a]);
+      expect(Notice.messages.length).toBeGreaterThan(noticesBefore);
+    });
+
+    it("a file in a hidden folder (.git, .obsidian, node_modules) is refused by the existing rule, with no tab", async () => {
+      const a = write("t/pd.js");
+      const hidden = [write(".git/config"), write(".obsidian/app.json"), write("node_modules/lib/index.js")];
+      await setup();
+      await plugin.openCodeFile(a);
+      for (const h of hidden) await plugin.openFromEditor(realLive()[0] as never, inVault(h), 1);
+      await settle();
+      expect(realLive().map((l) => l.file)).toEqual([a]);
+    });
+
+    it("an extension the user left to other plugins goes to Obsidian", async () => {
+      write("t/helper.js");
+      await setup();
+      await plugin.updateSettings({ excludeExtensions: ["js"] });
+      await plugin.openFromEditor(new RealLeaf() as never, inVault("t/helper.js"), 1);
+      expect(opened).toEqual([{ file: "t/helper.js", active: true }]);
+    });
+
+    it("a file with spaces, accents, CJK and emoji in its name opens as one tab, found again by the other Unicode form", async () => {
+      const a = write("t/pd.js");
+      const name = write("src/estimaté tïme 文件 🚀.ts");
+      await setup();
+      await plugin.openCodeFile(a);
+      const first = realLive()[0];
+      await plugin.openFromEditor(first as never, inVault(name), 3);
+      await plugin.openFromEditor(first as never, inVault(name.normalize("NFD")), 4);
+      await settle();
+      expect(realLive()).toHaveLength(2);
+    });
+
+    it("a line that is zero, negative or past the end never breaks the open (the tab opens; the page script clamps)", async () => {
+      const a = write("t/pd.js");
+      const h = write("t/helper.js");
+      const h2 = write("t/h2.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      await plugin.openFromEditor(realLive()[0] as never, inVault(h), 0);
+      await plugin.openFromEditor(realLive()[0] as never, inVault(h2), 99999999);
+      await settle();
+      const [, one, two] = realLive();
+      expect(realLive()).toHaveLength(3);
+      void h;
+      expect(goLines(one)[0]).toContain("const line = 1;");
+      expect(goLines(two)[0]).toContain("const line = 99999999;");
+    });
+
+    it("openCodeFile without a line leaves the cursor alone (the explorer, the quick switcher, the command)", async () => {
+      const a = write("t/pd.js");
+      await setup();
+      await plugin.openCodeFile(a);
+      await plugin.openCodeFile(a);
+      expect(goLines(realLive()[0])).toEqual([]);
+    });
+  });
+});
+
+describe("a file opened from a Code tab's editor (PR-4 E3, E4, GP2)", () => {
+  /** Every call the plugin makes on the workspace, in order, with what it was given. */
+  let calls: string[];
+  let activeLeaf: WorkspaceLeaf | null;
+  let obsidianLeaves: Array<WorkspaceLeaf & { view?: unknown }>;
+  let opened: Array<{ file: string; options: unknown }>;
+  let viewStates: Array<{ mode: unknown; state: { type: string; state?: unknown; active?: boolean } }>;
+
+  /** The app of `makeApp`, with the workspace calls this section is about recorded. */
+  async function loadRecording(): Promise<void> {
+    await load();
+    const ws = app.workspace as unknown as Record<string, unknown>;
+    ws.getMostRecentLeaf = () => activeLeaf;
+    ws.setActiveLeaf = (l: WorkspaceLeaf, o: unknown) => {
+      activeLeaf = l;
+      calls.push(`setActiveLeaf:${(l as { name?: string }).name ?? "?"}:${JSON.stringify(o)}`);
+    };
+    ws.iterateAllLeaves = (cb: (l: WorkspaceLeaf) => void) => obsidianLeaves.forEach(cb);
+    ws.revealLeaf = async (l: WorkspaceLeaf) => void calls.push(`revealLeaf:${(l as { name?: string }).name ?? "?"}`);
+    ws.getLeaf = (mode?: unknown) => {
+      calls.push(`getLeaf:${String(mode)}`);
+      const l = new CodeLeaf() as CodeLeaf & { openFile?: (f: { path: string }, o: unknown) => Promise<void> };
+      const set = l.setViewState.bind(l);
+      l.setViewState = async (s) => {
+        viewStates.push({ mode, state: s as never });
+        await set(s);
+      };
+      l.openFile = async (f, options) => void opened.push({ file: f.path, options });
+      created.push(l);
+      return l;
+    };
+  }
+
+  const named = <T extends WorkspaceLeaf>(l: T, name: string): T => Object.assign(l, { name });
+
+  beforeEach(() => {
+    calls = [];
+    activeLeaf = null;
+    obsidianLeaves = [];
+    opened = [];
+    viewStates = [];
+  });
+
+  it("E4: a Code tab that is not the active one is made active BEFORE the new tab is made, so the new tab lands in its pane", async () => {
+    write("a.py");
+    write("lib/b.py");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    const other = named(new CodeLeaf(), "other");
+    activeLeaf = other; // the user is on another pane when the report arrives
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "lib/b.py" }, 7);
+    expect(calls.slice(0, 2)).toEqual(['setActiveLeaf:from:{"focus":false}', "getLeaf:tab"]);
+    expect(activeLeaf).toBe(from);
+  });
+
+  it("E4: when the Code tab is already the active one the active leaf is not touched", async () => {
+    write("lib/b.py");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    activeLeaf = from;
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "lib/b.py" }, 7);
+    expect(calls.filter((c) => c.startsWith("setActiveLeaf"))).toEqual([]);
+  });
+
+  it('GP2: the Code tab path asks for getLeaf("tab") and sets the view state active, at the reported line', async () => {
+    write("lib/b.py");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    activeLeaf = from;
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "lib/b.py" }, 7);
+    expect(viewStates).toHaveLength(1);
+    expect(viewStates[0].mode).toBe("tab");
+    expect(viewStates[0].state).toEqual({ type: VIEW, state: { file: "lib/b.py", line: 7 }, active: true });
+  });
+
+  it('GP2: the Obsidian path (a note) asks for getLeaf("tab") and opens the file active', async () => {
+    write("notes/n.md", "# n");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    activeLeaf = from;
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "notes/n.md" }, null);
+    expect(calls).toContain("getLeaf:tab");
+    expect(opened).toEqual([{ file: "notes/n.md", options: { active: true } }]);
+  });
+
+  it("a note that is already open in Obsidian is focused, not opened a second time (repeated Go to Definition into a note)", async () => {
+    write("notes/n.md", "# n");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    activeLeaf = from;
+    const noteLeaf = named(new WorkspaceLeaf(), "note") as WorkspaceLeaf & { view?: unknown };
+    noteLeaf.view = { file: { path: "notes/n.md" } };
+    const elsewhere = named(new WorkspaceLeaf(), "elsewhere") as WorkspaceLeaf & { view?: unknown };
+    elsewhere.view = { file: { path: "notes/other.md" } };
+    obsidianLeaves = [elsewhere, noteLeaf];
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "notes/n.md" }, null);
+    expect(opened).toEqual([]);
+    expect(calls).not.toContain("getLeaf:tab");
+    expect(calls).toContain("revealLeaf:note");
+    expect(activeLeaf).toBe(noteLeaf);
+    expect(live()).toHaveLength(0);
+  });
+
+  it("a note open only as a different file's tab does not count: it opens in a new tab", async () => {
+    write("notes/n.md", "# n");
+    await loadRecording();
+    const from = named(new CodeLeaf(), "from");
+    activeLeaf = from;
+    const elsewhere = named(new WorkspaceLeaf(), "elsewhere") as WorkspaceLeaf & { view?: unknown };
+    elsewhere.view = { file: { path: "notes/other.md" } };
+    obsidianLeaves = [elsewhere];
+    await plugin.openFromEditor(from as never, { kind: "vault", file: "notes/n.md" }, null);
+    expect(opened).toEqual([{ file: "notes/n.md", options: { active: true } }]);
   });
 });

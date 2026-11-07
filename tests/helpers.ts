@@ -69,7 +69,9 @@ export class FakeWebview {
   autoDomReady = true;
   executeResult: () => Promise<unknown> = async () => "seeded";
   trustResult: () => Promise<unknown> = async () => "seeded";
-  private listeners: Record<string, (() => void)[]> = {};
+  private listeners: Record<string, ((event?: unknown) => void)[]> = {};
+  /** The listeners added with `{ once: true }`: a real element drops those after one event and keeps the rest. */
+  private onceListeners = new Set<(event?: unknown) => void>();
   constructor(public tag: string) {}
   setAttribute(k: string, v: string) {
     this.attrs[k] = v;
@@ -78,11 +80,18 @@ export class FakeWebview {
       if (this.srcs.length === 1 && this.autoDomReady) setTimeout(() => this.fire("dom-ready"), 0);
     }
   }
-  addEventListener(name: string, fn: () => void) {
+  addEventListener(name: string, fn: (event?: unknown) => void, options?: { once?: boolean }) {
     (this.listeners[name] ??= []).push(fn);
+    if (options?.once) this.onceListeners.add(fn);
+  }
+  /** An event that can come many times (a webview's `console-message`): every listener hears it and stays. */
+  emit(name: string, event: unknown) {
+    for (const fn of [...(this.listeners[name] ?? [])]) fn(event);
   }
   fire(name: string) {
-    for (const fn of this.listeners[name]?.splice(0) ?? []) fn();
+    const heard = [...(this.listeners[name] ?? [])];
+    this.listeners[name] = heard.filter((fn) => !this.onceListeners.has(fn));
+    for (const fn of heard) fn();
   }
   executeJavaScript(code: string) {
     this.executed.push(code);
@@ -100,4 +109,17 @@ export class FakeWebview {
     this.text = o.text;
   }
   remove() {}
+}
+
+/**
+ * Open the terminal drawer the way the edge, the command and the hotkey do (through the drawer, which shows the host page and
+ * starts the server on the first open). The plugin has no other way to show the page.
+ */
+export function openTerminal(plugin: unknown): void {
+  (plugin as { drawer: { openDrawer(): void } }).drawer.openDrawer();
+}
+
+/** Close the terminal drawer, which hides the host page; the page stays mounted and alive. */
+export function closeTerminal(plugin: unknown): void {
+  (plugin as { drawer: { close(): void } }).drawer.close();
 }

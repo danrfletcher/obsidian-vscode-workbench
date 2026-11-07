@@ -130,6 +130,84 @@ describe("the temp copy", () => {
     expect(mem.under(TMP)).toEqual([]);
   });
 
+  describe("a database that changes while it is being copied", () => {
+    const WAL = `${DB}-wal`;
+    /** Runs `change` once, right after the first copy of the database has been made (desktop VS Code writing between the copies). */
+    function changeAfterFirstCopy(mem: MemFs, change: () => void, times = 1) {
+      const original = mem.copyFile.bind(mem);
+      let left = times;
+      mem.copyFile = async (src, dst) => {
+        await original(src, dst);
+        if (src === DB && left > 0) {
+          left--;
+          change();
+        }
+      };
+    }
+    /** A runner that records the files of the temp copy it was given, and answers with the ids named in the copied -wal. */
+    function readsWal(mem: MemFs) {
+      const seen: Array<{ db: string | undefined; wal: string | undefined }> = [];
+      const run: SqliteRunner = async (args) => {
+        seen.push({ db: mem.files.get(args[2]), wal: mem.files.get(`${args[2]}-wal`) });
+        return { kind: "ok", stdout: idsRow(mem.files.get(`${args[2]}-wal`) ?? "none.yet") };
+      };
+      return { run, seen };
+    }
+
+    it("is copied again once, and sqlite3 gets the second copy", async () => {
+      const mem = new MemFs({ [DB]: "db", [WAL]: "old.wal" });
+      changeAfterFirstCopy(mem, () => {
+        mem.put(WAL, "new.wal");
+        mem.mtimes.set(WAL, 99);
+      });
+      const r = readsWal(mem);
+      expect(await read(mem, r.run)).toEqual({ ok: true, ids: ["new.wal"], missing: false });
+      expect(r.seen).toEqual([{ db: "db", wal: "new.wal" }]); // one sqlite3 run, on the copy made after the change
+      expect(mem.ops.filter((o) => o.op === "copyFile" && o.path === DB)).toHaveLength(2);
+      expect(mem.under(TMP)).toEqual([]);
+    });
+
+    it("a sidecar that was there for the first copy and is gone for the second is not carried into it", async () => {
+      const mem = new MemFs({ [DB]: "db", [WAL]: "old.wal" });
+      changeAfterFirstCopy(mem, () => mem.files.delete(WAL)); // checkpointed away
+      const r = readsWal(mem);
+      expect(await read(mem, r.run)).toEqual({ ok: true, ids: ["none.yet"], missing: false });
+      expect(r.seen).toEqual([{ db: "db", wal: undefined }]);
+    });
+
+    it("the main file growing between the copies is noticed too", async () => {
+      const mem = new MemFs({ [DB]: "db" });
+      changeAfterFirstCopy(mem, () => mem.put(DB, "db, written"));
+      const r = readsWal(mem);
+      expect(await read(mem, r.run)).toMatchObject({ ok: true });
+      expect(r.seen).toEqual([{ db: "db, written", wal: undefined }]);
+    });
+
+    it("one that keeps changing fails the read with a plain reason and never starts sqlite3 on a mismatched copy", async () => {
+      const mem = new MemFs({ [DB]: "db", [WAL]: "wal" });
+      let n = 0;
+      changeAfterFirstCopy(
+        mem,
+        () => {
+          mem.put(WAL, `wal ${++n}`);
+          mem.mtimes.set(WAL, 10 + n); // a write moves the modification time
+        },
+        2,
+      );
+      const r = readsWal(mem);
+      expect(await read(mem, r.run)).toEqual({ ok: false, kind: "unreadable", reason: "the database kept changing while it was copied" });
+      expect(r.seen).toEqual([]);
+      expect(mem.under(TMP)).toEqual([]);
+    });
+
+    it("files that do not change are copied once", async () => {
+      const mem = new MemFs({ [DB]: "db", [WAL]: "wal" });
+      const r = readsWal(mem);
+      await read(mem, r.run);
+      expect(mem.ops.filter((o) => o.op === "copyFile" && o.path === DB)).toHaveLength(1);
+    });
+  });
+
   it("a database file that is not there is a missing database (not a failure), and sqlite3 is not started", async () => {
     const mem = new MemFs();
     const a = answering({ kind: "ok", stdout: "" });

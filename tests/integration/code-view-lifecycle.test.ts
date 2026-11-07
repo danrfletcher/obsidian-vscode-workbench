@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeNode, WorkspaceLeaf as MockLeaf } from "../mocks/obsidian";
 import type { WorkspaceLeaf } from "obsidian";
 import { CodeView, DIRTY_SCRIPT, type CodeViewHost } from "../../src/code-view";
+import { overlayKeybindings, unbindCommands } from "../../src/chrome-settings";
+import { OVERLAY_BEGIN, OVERLAY_END } from "../../src/keybinding-overlay";
 import type { CloseDirtyRequest } from "../../src/modals";
 import { OpenFiles } from "../../src/open-file";
 import { carryEdits, readBaseline, statSignature, type CarryResult } from "../../src/rename-carry";
@@ -25,8 +27,15 @@ class Embed extends FakeNode {
   /** Pressing Save All clears the dirty flag, as the real workbench does. */
   savesOnKeys = true;
   dirtyAnswer: (() => Promise<unknown>) | null = null;
-  /** What the workbench's tab for this file reads while the page as a whole is dirty: "clean", "dirty", or "none" (no such tab). */
-  fileTab: "clean" | "dirty" | "none" = "none";
+  /**
+   * The stand-in page's window title; null: derived from `dirty` ("● a.py — Visual Studio Code" when dirty, else the same
+   * without the mark). `DIRTY_SCRIPT` runs against this page for real; the page has no VS Code tab strip.
+   */
+  title: string | null = null;
+  /** Whether the stand-in page has a workbench element (false: the signal is missing and the script throws). */
+  workbench = true;
+  /** Every selector the dirty script asked the stand-in page for. */
+  queried: string[] = [];
   private fired: Record<string, Array<() => void>> = {};
   setAttribute(k: string, v: string) {
     this.attrs[k] = v;
@@ -39,19 +48,39 @@ class Embed extends FakeNode {
     (this.fired[n] ??= []).push(f);
     super.addEventListener(n, f);
   }
-  /** Every script that was neither a dirty read nor a file-tab read: the two seeds, in order. */
+  /** Every script that was not a dirty read: the two seeds, in order. */
   seeds: string[] = [];
   /** What the trust seed answers. */
   trustAnswer: () => Promise<unknown> = () => Promise.resolve("seeded");
+  /** What the settings seed (which carries the keybinding overlay step) answers. */
+  seedAnswer: () => Promise<unknown> = () => Promise.resolve("seeded");
   executeJavaScript(code: string) {
     if (code.includes("vscode-web-state-db-global-shared")) {
       this.seeds.push(code);
       return this.trustAnswer();
     }
-    if (code.includes("vscode-web-db")) this.seeds.push(code);
-    if (code === DIRTY_SCRIPT) return this.dirtyAnswer ? this.dirtyAnswer() : Promise.resolve(this.dirty);
-    if (code.includes("data-resource-name")) return Promise.resolve(this.fileTab); // fileDirtyScript
+    if (code.includes("vscode-web-db")) {
+      this.seeds.push(code);
+      return this.seedAnswer();
+    }
+    if (code === DIRTY_SCRIPT) return this.dirtyAnswer ? this.dirtyAnswer() : this.readPage();
     return Promise.resolve("seeded");
+  }
+  /** Runs the real `DIRTY_SCRIPT` against a stand-in page shaped like the signal: a window title, a workbench, no tab strip. */
+  private readPage(): Promise<unknown> {
+    const title = this.title ?? `${this.dirty ? "\u25cf " : ""}a.py \u2014 Visual Studio Code`;
+    const doc = {
+      title,
+      querySelector: (sel: string) => {
+        this.queried.push(sel);
+        return sel === ".monaco-workbench" && this.workbench ? {} : null;
+      },
+    };
+    try {
+      return Promise.resolve(new Function("document", `return ${DIRTY_SCRIPT}`)(doc));
+    } catch (e) {
+      return Promise.reject(e);
+    }
   }
   sendInputEvent() {
     this.keys++;
@@ -88,6 +117,10 @@ function world(
     root?: string;
     afterCarry?: () => void;
     trust?: { enabled: () => boolean; held: () => number[]; outcomes: string[]; port?: number };
+    /** The host's chrome hiding (the keybinding overlay and its page script); unset: the host gives none. */
+    chromeHiding?: CodeViewHost["chromeHiding"];
+    /** Collects the listeners the tabs register for the server's state, so a test can announce a restart. */
+    serverListeners?: Array<(state: "running" | "stopped") => void>;
   } = {},
 ) {
   const leaves: Array<WorkspaceLeaf & { detached?: boolean }> = [];
@@ -101,6 +134,8 @@ function world(
   const newTabs: string[] = [];
   const carried: Array<{ from: string; to: string; result: CarryResult }> = [];
   const notMoved: Array<{ from: string; to: string }> = [];
+  /** Every read of a file's baseline the tabs started (a rename looks at the old path once, in the background), so a test can wait for them. */
+  const baselineReads: Array<{ file: string; done: Promise<void> }> = [];
   const root = opts.root;
   const host: CodeViewHost = {
     vaultRoot: () => root ?? "/vault",
@@ -109,9 +144,15 @@ function world(
     trackView: () => undefined,
     untrackView: () => undefined,
     serverState: () => "running",
-    onServerState: () => () => undefined,
+    onServerState: (cb) => {
+      opts.serverListeners?.push(cb as (state: "running" | "stopped") => void);
+      return () => undefined;
+    },
     restartServer: async () => undefined,
     userDataCopy: () => null,
+    // A host like the plugin's: it gives the chrome-hiding script and opens files from the editor, so the page is watched and a clean title is trusted (PR-5 R10).
+    chromeHiding: opts.chromeHiding ?? (() => ({ keybindings: [], script: "0" })),
+    openFromEditor: async () => undefined,
     ...(opts.trust
       ? {
           trustVaultFolder: () => opts.trust?.enabled() ?? false,
@@ -133,7 +174,11 @@ function world(
     // The real on-disk move (src/rename-carry.ts) against the temp vault, recording what it decided.
     ...(root
       ? {
-          readBaseline: (f: string) => readBaseline(root, f),
+          readBaseline: (f: string) => {
+            const read = readBaseline(root, f);
+            baselineReads.push({ file: f, done: read.then(() => undefined, () => undefined) });
+            return read;
+          },
           statSignature: (f: string) => statSignature(root, f),
           carryEdits: async (from: string, to: string, baseline: Buffer | null) => {
             const result = await carryEdits(root, from, to, baseline);
@@ -163,7 +208,13 @@ function world(
   const taken = (p: string) => {
     for (const v of views.values()) v.pathTaken(p);
   };
-  return { openTab, open, registry, sync, prompts, focused, newTabs, leaves, carried, notMoved, taken };
+  /** Resolves when every baseline read of `file` started so far has finished and the tab has acted on what it read. */
+  const baselineSettled = async (file: string) => {
+    await Promise.all(baselineReads.filter((r) => r.file === file).map((r) => r.done));
+    await new Promise((r) => setImmediate(r));
+  };
+  const hasBaselineRead = (file: string) => baselineReads.some((r) => r.file === file);
+  return { openTab, open, registry, sync, prompts, focused, newTabs, leaves, carried, notMoved, taken, baselineSettled, hasBaselineRead };
 }
 
 beforeEach(() => {
@@ -243,6 +294,22 @@ describe("closing a Code tab with unsaved edits (G2, E13)", () => {
     t.leaf.detach();
     await vi.waitFor(() => expect(w.prompts).toHaveLength(1));
     expect(w.prompts[0].state).toBe("unreadable");
+    expect(t.leaf.detached).toBe(false);
+  });
+
+  it("close: a title with the dirty mark asks (Cancel keeps the tab); a page whose title is gone asks in the unreadable wording, never a silent close (E5)", async () => {
+    const w = world({ answers: ["cancel", "cancel"] });
+    const t = await w.openTab("a.py");
+    t.embed().dirty = true;
+    t.leaf.detach();
+    await vi.waitFor(() => expect(w.prompts).toHaveLength(1));
+    expect(w.prompts[0]).toEqual({ file: "a.py", state: "dirty", failed: false });
+    await vi.waitFor(() => expect(w.focused).toEqual([t.leaf]));
+    t.embed().dirty = false;
+    t.embed().title = ""; // the signal is gone
+    t.leaf.detach();
+    await vi.waitFor(() => expect(w.prompts).toHaveLength(2));
+    expect(w.prompts[1].state).toBe("unreadable");
     expect(t.leaf.detached).toBe(false);
   });
 
@@ -384,6 +451,55 @@ describe("the idle clock and the quit prompt ask the tab whether it is unsaved (
       t.embed().dirty = true;
       expect(await t.view.isDirty()).toBe(true);
     }
+  });
+
+  it("idle clock: a title with the dirty mark keeps the server alive (hasDirtyBuffer), the same page saved does not; the page is the real DIRTY_SCRIPT on a page with no tab strip (E5)", async () => {
+    const w = world();
+    const t = await w.openTab("a.py");
+    const page = t.embed();
+    page.dirty = true;
+    expect(await t.view.isDirty()).toBe(true);
+    page.dirty = false; // saved: the mark leaves the title
+    expect(await t.view.isDirty()).toBe(false);
+    expect(page.queried.every((sel) => !sel.includes(".tab") && !sel.includes("data-resource-name"))).toBe(true);
+  });
+
+  it("quit and restart prompts: the tabs listed are the ones whose own title carries the mark; two files of one name in different folders are told apart (E5)", async () => {
+    const w = world();
+    const typed = await w.openTab("x/a.py");
+    const other = await w.openTab("y/a.py");
+    const saved = await w.openTab("z/b.py");
+    typed.embed().dirty = true;
+    // what the quit and restart prompts do: ask every tab, list the ones that are dirty
+    const dirtyFiles = async () => {
+      const tabs = [typed, other, saved];
+      const flags = await Promise.all(tabs.map((t) => t.view.isDirty()));
+      return tabs.filter((_, i) => flags[i]).map((t) => t.view.getState().file);
+    };
+    expect(await dirtyFiles()).toEqual(["x/a.py"]);
+    typed.embed().dirty = false;
+    expect(await dirtyFiles()).toEqual([]); // once saved, none of them is listed
+  });
+
+  it("a page whose title is empty or that has no workbench counts as unsaved: the script throws, the tab reads unreadable (E5)", async () => {
+    const w = world();
+    const t = await w.openTab("a.py");
+    t.embed().title = "";
+    expect(await t.view.bufferState()).toBe("unreadable");
+    expect(await t.view.isDirty()).toBe(true);
+    t.embed().title = null;
+    t.embed().workbench = false;
+    expect(await t.view.bufferState()).toBe("unreadable");
+    expect(await t.view.isDirty()).toBe(true);
+  });
+
+  it("a page with a title and a workbench but no mark reads clean, whether or not an editor is open: nothing typed, nothing to lose (E5)", async () => {
+    const w = world();
+    const t = await w.openTab("a.py");
+    t.embed().title = "Visual Studio Code"; // no editor open
+    expect(await t.view.bufferState()).toBe("clean");
+    t.embed().title = "a.py \u2014 Visual Studio Code";
+    expect(await t.view.bufferState()).toBe("clean");
   });
 
   it("a page that cannot be asked counts as unsaved: it throws, or the server is down", async () => {
@@ -528,65 +644,72 @@ describe("vault events (G3, G4)", () => {
     expect(w.leaves).toHaveLength(1);
   });
 
-  it("a save of the renamed file while ANOTHER editor of the page stays unsaved is carried at once, and every later save too (PR-5 R4, T40, T41)", async () => {
-    // The page-wide probe stays true while any editor is dirty (another file's edits, or a buffer the workbench restored),
-    // but the renamed file's own tab reads clean after its save. The text is carried into the renamed file without waiting
-    // for the other editor; the embed is reloaded only once the whole page is saved.
+  it("the rename-carry runs on the window title alone, with no VS Code tab strip in the page: dirty, then saved at the old path, is carried and the embed moves (E5)", async () => {
     const root = tempDir();
     fs.writeFileSync(path.join(root, "a.py"), "old\n");
     const w = world({ root });
     const t = await w.openTab("a.py");
     const first = t.embed();
-    first.dirty = true; // the page is dirty, whoever's edits these are
-    first.fileTab = "dirty"; // and this file's own buffer is one of them
+    first.dirty = true; // the title carries the dirty mark
     fs.renameSync(path.join(root, "a.py"), path.join(root, "b.py"));
     w.sync.onRename("b.py", "a.py");
-    await new Promise((r) => setTimeout(r, 1300)); // a watch look sees this file's tab dirty
-    fs.writeFileSync(path.join(root, "a.py"), "edited\n"); // Cmd+S in the renamed file's buffer
-    first.fileTab = "clean"; // the other editor keeps the page dirty
-    await vi.waitFor(() => expect(w.carried).toHaveLength(1), { timeout: 4000 });
-    expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true); // no reload: the other editor's text would go with it
+    await new Promise((r) => setTimeout(r, 1300)); // a watch look sees the dirty title
+    fs.writeFileSync(path.join(root, "a.py"), "edited\n"); // Cmd+S in the workbench: written at the old path...
+    first.dirty = false; // ...and the title loses the mark
+    await vi.waitFor(() => expect(w.carried).toHaveLength(1), { timeout: 10000 });
+    expect(w.carried.map((c) => c.result)).toEqual(["carried"]);
+    await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"), { timeout: 10000 });
     expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited\n");
     expect(fs.existsSync(path.join(root, "a.py"))).toBe(false);
-    // the buffer is still bound to a.py: type again and save again, and that is carried as well, not left in a recreated a.py
-    first.fileTab = "dirty";
-    await new Promise((r) => setTimeout(r, 1300));
-    fs.writeFileSync(path.join(root, "a.py"), "edited again\n");
-    first.fileTab = "clean";
-    await vi.waitFor(() => expect(w.carried).toHaveLength(2), { timeout: 4000 });
-    expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited again\n");
-    expect(fs.existsSync(path.join(root, "a.py"))).toBe(false);
-    expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true);
-    first.dirty = false; // the other editor is saved: now the embed moves to the renamed file
-    await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"), { timeout: 4000 });
     expect(w.notMoved).toEqual([]);
-    expect(w.carried.map((c) => c.result)).toEqual(["carried", "carried"]);
-    expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("edited again\n");
+    // the page the tab was asked about never had a tab strip, and the script never asked for one or for a file name
+    expect(first.queried.length).toBeGreaterThan(0);
+    expect(first.queried.every((sel) => !sel.includes(".tab") && !sel.includes("data-resource-name"))).toBe(true);
     expect(w.leaves).toHaveLength(1);
-  }, 15000);
+  }, 40000);
 
-  it("an edit that stays unsaved in the renamed file's own tab is not carried while another editor is unsaved either", async () => {
+  it("a save in flight is not read as clean before the file is written: the watch needs the dirty title, then a clean one with the old path changed in between (E5)", async () => {
     const root = tempDir();
     fs.writeFileSync(path.join(root, "a.py"), "old\n");
     const w = world({ root });
     const t = await w.openTab("a.py");
     const first = t.embed();
     first.dirty = true;
-    first.fileTab = "dirty";
     fs.renameSync(path.join(root, "a.py"), path.join(root, "b.py"));
     w.sync.onRename("b.py", "a.py");
-    await new Promise((r) => setTimeout(r, 2500)); // several watch looks: this file's tab is dirty throughout
+    await new Promise((r) => setTimeout(r, 1300)); // dirty look
+    await t.view.observeMove();
+    first.dirty = false; // the title lost its mark while the old path is still untouched: nothing was written yet
+    await t.view.observeMove();
+    await t.view.observeMove(); // two quick reads of a clean title with no write behind them
+    fs.writeFileSync(path.join(root, "a.py"), "edited\n"); // the write lands later
+    await t.view.observeMove();
+    // a clean title seen with no write is an undo, not a save: nothing is carried on it
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(w.carried).toEqual([]);
+    expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("old\n");
+  }, 40000);
+
+  it("an edit that stays unsaved in the tab is not carried, and the embed stays (E5)", async () => {
+    const root = tempDir();
+    fs.writeFileSync(path.join(root, "a.py"), "old\n");
+    const w = world({ root });
+    const t = await w.openTab("a.py");
+    const first = t.embed();
+    first.dirty = true;
+    fs.renameSync(path.join(root, "a.py"), path.join(root, "b.py"));
+    w.sync.onRename("b.py", "a.py");
+    await new Promise((r) => setTimeout(r, 2500)); // several watch looks: the title carries the mark throughout
     expect(w.carried).toEqual([]);
     expect(w.notMoved).toEqual([]);
     expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true);
     expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("old\n");
   });
 
-  it("with no tab to read for the renamed file, a save while ANOTHER editor stays unsaved is not carried, but nothing is lost and the user is told (PR-5 R4, T35)", async () => {
-    // Tab strip hidden by a setting, so only the page-wide probe is left: it stays true while any editor is dirty. A
-    // save of the renamed file's own buffer then never shows as a dirty-to-clean change, so it cannot be told from a
-    // write by something else (R10) and is not carried. The text is in the old path, the renamed file is untouched,
-    // and the notice says so.
+  it("with the signal missing at the look of the save (the title is empty), the save is not carried, but nothing is lost and the user is told (E5)", async () => {
+    // A VS Code update that changes how the title is built ends up here: the script throws, the tab reads unreadable, and a save
+    // made in that gap cannot be told from a write by something else (R10, R11). The text is in the old path, the renamed file is
+    // untouched, and the notice says so.
     const root = tempDir();
     fs.writeFileSync(path.join(root, "a.py"), "old\n");
     const w = world({ root });
@@ -595,11 +718,13 @@ describe("vault events (G3, G4)", () => {
     first.dirty = true;
     fs.renameSync(path.join(root, "a.py"), path.join(root, "b.py"));
     w.sync.onRename("b.py", "a.py");
-    await new Promise((r) => setTimeout(r, 1300)); // a watch look sees the dirty buffer
-    fs.writeFileSync(path.join(root, "a.py"), "edited\n"); // Cmd+S on the renamed file's buffer; another editor stays dirty
-    await new Promise((r) => setTimeout(r, 1300)); // a watch look sees the old path change while the probe still reads dirty
-    expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true); // still held back
-    first.dirty = false; // the other editor is saved too
+    await new Promise((r) => setTimeout(r, 1300)); // a watch look sees the dirty title
+    first.title = ""; // the signal goes
+    fs.writeFileSync(path.join(root, "a.py"), "edited\n"); // Cmd+S on the renamed file's buffer
+    await new Promise((r) => setTimeout(r, 1300)); // a watch look cannot read the page
+    expect(first.srcs.every((u) => !u.includes("b.py"))).toBe(true); // an unreadable page is not reloaded
+    first.title = null; // the signal is back, reading clean
+    first.dirty = false;
     await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"), { timeout: 4000 });
     expect(w.carried).toEqual([]);
     expect(w.notMoved).toEqual([{ from: "a.py", to: "b.py" }]);
@@ -845,8 +970,14 @@ describe("vault events (G3, G4)", () => {
       const t = await w.openTab("a.py");
       fs.renameSync(path.join(root, "a.py"), path.join(root, "b.py"));
       w.sync.onRename("b.py", "a.py");
-      fs.writeFileSync(path.join(root, "a.py"), "new a\n");
+      // The tab's rename look reads the old path once, in the background (notePendingMove). A file written there before
+      // that read finishes is seen by it, which is a different case from the one under test: wait until the tab has
+      // settled onto the renamed file AND that read of the old path has finished, and only then put another file there.
       await vi.waitFor(() => expect(t.embed().srcs.at(-1)).toContain("b.py"));
+      await vi.waitFor(() => expect(w.hasBaselineRead("a.py")).toBe(true));
+      await w.baselineSettled("a.py");
+      fs.writeFileSync(path.join(root, "a.py"), "new a\n");
+      w.taken("a.py"); // what the plugin does when Obsidian reports the new file: the settled tab has nothing to say about it
       expect(fs.readFileSync(path.join(root, "b.py"), "utf8")).toBe("old\n");
       expect(fs.readFileSync(path.join(root, "a.py"), "utf8")).toBe("new a\n");
       expect(w.carried).toEqual([]);
@@ -1198,5 +1329,71 @@ describe("no writes to any note", () => {
     for (const t of tabs.slice(0, 2)) t.leaf.detach();
     await vi.waitFor(() => expect(tabs.every((t) => t.leaf.detached)).toBe(true));
     expect(snapshot()).toEqual(before);
+  });
+});
+
+describe("the keybinding overlay step runs at every load of a Code tab (GP4, E9, F3)", () => {
+  const hiding = () => ({ keybindings: overlayKeybindings(), unbind: unbindCommands(), script: "/* page script */ 'installed'" });
+  const withOverlay = (seed: string) => seed.includes(OVERLAY_BEGIN) && seed.includes(OVERLAY_END) && seed.includes('"-workbench.action.toggleSidebarVisibility"');
+  /** The overlay step is part of the settings seed; the trust seed is the other script. Counts the settings seeds that carry the overlay. */
+  const overlaySeeds = (embed: Embed) => embed.seeds.filter(withOverlay).length;
+
+  it("tab open: the settings seed carries the overlay (the disabled chords and the unbinding of revealing commands)", async () => {
+    const w = world({ chromeHiding: hiding });
+    const tab = await w.openTab("a.js");
+    await vi.waitFor(() => expect(overlaySeeds(tab.embed())).toBe(1));
+    const seed = tab.embed().seeds.find(withOverlay) as string;
+    // written out literally: the removals of the four chords of GP4
+    for (const [key, command] of [
+      ["cmd+b", "-workbench.action.toggleSidebarVisibility"],
+      ["cmd+j", "-workbench.action.togglePanel"],
+      ["cmd+k z", "-workbench.action.toggleZenMode"],
+      ["cmd+w", "-workbench.action.closeActiveEditor"],
+    ]) expect(seed).toContain(JSON.stringify({ key, command }));
+    expect(seed).toContain(JSON.stringify(unbindCommands()));
+  });
+
+  it("reload (the same tab, a second load): the step runs again, not once per tab or per server start", async () => {
+    const w = world({ chromeHiding: hiding });
+    const tab = await w.openTab("a.js");
+    await vi.waitFor(() => expect(overlaySeeds(tab.embed())).toBe(1));
+    const first = tab.embed();
+    tab.view.reload(); // the fake embed has no reload(): the tab loads the workbench again, which is a fresh page
+    await vi.waitFor(() => expect(tab.embed()).not.toBe(first));
+    await vi.waitFor(() => expect(overlaySeeds(tab.embed())).toBe(1));
+    expect(w.leaves).toHaveLength(1); // the same tab, not a second one
+  });
+
+  it("server restart: the tab reloads onto the new server and runs the step again", async () => {
+    const serverListeners: Array<(state: "running" | "stopped") => void> = [];
+    const w = world({ chromeHiding: hiding, serverListeners });
+    const tab = await w.openTab("a.js");
+    await vi.waitFor(() => expect(overlaySeeds(tab.embed())).toBe(1));
+    const first = tab.embed();
+    for (const cb of serverListeners) cb("stopped");
+    for (const cb of serverListeners) cb("running");
+    await vi.waitFor(() => expect(tab.embed()).not.toBe(first));
+    await vi.waitFor(() => expect(overlaySeeds(tab.embed())).toBe(1));
+  });
+
+  it.each([
+    ["the host's chromeHiding throws", { chromeHiding: () => { throw new Error("no overlay"); } }, () => Promise.resolve("seeded")],
+    ["the seed script (which holds the overlay step) throws in the page", { chromeHiding: hiding }, () => Promise.reject(new Error("page refused"))],
+    ["the seed script answers an error outcome", { chromeHiding: hiding }, () => Promise.resolve("error:SyntaxError")],
+  ])("F3: %s: the tab still opens and navigates to its editor", async (_name, opts, answer) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // the answer is set on the embed before its page's dom-ready, which fires on the first src
+      vi.stubGlobal("document", { createElement: (t: string) => Object.assign(new Embed(t), { seedAnswer: answer }) });
+      const w = world(opts as never);
+      const tab = await w.openTab("a.js");
+      await vi.waitFor(() => expect(tab.embed().srcs).toHaveLength(2));
+      expect(tab.embed().srcs[1]).toContain("tkn=tok");
+      expect(tab.leaf.detached).toBe(false);
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
   });
 });
