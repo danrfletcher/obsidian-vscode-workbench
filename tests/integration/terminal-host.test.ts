@@ -22,7 +22,7 @@ let body: FakeHostEl & { classList?: { contains(c: string): boolean } };
 let webviews: FakeHostEl[];
 let dark = false;
 let seenModals = 0;
-const PLUGIN_DIR = ".obsidian/plugins/obsidian-vscode-workbench";
+const PLUGIN_DIR = ".obsidian/plugins/vscode-workbench";
 const MODAL_ACCEPT = "Accept and download";
 
 function makeApp(root: string): MockApp {
@@ -57,7 +57,7 @@ function makeApp(root: string): MockApp {
 async function load(env: Record<string, string> = {}, data: Record<string, unknown> = {}): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile, FAKE_CODE_ARGSFILE: argsFile }, env);
   app = makeApp(vault);
-  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: PLUGIN_DIR } as never);
+  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: PLUGIN_DIR } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, embed: "iframe", ...data };
   (plugin as unknown as { downloadHostReachable: () => Promise<boolean> }).downloadHostReachable = async () => false;
   await plugin.onload();

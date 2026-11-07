@@ -42,7 +42,7 @@ function makeApp(root: string, owners: Record<string, string> = {}): MockApp {
 
 async function load(owners: Record<string, string> = {}, data: Record<string, unknown> = {}): Promise<void> {
   app = makeApp(vault, owners);
-  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = { serverLicenceAccepted: true, ...data };
   await plugin.onload();
   await plugin.rescanExtensions(); // joins the scan onload started
@@ -113,7 +113,7 @@ describe("start scan (GP1)", () => {
   it("does not block onload: the scan runs after it returns", async () => {
     write("a.py");
     app = makeApp(vault);
-    plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+    plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
     await plugin.onload();
     expect(registered()).toEqual([]); // nothing yet: the walk has only started
     await plugin.rescanExtensions();
@@ -137,7 +137,7 @@ describe("start scan (GP1)", () => {
   it("a scan that fails is logged and does not throw", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     app = makeApp(path.join(vault, "does-not-exist"));
-    plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+    plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
     await plugin.onload().catch(() => undefined);
     await expect(plugin.rescanExtensions()).resolves.toBeUndefined();
     expect(registered()).toEqual([]);
@@ -220,7 +220,7 @@ describe("another plugin owns an extension (E7)", () => {
     write("a.py");
     app = makeApp(vault);
     delete app.viewRegistry;
-    plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+    plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
     await plugin.onload();
     await plugin.rescanExtensions();
     expect(registered()).toEqual(["py"]);
@@ -290,7 +290,7 @@ describe("coexistence with the other code editors (F8)", () => {
     const unregister = vi.fn();
     app = makeApp(vault, { py: "code-editor" });
     (app.viewRegistry as unknown as { unregisterExtensions: unknown }).unregisterExtensions = unregister;
-    plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+    plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
     await plugin.onload();
     await plugin.rescanExtensions();
     expect(unregister).not.toHaveBeenCalled();
@@ -306,7 +306,7 @@ describe("registration waits for layout-ready (F8)", () => {
     app = makeApp(vault);
     const layoutReady: Array<() => void> = [];
     app.workspace.onLayoutReady = (cb) => void layoutReady.push(cb);
-    plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+    plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
     (plugin as unknown as { pluginData: unknown }).pluginData = { serverLicenceAccepted: true };
     await plugin.onload();
     expect(layoutReady).toHaveLength(1);

@@ -14,7 +14,7 @@ import { FAKE_CODE, isAlive, tempDir } from "../helpers";
 import { listDescendants } from "../../src/process-utils";
 
 const VIEW = "vscode-workbench-code";
-const TOGGLE_COMMAND = "obsidian-vscode-workbench:toggle-terminal-drawer";
+const TOGGLE_COMMAND = "vscode-workbench:toggle-terminal-drawer";
 
 type Mocks = typeof import("../mocks/obsidian");
 type PluginClass = typeof import("../../src/main").default;
@@ -144,7 +144,7 @@ function makeApp(root: string): any {
 /** Obsidian's defaults: the quick switcher's Mod+O, and what the plugin registered for its own command. */
 function defaultsOf(id: string) {
   if (id === "switcher:open") return [{ modifiers: ["Mod"], key: "o" }];
-  const own = mocks.Plugin.commands.find((c: any) => `obsidian-vscode-workbench:${c.id}` === id) as any;
+  const own = mocks.Plugin.commands.find((c: any) => `vscode-workbench:${c.id}` === id) as any;
   return own?.hotkeys;
 }
 
@@ -169,7 +169,7 @@ class CodeLeaf {
 async function loadPlugin(data: Record<string, unknown> = {}, realHost = false): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile });
   app = makeApp(vault);
-  plugin = new PluginCtor(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+  plugin = new PluginCtor(app as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, serverLicenceAccepted: true, ...data };
   await plugin.onload();
   fakeHost = new FakeHostPage();
@@ -268,7 +268,7 @@ describe("the command and its hotkey (G8)", () => {
     const cmd = mocks.Plugin.commands.find((c: any) => c.id === "toggle-terminal-drawer") as any;
     expect(cmd).toBeDefined();
     expect(cmd.hotkeys).toEqual([{ modifiers: ["Ctrl"], key: "`" }]);
-    expect(`obsidian-vscode-workbench:${cmd.id}`).toBe(TOGGLE_COMMAND);
+    expect(`vscode-workbench:${cmd.id}`).toBe(TOGGLE_COMMAND);
   });
 
   it("the command and the edge still open the drawer after the bridge is added (nothing removed)", async () => {

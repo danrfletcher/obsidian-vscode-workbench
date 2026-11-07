@@ -17,7 +17,7 @@ import {
   type PageChord,
 } from "../../src/hotkey/hotkey-bridge";
 
-const TOGGLE_ID = "obsidian-vscode-workbench:toggle-terminal-drawer";
+const TOGGLE_ID = "vscode-workbench:toggle-terminal-drawer";
 
 interface KeyInit {
   key: string;

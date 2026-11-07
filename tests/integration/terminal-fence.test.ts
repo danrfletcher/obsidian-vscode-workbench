@@ -98,7 +98,7 @@ afterEach(async () => {
 
 async function load(): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile, FAKE_CODE_ARGSFILE: argsFile, WORKBENCH_APP_SUPPORT_ROOT: path.join(tree, "AppSupport") });
-  plugin = new VSCodeWorkbenchPlugin(makeHostApp(vault) as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+  plugin = new VSCodeWorkbenchPlugin(makeHostApp(vault) as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, embed: "iframe", serverLicenceAccepted: true };
   (plugin as unknown as { downloadHostReachable: () => Promise<boolean> }).downloadHostReachable = async () => false;
   await plugin.onload();
@@ -175,7 +175,7 @@ describe("F6 desktop VS Code's folders", () => {
     await load();
     openTerminal(plugin);
     await host().settled();
-    const server = path.join(vault, ".obsidian/plugins/obsidian-vscode-workbench/.server");
+    const server = path.join(vault, ".obsidian/plugins/vscode-workbench/.server");
     expect(fs.existsSync(server)).toBe(true);
     expect(JSON.parse(fs.readFileSync(argsFile, "utf8")).join(" ")).toContain(server);
   });

@@ -13,7 +13,7 @@ import { LOST_TEXT, RESTART_LOST_TEXT, TERMINAL_CRASH_TEXT, TERMINAL_RESTART_FAI
 import { FAKE_CODE, isAlive, tempDir, openTerminal, closeTerminal } from "../helpers";
 import { installFakeDocument, makeHostApp, type FakeDocument } from "../fake-host-page";
 
-const PLUGIN_DIR = ".obsidian/plugins/obsidian-vscode-workbench";
+const PLUGIN_DIR = ".obsidian/plugins/vscode-workbench";
 let vault: string;
 let pidFile: string;
 let argsFile: string;
@@ -22,7 +22,7 @@ let doc: FakeDocument;
 
 async function load(env: Record<string, string> = {}, data: Record<string, unknown> = {}): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile, FAKE_CODE_ARGSFILE: argsFile }, env);
-  plugin = new VSCodeWorkbenchPlugin(makeHostApp(vault) as never, { id: "obsidian-vscode-workbench", dir: PLUGIN_DIR } as never);
+  plugin = new VSCodeWorkbenchPlugin(makeHostApp(vault) as never, { id: "vscode-workbench", dir: PLUGIN_DIR } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, embed: "iframe", serverLicenceAccepted: true, ...data };
   (plugin as unknown as { downloadHostReachable: () => Promise<boolean> }).downloadHostReachable = async () => false;
   await plugin.onload();

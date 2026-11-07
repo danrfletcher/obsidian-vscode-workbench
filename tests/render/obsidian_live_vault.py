@@ -12,7 +12,7 @@ import time
 from obsidian_live_cdp import Cdp, VIEW_TYPE
 
 FOLDER = "live-check"
-PLUGIN = "app.plugins.plugins['obsidian-vscode-workbench']"
+PLUGIN = "app.plugins.plugins['vscode-workbench']"
 
 # Every Code tab: its file, leaf id, tab group (parent) id and its place in that group.
 CODE_LEAVES_JS = (

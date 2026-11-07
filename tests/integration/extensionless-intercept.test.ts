@@ -173,7 +173,7 @@ function makeApp(root: string): MockApp {
 async function load(data: Record<string, unknown> = {}): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile });
   app = makeApp(vault);
-  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, embed: "iframe", serverLicenceAccepted: true, ...data };
   await plugin.onload();
 }
