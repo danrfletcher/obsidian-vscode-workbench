@@ -1,7 +1,7 @@
 /**
  * The file path above a Code tab's editor, drawn the way Obsidian draws a note's: one `view-header-breadcrumb` per parent folder, each
  * followed by a `/` separator, in the view header's `titleParentEl`, and ending with the file name in the header title, which reveals
- * the file when clicked. Clicking a folder reveals it in the file explorer; hovering, right-clicking and dragging it do what they do on a note's crumb. Obsidian only
+ * the file when clicked (and has a hover tooltip and a right-click menu). Clicking a folder reveals it in the file explorer; hovering, right-clicking and dragging it do what they do on a note's crumb. Obsidian only
  * does this for its own `FileView`s, which a Code tab is not (it holds a path, not a `TFile`), so the tab draws it itself.
  */
 
@@ -44,24 +44,44 @@ export function folderChain(file: string): string[] {
 export interface FileTitleEl {
   setText(text: string): void;
   onclick: ((evt: unknown) => unknown) | null;
+  /** Right-click. Assigned, like `onclick`, so a redraw replaces the handler instead of stacking another. */
+  oncontextmenu?: ((evt: CrumbEvent) => unknown) | null;
   style?: { cursor: string };
+}
+
+/** What the file name does besides reveal on click. Both are optional: a host without them gets a name that reveals and nothing more. */
+export interface FileTitleActions {
+  /** Called as the name is drawn: give it a hover tooltip (the host shows the file's vault-relative path). */
+  tooltip?(el: FileTitleEl, file: string): void;
+  /** Right-click: show the menu a note's file shows for the file. */
+  menu?(file: string, evt: CrumbEvent): void;
 }
 
 /**
  * Put the file name at the end of the path: in the header title, after the folder crumbs, as a note's path ends with its name.
  * The title is set here rather than left to `getDisplayText()` and the leaf's header update, which can leave the placeholder
- * ("VS Code") the tab had before it knew its file. Clicking the name reveals the file in the file explorer. Assigning `onclick`
- * (not adding a listener) keeps a redraw after a rename from stacking handlers.
+ * ("VS Code") the tab had before it knew its file. Clicking the name reveals the file in the file explorer; hovering and
+ * right-clicking do what they do on a folder crumb (the last two only when `actions` has them). Assigning `onclick` and
+ * `oncontextmenu` (not adding listeners) keeps a redraw after a rename from stacking handlers.
  */
-export function renderFileTitle(titleEl: FileTitleEl, file: string, reveal: (file: string) => void): void {
+export function renderFileTitle(titleEl: FileTitleEl, file: string, reveal: (file: string) => void, actions: FileTitleActions = {}): void {
   const name = file.split("/").filter(Boolean).pop() ?? "";
   titleEl.setText(name);
   if (!name) {
     titleEl.onclick = null;
+    titleEl.oncontextmenu = null;
     return;
   }
   titleEl.onclick = () => reveal(file);
   if (titleEl.style) titleEl.style.cursor = "pointer";
+  actions.tooltip?.(titleEl, file);
+  const { menu } = actions;
+  titleEl.oncontextmenu = menu
+    ? (evt) => {
+        evt.preventDefault();
+        menu(file, evt);
+      }
+    : null;
 }
 
 /**

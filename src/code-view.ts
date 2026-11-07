@@ -76,6 +76,10 @@ export interface CodeViewHost {
   revealFolder?(folder: string): void;
   /** The file name at the end of a tab's path was clicked: reveal that vault-relative file in Obsidian's file explorer. */
   revealFile?(file: string): void;
+  /** Give the file name at the end of a tab's path its hover tooltip (the file's vault-relative path). `el` is the header title element. */
+  fileTooltip?(el: unknown, file: string): void;
+  /** The file name was right-clicked: show the menu for the file (the host builds it with `Menu.forEvent`, which shows it). */
+  fileMenu?(file: string, evt: unknown): void;
   /** Give a path crumb its hover tooltip (the crumb's own folder name, as on a note). `el` is the crumb's element; `folder` its vault-relative path. */
   folderTooltip?(el: unknown, folder: string): void;
   /** A path crumb was right-clicked: show the menu a note's crumb shows for the folder (the host builds it with `Menu.forEvent`, which shows it). */
@@ -425,7 +429,7 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
   /**
    * Draw the file's path in the view header, as Obsidian does for a note: each folder as a crumb revealing itself in the file explorer
    * when clicked (and offering a tooltip, a right-click menu and drag, as a note's crumb does), then the file name as the header title,
-   * which reveals the file when clicked. `titleParentEl` and `titleEl` are Obsidian's own header elements (not in its typings); without
+   * which reveals the file when clicked (and has a tooltip and a right-click menu). `titleParentEl` and `titleEl` are Obsidian's own header elements (not in its typings); without
    * one there is nothing to draw into and the tab keeps what Obsidian gives it. A click does nothing when the host cannot reveal.
    */
   private renderBreadcrumbs(): void {
@@ -439,7 +443,12 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
         drag: host.dragFolder && ((folder, evt) => host.dragFolder?.(folder, evt) ?? false),
       });
     }
-    if (header.titleEl) renderFileTitle(header.titleEl, this.file, (file) => host.revealFile?.(file));
+    if (header.titleEl) {
+      renderFileTitle(header.titleEl, this.file, (file) => host.revealFile?.(file), {
+        tooltip: host.fileTooltip && ((el, file) => host.fileTooltip?.(el, file)),
+        menu: host.fileMenu && ((file, evt) => host.fileMenu?.(file, evt)),
+      });
+    }
   }
 
   get filePath(): string {
