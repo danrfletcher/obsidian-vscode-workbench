@@ -214,6 +214,16 @@ describe("unload", () => {
     }, { timeout: 5000 });
   });
 
+  it("does not detach the Code tabs (the store review), and still lets each tab release its page, claim and subscriptions", async () => {
+    await load();
+    const detach = vi.spyOn(app.workspace, "detachLeavesOfType");
+    const release = vi.fn(async () => undefined);
+    plugin.trackView({ release } as never);
+    plugin.onunload();
+    expect(detach).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
   it("leaves no interval or timeout of its own behind (the chord sync, the idle timer and the host page go with it)", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout"] });
     try {

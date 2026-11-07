@@ -119,3 +119,41 @@ body.vscw-terminal-dragging {
   white-space: normal;
   overflow-wrap: anywhere;
 }
+
+/*
+ * Code tab layout. These were inline styles; the selectors are as specific as Obsidian's `.workspace-leaf-content ...
+ * .view-content` rules, so they win over its padding the way the inline styles did.
+ */
+.workspace-leaf-content .view-content.vscode-workbench-view {
+  padding: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+/* The page of a Code tab (a webview or an iframe) fills the tab. */
+.vscode-workbench-view .vscode-workbench-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+/* The banner that floats over a Code tab's dead page, and the gap before its button (also used in the terminal drawer). */
+.vscode-workbench-view .vscode-workbench-banner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  padding: 8px 12px;
+  background: var(--background-modifier-error, #a33);
+  color: var(--text-on-accent, #fff);
+}
+
+button.vscode-workbench-banner-button {
+  margin-left: 12px;
+}
+
+/* A long file name has no spaces to break at: the choice modals let their title and text break anywhere. */
+.modal-content .vscode-workbench-wrap-anywhere {
+  overflow-wrap: anywhere;
+}

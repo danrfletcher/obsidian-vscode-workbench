@@ -39,6 +39,7 @@ function view(dirty: boolean) {
     abandonRename: () => undefined,
     pathTaken: () => undefined,
     reload: () => undefined,
+    release: async () => undefined,
   };
 }
 
