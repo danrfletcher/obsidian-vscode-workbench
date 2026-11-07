@@ -12,6 +12,12 @@ export class Notice {
 /** Obsidian's `Platform`: tests flip `isDesktopApp` to prove a feature registers on desktop only. */
 export const Platform = { isDesktopApp: true };
 
+/** Every tooltip `setTooltip` was given, in order. */
+export const tooltips: Array<{ el: unknown; text: string }> = [];
+export function setTooltip(el: unknown, text: string): void {
+  tooltips.push({ el, text });
+}
+
 export class TFolder {
   children: Array<TFile | TFolder> = [];
   parent: TFolder | null = null;
@@ -35,7 +41,12 @@ export class TFile {
 export class MenuItem {
   title = "";
   icon = "";
-  private handler: (() => unknown) | null = null;
+  section = "";
+  private handler: ((evt?: unknown) => unknown) | null = null;
+  setSection(section: string): this {
+    this.section = section;
+    return this;
+  }
   setTitle(title: string): this {
     this.title = title;
     return this;
@@ -44,23 +55,52 @@ export class MenuItem {
     this.icon = icon;
     return this;
   }
-  onClick(callback: () => unknown): this {
+  onClick(callback: (evt?: any) => unknown): this {
     this.handler = callback;
     return this;
   }
-  click(): unknown {
-    return this.handler?.();
+  click(evt?: unknown): unknown {
+    return this.handler?.(evt);
   }
 }
 
 /** Obsidian's context menu, as far as the plugin adds items to it. */
 export class Menu {
+  static shown: Array<{ menu: Menu; evt: unknown }> = [];
   items: MenuItem[] = [];
+  sections: string[] = [];
+  /** The event `Menu.forEvent` was made for. Like Obsidian's, that menu shows itself, so it is not in `shown`. */
+  forEventEvt: unknown = null;
+  static forEvent(evt: unknown): Menu {
+    const menu = new Menu();
+    menu.forEventEvt = evt;
+    Menu.created.push(menu);
+    return menu;
+  }
+  static created: Menu[] = [];
+  addSections(sections: string[]): this {
+    this.sections = sections;
+    return this;
+  }
+  setParentElement(_el: unknown): this {
+    return this;
+  }
+  showAtMouseEvent(evt: unknown): this {
+    Menu.shown.push({ menu: this, evt });
+    return this;
+  }
   addItem(callback: (item: MenuItem) => unknown): this {
     const item = new MenuItem();
     callback(item);
     this.items.push(item);
     return this;
+  }
+}
+
+export class Keymap {
+  /** Obsidian answers true for a ctrl/cmd click: tests set `modKey` on the event. */
+  static isModEvent(evt?: { modKey?: boolean } | null): boolean {
+    return !!evt?.modKey;
   }
 }
 

@@ -1,4 +1,4 @@
-import { FileSystemAdapter, ItemView, Notice, Platform, Plugin, TFile, type Menu, type TAbstractFile, type Tasks, type WorkspaceLeaf } from "obsidian";
+import { FileSystemAdapter, ItemView, Keymap, Menu, Notice, Platform, Plugin, TFile, setTooltip, type TAbstractFile, type Tasks, type WorkspaceLeaf } from "obsidian";
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import { checkFile, refusalMessage } from "./binary-guard";
@@ -58,7 +58,7 @@ import { DEVICE_ID_KEY, deviceId } from "./terminal/drawer-state";
 import { viewKind } from "./terminal/drawer-visibility";
 import { FocusReturn } from "./terminal/focus-return";
 import { HeightStore } from "./terminal/height-store";
-import { addNewTerminalItem, type MenuLike, type MenuTarget } from "./terminal/new-terminal-menu";
+import { FILE_EXPLORER_SOURCE, addNewTerminalItem, type MenuLike, type MenuTarget } from "./terminal/new-terminal-menu";
 import { TerminalDrawer } from "./terminal/terminal-drawer";
 import { TerminalHostPage } from "./terminal-host/host-page";
 import { newTerminalAtFolder } from "./terminal-host/new-terminal";
@@ -1205,6 +1205,16 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     this.openFiles.release(file, leaf);
   }
 
+  /** The vault folder at `folder`, found in the form given or the other Unicode form (macOS names are decomposed). */
+  private findFolder(folder: string): unknown {
+    const vault = (this.app as unknown as { vault?: { getFolderByPath?(p: string): unknown } }).vault;
+    for (const form of [folder, folder.normalize("NFC"), folder.normalize("NFD")]) {
+      const found = vault?.getFolderByPath?.(form);
+      if (found) return found;
+    }
+    return null;
+  }
+
   /**
    * A folder in a Code tab's path was clicked: reveal it in the file explorer, the way a note's path does (Obsidian's own
    * breadcrumb calls the file-explorer plugin's `revealInFolder`). Nothing happens when the plugin is off or the folder is gone.
@@ -1212,14 +1222,85 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
   revealFolder(folder: string): void {
     const app = this.app as unknown as {
       internalPlugins?: { getEnabledPluginById?(id: string): { revealInFolder?(f: unknown): void } | null };
-      vault?: { getFolderByPath?(p: string): unknown };
     };
     const explorer = app.internalPlugins?.getEnabledPluginById?.("file-explorer");
     if (!explorer?.revealInFolder) return;
-    for (const form of [folder, folder.normalize("NFC"), folder.normalize("NFD")]) {
-      const found = app.vault?.getFolderByPath?.(form);
-      if (found) return explorer.revealInFolder(found);
+    const found = this.findFolder(folder);
+    if (found) explorer.revealInFolder(found);
+  }
+
+  /** Hover tooltip on a path crumb: the crumb's own folder name, as Obsidian's `createBreadcrumb` sets it on a note's. (Obsidian skips it on mobile; this plugin is desktop-only.) */
+  folderTooltip(el: unknown, folder: string): void {
+    setTooltip(el as HTMLElement, baseName(folder));
+  }
+
+  /**
+   * Right-click on a path crumb: the same menu a note's crumb shows. As Obsidian's own handler does, it builds the menu with
+   * `Menu.forEvent` (which cancels the browser menu and shows itself once this handler returns), lays out the same sections, adds
+   * "New note" and, when the file explorer is on, "New folder" and "Reveal in file explorer", then triggers `file-menu` with the
+   * file explorer's source so that other plugins' items (this plugin's "New terminal at folder" too) are added. Nothing when the folder is gone.
+   */
+  folderMenu(folder: string, evt: unknown): void {
+    const found = this.findFolder(folder);
+    if (!found) return;
+    const app = this.app as unknown as {
+      fileManager?: { createNewMarkdownFile?(f: unknown): Promise<unknown>; createNewFolder?(f: unknown): Promise<{ path: string } | null | undefined> };
+      workspace: {
+        trigger(name: string, ...args: unknown[]): void;
+        getLeaf(newLeaf?: unknown): { openFile(f: unknown, o: unknown): unknown };
+        ensureSideLeaf?(type: string, side: string, o: unknown): unknown;
+      };
+      internalPlugins?: { getEnabledPluginById?(id: string): { revealInFolder?(f: unknown): void } | null };
+    };
+    const menu = Menu.forEvent(evt as MouseEvent) as Menu & { addSections?(sections: string[]): Menu };
+    menu.addSections?.(["title", "open", "action-primary", "action", "info", "info.copy", "view", "system", "", "danger"]);
+    menu.addItem((item) =>
+      item
+        .setSection("action-primary")
+        .setTitle("New note")
+        .setIcon("lucide-edit")
+        .onClick(async (e: MouseEvent | KeyboardEvent) => {
+          const note = await app.fileManager?.createNewMarkdownFile?.(found);
+          if (note) app.workspace.getLeaf(Keymap.isModEvent(e)).openFile(note, { active: true, state: { mode: "source" }, eState: { rename: "all" } });
+        }),
+    );
+    const explorer = app.internalPlugins?.getEnabledPluginById?.("file-explorer");
+    if (explorer) {
+      menu.addItem((item) =>
+        item
+          .setSection("action-primary")
+          .setTitle("New folder")
+          .setIcon("lucide-folder-open")
+          .onClick(async () => {
+            const created = await app.fileManager?.createNewFolder?.(found);
+            if (created) app.workspace.ensureSideLeaf?.("file-explorer", "left", { active: true, reveal: true, state: { newFile: created.path } });
+          }),
+      );
+      menu.addItem((item) =>
+        item
+          .setSection("system")
+          .setTitle("Reveal in file explorer")
+          .setIcon("lucide-folder-open")
+          .onClick(() => explorer.revealInFolder?.(found)),
+      );
     }
+    const crumb = (evt as { currentTarget?: unknown } | null)?.currentTarget;
+    if (typeof HTMLElement !== "undefined" && crumb instanceof HTMLElement) menu.setParentElement(crumb);
+    app.workspace.trigger("file-menu", menu, found, FILE_EXPLORER_SOURCE);
+  }
+
+  /**
+   * Drag start on a path crumb: Obsidian's drag manager (not in its typings) starts a drag of the folder, as for a note's crumb.
+   * False when the manager or the folder is missing.
+   */
+  dragFolder(folder: string, evt: unknown): boolean {
+    const manager = (this.app as unknown as { dragManager?: { dragFolder?(e: unknown, f: unknown): unknown; onDragStart?(e: unknown, d: unknown): void } }).dragManager;
+    const found = this.findFolder(folder);
+    if (!found || !manager?.dragFolder || !manager.onDragStart) return false;
+    const drag = manager.dragFolder(evt, found);
+    if (!drag) return false;
+    manager.onDragStart(evt, drag);
+    return true;
   }
 
   /** The size and binary guard (E6). A refused file gets a notice and goes to the system app. */
