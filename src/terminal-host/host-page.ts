@@ -33,6 +33,10 @@ export const DECLINED_NOTICE = "VS Code Workbench: the terminal needs the VS Cod
 export const CANCELLED_TEXT = "The VS Code server start was cancelled.";
 export const NOT_LOADED_TEXT = "The VS Code terminal page did not load.";
 export const NOT_PANEL_TEXT = "The VS Code terminal panel did not open on its own.";
+/** The panel was closed in the page and could not be asked for (no running server, or the request file could not be written). */
+export const PANEL_REQUEST_FAILED_TEXT = "The VS Code terminal panel was closed and could not be reopened: the request could not be sent.";
+/** The panel was closed in the page and asked for, but the page did not bring it back in time. */
+export const PANEL_NOT_BACK_TEXT = "The VS Code terminal panel was closed and did not come back.";
 
 /**
  * Puts focus on the terminal's input inside the page: the script the spike measured (docs/terminal-spike.md, S7), which
@@ -143,6 +147,8 @@ export class TerminalHostPage {
   /** The panel was asked for and has not come back yet: the drawer says it is starting rather than show a blank VS Code. */
   private restoring = false;
   private restoreToken = 0;
+  /** The panel could not be brought back (the request failed, or the page did not answer in time): shown with Retry instead of a blank page. */
+  private panelFailure: string | null = null;
   private panelWatch: ReturnType<typeof setInterval> | null = null;
   private panelChecking = false;
 
@@ -205,7 +211,10 @@ export class TerminalHostPage {
   // --- the small internal API (the drawer in `terminal/terminal-drawer.ts` drives it) ---------------------------
 
   show(): void {
-    if (this.panelClosed && this.ready() && !this.state.visible) this.restorePanel();
+    const opening = this.ready() && !this.state.visible;
+    if (opening && this.panelClosed) this.restorePanel();
+    // The watch is paused while the drawer is hidden, so a panel closed just before the hide is looked for once, here.
+    else if (opening) void this.checkPanel(true);
     this.dispatch({ type: "show", licenceAccepted: this.deps.licenceAccepted() });
   }
 
@@ -323,6 +332,7 @@ export class TerminalHostPage {
     this.state = step.state;
     for (const effect of step.effects) this.carryOut(effect);
     this.render();
+    this.syncPanelWatch();
     if (step.state.phase !== before.phase || step.state.disposed !== before.disposed) this.deps.stateChanged?.();
     // The host closed itself (a declined licence): the drawer that asked for it follows. A `hide` or the unload came from the caller.
     if (wasVisible && !step.state.visible && event.type !== "hide" && event.type !== "dispose") this.deps.closedByHost?.();
@@ -370,8 +380,7 @@ export class TerminalHostPage {
       if (abandoned()) return;
       await this.mount(server);
       if (abandoned()) return;
-      this.finish({ type: "ready" });
-      this.watchPanel(); // after `ready`: from here a missing panel means the user closed it
+      this.finish({ type: "ready" }); // from here a missing panel means the user closed it: `dispatch` starts the watch while the drawer is showing
       if (this.focusWhenReady && this.state.visible) this.runFocus(); // the drawer opened while the page was loading
     } catch (e) {
       if (abandoned()) return;
@@ -507,13 +516,25 @@ export class TerminalHostPage {
    * Watch a ready page for a panel that is no longer there: the X in VS Code's terminal panel closes it, and the page is then a
    * blank workbench that nothing can close (the drawer's edge is the only way, and the page behind it shows no terminal). A page
    * that is not painted (loading, reloading) says nothing, so only a painted page without its panel counts.
+   *
+   * The watch runs only while the page is ready and the drawer is showing (`syncPanelWatch`): a hidden drawer asks its page nothing.
+   * A panel closed while the drawer is hidden is found by the one check `show` makes.
    */
-  private watchPanel(): void {
-    if (this.panelWatch) return;
-    this.panelWatch = setInterval(() => void this.checkPanel(), this.deps.panelWatchMs ?? PANEL_WATCH_MS);
+  private syncPanelWatch(): void {
+    const want = this.pageReady && this.state.visible && !this.state.disposed;
+    if (want && !this.panelWatch) {
+      this.panelWatch = setInterval(() => void this.checkPanel(), this.deps.panelWatchMs ?? PANEL_WATCH_MS);
+    } else if (!want && this.panelWatch) {
+      clearInterval(this.panelWatch);
+      this.panelWatch = null;
+    }
   }
 
-  private async checkPanel(): Promise<void> {
+  /**
+   * Look once at whether the ready page still has its panel. Found closed: while the drawer is showing it hides (the watch); when
+   * `opening` (the check `show` makes on a hidden drawer) the panel is asked for back at once.
+   */
+  private async checkPanel(opening = false): Promise<void> {
     const el = this.page;
     if (!el || !this.pageReady || this.restoring || this.panelClosed || this.panelChecking || this.state.disposed) return;
     this.panelChecking = true;
@@ -521,6 +542,10 @@ export class TerminalHostPage {
       const layout = await this.readLayout(el).catch(() => null);
       if (!layout || this.page !== el || !this.pageReady || this.restoring || this.state.disposed) return;
       if (isPainted(layout) && !partShown(layout, "panel")) {
+        if (opening && this.state.visible) {
+          this.restorePanel();
+          return;
+        }
         this.panelClosed = true;
         this.dispatch({ type: "panel-closed" }); // hides the page; the drawer follows (closedByHost)
       }
@@ -529,25 +554,43 @@ export class TerminalHostPage {
     }
   }
 
-  /** The drawer is opening on a page whose panel was closed: ask for the panel, and say "starting" until it is back. */
+  /**
+   * The drawer is opening on a page whose panel was closed: ask for the panel, and say "starting" until it is back. When the
+   * request cannot be made, or the page does not come back within `panelMs`, the drawer says so with Retry rather than show a
+   * blank VS Code that the watch would close again. The panel counts as closed until it is back, so the watch does not re-fire.
+   */
   private restorePanel(): void {
     this.panelClosed = false;
+    this.panelFailure = null;
     const el = this.page;
-    if (!el || !(this.deps.requestPanel?.() ?? false)) return;
+    if (!el) return;
     const token = ++this.restoreToken;
+    if (!(this.deps.requestPanel?.() ?? false)) {
+      this.failPanel(PANEL_REQUEST_FAILED_TEXT);
+      return;
+    }
     this.restoring = true;
+    this.render();
     void (async () => {
+      let back: PageLayout | null = null;
       try {
-        await this.until(() => this.readLayout(el), (l) => isPanelOnly(l), this.deps.panelMs ?? PANEL_MS);
+        back = await this.until(() => this.readLayout(el), (l) => isPanelOnly(l), this.deps.panelMs ?? PANEL_MS);
       } catch {
-        /* the page was replaced or the host unloaded: whatever replaced it owns the display */
+        return; /* the page was replaced or the host unloaded: whatever replaced it owns the display */
       } finally {
         if (this.restoreToken === token) {
           this.restoring = false;
-          this.render();
+          if (back === null && this.page === el) this.failPanel(PANEL_NOT_BACK_TEXT);
+          else this.render();
         }
       }
     })();
+  }
+
+  private failPanel(text: string): void {
+    this.panelClosed = true; // still closed: the next show asks again, and the watch does not hide the drawer meanwhile
+    this.panelFailure = text;
+    this.render();
   }
 
   private removePage(): void {
@@ -555,6 +598,7 @@ export class TerminalHostPage {
     this.page = null;
     this.pageReady = false;
     this.panelClosed = false;
+    this.panelFailure = null;
     this.restoring = false;
     this.restoreToken++;
     if (this.panelWatch) clearInterval(this.panelWatch);
@@ -589,21 +633,23 @@ export class TerminalHostPage {
     this.container.style.visibility = visible ? "visible" : "hidden";
     this.container.style.pointerEvents = visible ? "auto" : "none";
 
-    const key = `${phase}|${error ?? ""}|${lostCause ?? ""}|${this.restoring}`;
+    const key = `${phase}|${error ?? ""}|${lostCause ?? ""}|${this.restoring}|${this.panelFailure ?? ""}`;
     if (key !== this.statusKey) {
       this.statusKey = key;
       this.status.replaceChildren();
-      const text = phase === "starting" || (this.restoring && phase !== "error" && phase !== "crashed") ? STARTING_TEXT : phase === "licence" ? LICENCE_TEXT : phase === "error" ? (error ?? "") : "";
+      const panelFailure = this.panelFailure !== null && !this.restoring && (phase === "running" || phase === "lost") ? this.panelFailure : null;
+      const text = phase === "starting" || (this.restoring && phase !== "error" && phase !== "crashed") ? STARTING_TEXT : phase === "licence" ? LICENCE_TEXT : phase === "error" ? (error ?? "") : (panelFailure ?? "");
       this.status.style.display = text === "" ? "none" : "flex";
       if (text !== "") {
         const line = this.deps.createElement("div");
         line.textContent = text;
         this.status.appendChild(line);
       }
-      if (phase === "error") {
+      if (phase === "error" || panelFailure !== null) {
         const retry = this.deps.createElement("button");
         retry.textContent = "Retry";
-        retry.addEventListener("click", () => this.dispatch({ type: "retry" }));
+        // A failed start retries the start; a panel that did not come back asks for the panel again.
+        retry.addEventListener("click", () => (phase === "error" ? this.dispatch({ type: "retry" }) : this.restorePanel()));
         this.status.appendChild(retry);
       }
       this.crashBanner.replaceChildren();

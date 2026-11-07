@@ -6,7 +6,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CLOSE_AUXILIARY_BAR_COMMAND,
   CLOSE_SIDE_BAR_COMMAND,
@@ -24,10 +24,19 @@ import { FakeWorkbenchPage } from "../host-fakes";
 import { tempDir } from "../helpers";
 
 let data: string;
+/** The activated extensions of the running test: stopped after it so no interval outlives its test. */
+let hosts: Array<{ dispose(): void }> = [];
+
+/** How often the test hosts re-read the requests folder (the shipped value is RESCAN_MS). */
+const RESCAN_FOR_TESTS_MS = 20;
 
 beforeEach(() => {
   data = tempDir();
   installTerminalAtExtension(data);
+});
+
+afterEach(() => {
+  for (const h of hosts.splice(0)) h.dispose();
 });
 
 interface Run {
@@ -42,6 +51,8 @@ interface Run {
 interface HostOptions {
   terminalPage?: boolean;
   page?: FakeWorkbenchPage;
+  /** fs.watch reports nothing (a missed event). */
+  deadWatcher?: boolean;
   /** A command that is not registered for this many asks (it rejects as VS Code does), by command id. */
   unknownFor?: Record<string, number>;
   /** A command that never answers until this is released, by command id. */
@@ -71,33 +82,43 @@ function startHost(opts: HostOptions = {}): Run {
       },
     },
   };
-  const source = extensionSource(opts.firstTerminalWaitMs ?? 50);
-  const mod: { exports: { activate?: (ctx: { extensionPath: string }) => void } } = { exports: {} };
-  const requireFake = (name: string) => (name === "vscode" ? vscode : name === "fs" ? fs : name === "path" ? path : (() => { throw new Error(name); })());
+  // A watcher that never reports anything is the missed fs.watch event: only the extension's re-scan can find a request then.
+  const fsForExtension = opts.deadWatcher ? { ...fs, watch: () => ({ close: () => undefined }) } : fs;
+  const source = extensionSource(opts.firstTerminalWaitMs ?? 50, RESCAN_FOR_TESTS_MS);
+  const mod: { exports: { activate?: (ctx: { extensionPath: string }) => { dispose(): void } } } = { exports: {} };
+  const requireFake = (name: string) => (name === "vscode" ? vscode : name === "fs" ? fsForExtension : name === "path" ? path : (() => { throw new Error(name); })());
   new Function("require", "exports", "module", source)(requireFake, mod.exports, mod);
-  mod.exports.activate?.({ extensionPath: extensionDir(data) });
+  const handle = mod.exports.activate?.({ extensionPath: extensionDir(data) });
+  if (handle) hosts.push(handle);
   return { calls, errors, layout: () => calls.map((c) => c.command).filter((c) => (PANEL_ONLY_COMMANDS as readonly string[]).includes(c)) };
 }
 
-/**
- * Wait until fn is true. fs.watch can still be coming alive when a test writes its first request (an event written in that window is
- * never reported, and the extension has no timer to re-scan), so while waiting this touches the requests folder now and then: a
- * live watcher reports that and the extension re-reads the folder. The touched file is not a .json request, so it is never read as one.
- */
-const until = (fn: () => boolean) => {
-  let last = 0;
-  return vi.waitFor(() => {
-    if (fn()) return;
-    if (Date.now() - last > 250) {
-      last = Date.now();
-      const nudge = path.join(extensionDir(data), REQUESTS_DIR, "watcher-nudge.tmp");
-      try { fs.writeFileSync(nudge, ""); fs.unlinkSync(nudge); } catch { /* the folder is not there yet */ }
-    }
-    throw new Error("not yet");
-  }, { timeout: 20_000, interval: 10 });
-};
+/** Wait until fn is true. A request is found by the watcher or by the extension's own re-scan, so no test has to wait for the watcher to be live. */
+const until = (fn: () => boolean) => vi.waitFor(() => { if (!fn()) throw new Error("not yet"); }, { timeout: 20_000, interval: 10 });
 
 describe("the panel-only step of the terminal-at extension", () => {
+  it("finds a request when fs.watch reports nothing at all (a missed event): the folder is re-read on an interval", async () => {
+    const run = startHost({ deadWatcher: true });
+    await until(() => run.layout().length === 3);
+    writeTerminalRequest(data, { cwd: "/vault/late" });
+    await until(() => run.calls.some((c) => c.command === NEW_WITH_CWD_COMMAND));
+    expect(run.calls.filter((c) => c.command === NEW_WITH_CWD_COMMAND)).toHaveLength(1);
+    await until(() => fs.readdirSync(path.join(extensionDir(data), REQUESTS_DIR)).filter((n) => n.endsWith(".json")).length === 0);
+    // later passes over the emptied folder, from the interval, ask for nothing again
+    await new Promise((r) => setTimeout(r, 100));
+    expect(run.calls.filter((c) => c.command === NEW_WITH_CWD_COMMAND)).toHaveLength(1);
+    expect(run.layout()).toHaveLength(3);
+  });
+
+  it("stops its watcher and its interval when it is disposed", async () => {
+    const run = startHost({ deadWatcher: true });
+    await until(() => run.layout().length === 3);
+    for (const h of hosts.splice(0)) h.dispose();
+    writeTerminalRequest(data, { cwd: "/vault/after" });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(run.calls.some((c) => c.command === NEW_WITH_CWD_COMMAND)).toBe(false);
+  });
+
   it("runs VS Code's own commands, in order: close the side bar, close the secondary side bar, focus the terminal; each with no argument", async () => {
     const run = startHost();
     await until(() => run.layout().length === 3);
@@ -162,9 +183,10 @@ describe("the panel-only step of the terminal-at extension", () => {
     expect(run.errors).toEqual([]);
   });
 
-  it("has no wait or count in its code: no timer between commands and no loop", () => {
+  it("has no wait or count in its code: no sleep between commands and no loop (its one interval only re-reads the requests folder)", () => {
     const source = extensionSource(100);
-    expect(source).not.toMatch(/sleep|for \(let i|while\s*\(|setInterval/);
+    expect(source).not.toMatch(/sleep|for \(let i|while\s*\(/);
+    expect(source.match(/setInterval/g)).toHaveLength(1);
   });
 
   it("does the layout BEFORE it takes a request, so the page's own first terminal is there for the first-use adoption to see", async () => {

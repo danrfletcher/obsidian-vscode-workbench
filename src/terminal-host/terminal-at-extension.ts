@@ -68,8 +68,11 @@ export const PANEL_ONLY_COMMANDS = [CLOSE_SIDE_BAR_COMMAND, CLOSE_AUXILIARY_BAR_
  */
 export const FIRST_TERMINAL_WAIT_MS = 5000;
 
+/** How often the extension re-reads the requests folder besides `fs.watch`, which can miss a request written as the watcher comes alive. */
+export const RESCAN_MS = 500;
+
 /** The extension's code, as VS Code's extension host runs it (CommonJS, `vscode` provided by the host). */
-export function extensionSource(firstTerminalWaitMs: number): string {
+export function extensionSource(firstTerminalWaitMs: number, rescanMs: number = RESCAN_MS): string {
   return `const vscode = require("vscode");
 const fs = require("fs");
 const path = require("path");
@@ -128,10 +131,21 @@ exports.activate = (ctx) => {
     }
   };
   let chain = Promise.resolve().then(panelOnly).catch(() => undefined);
-  const drain = () => { chain = chain.then(pass, pass); };
+  // Passes asked for and not yet started. The re-scan below asks only when none is waiting, so a slow pass is never queued behind a pile of them.
+  let waiting = 0;
+  const run = () => { waiting--; return pass(); };
+  const drain = () => { waiting++; chain = chain.then(run, run); };
   fs.mkdirSync(dir, { recursive: true });
-  fs.watch(dir, () => drain());
+  // fs.watch can miss a request written just after the first pass read the folder (the watcher is not live yet), so the folder is
+  // also re-read on a short interval. A pass over nothing new changes nothing: each request id is run once.
+  let watcher;
+  try { watcher = fs.watch(dir, () => drain()); } catch { /* no watcher: the interval below still finds every request */ }
+  const timer = setInterval(() => { if (waiting === 0) drain(); }, ${rescanMs});
+  if (timer.unref) timer.unref();
   drain();
+  const handle = { dispose: () => { clearInterval(timer); if (watcher) watcher.close(); } };
+  if (Array.isArray(ctx.subscriptions)) ctx.subscriptions.push(handle);
+  return handle;
 };
 `;
 }

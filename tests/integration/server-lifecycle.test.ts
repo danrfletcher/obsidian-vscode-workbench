@@ -428,11 +428,17 @@ describe("G10 keep-alive with a real shell under the server", () => {
     };
     const idleMs = 1000;
     idleOn(m, idleMs, { pollMs: 300, read: slowRead });
-    const t0 = Date.now();
+    // The clock starts when the server is running, so that is where the time is measured from: the start of the server itself
+    // (a spawn, a listening port) is slow under load and is not what is being timed.
+    let runningAt = 0;
+    m.onChange((state) => {
+      if (state === "running" && runningAt === 0) runningAt = Date.now();
+    });
     await m.ensureStarted();
     await until(() => expect(m.state).toBe("stopped-by-idle"));
-    // the stop lands at about 1300 ms; the old race left the server up and started a fresh idleMs countdown, a stop at 2300 ms or later
-    expect(Date.now() - t0).toBeLessThan(idleMs + 700);
+    // the stop lands at about 1300 ms after running; the old race left the server up and started a fresh idleMs countdown, a stop at 2300 ms or later
+    expect(runningAt).toBeGreaterThan(0);
+    expect(Date.now() - runningAt).toBeLessThan(idleMs + 800);
   });
 
   it("with a live shell the state stays running well past idleMs; after the shell is killed it goes to stopped-by-idle", async () => {
