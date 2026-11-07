@@ -74,6 +74,12 @@ export interface CodeViewHost {
   openInSystemApp(file: string): void;
   /** A folder in a tab's path was clicked: reveal that vault-relative folder in Obsidian's file explorer, as a note's path does. */
   revealFolder?(folder: string): void;
+  /** Give a path crumb its hover tooltip (the crumb's own folder name, as on a note). `el` is the crumb's element; `folder` its vault-relative path. */
+  folderTooltip?(el: unknown, folder: string): void;
+  /** A path crumb was right-clicked: show the menu a note's crumb shows for the folder (the host builds it with `Menu.forEvent`, which shows it). */
+  folderMenu?(folder: string, evt: unknown): void;
+  /** A path crumb is being dragged: start Obsidian's drag of the folder. False when it cannot, so the drag is cancelled. */
+  dragFolder?(folder: string, evt: unknown): boolean;
   /** The chosen instance's auto-save, from the settings copied at the last server start. Default off. */
   autoSave?(): AutoSave;
   /** Ask the unsaved-changes question when a tab with unsaved edits is closed. Without it, a dirty tab stays open. */
@@ -415,13 +421,19 @@ export class CodeView extends ItemView implements SyncTab, EmbedChannel {
 
   /**
    * Draw the file's folder path in the view header, as Obsidian does for a note, each folder revealing itself in the file explorer
-   * when clicked. `titleParentEl` is Obsidian's own header element (not in its typings); without it there is nothing to draw into
+   * when clicked (and offering a tooltip, a right-click menu and drag, as a note's crumb does). `titleParentEl` is Obsidian's own header element (not in its typings); without it there is nothing to draw into
    * and the tab keeps just its title. A click does nothing when the host cannot reveal.
    */
   private renderBreadcrumbs(): void {
     const parent = (this as unknown as { titleParentEl?: BreadcrumbParent }).titleParentEl;
     if (!parent) return;
-    renderPathBreadcrumbs(parent, this.file, (folder) => this.host.revealFolder?.(folder));
+    const host = this.host;
+    renderPathBreadcrumbs(parent, this.file, {
+      reveal: (folder) => host.revealFolder?.(folder),
+      tooltip: host.folderTooltip && ((el, folder) => host.folderTooltip?.(el, folder)),
+      menu: host.folderMenu && ((folder, evt) => host.folderMenu?.(folder, evt)),
+      drag: host.dragFolder && ((folder, evt) => host.dragFolder?.(folder, evt) ?? false),
+    });
   }
 
   get filePath(): string {
