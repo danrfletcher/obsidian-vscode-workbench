@@ -1,7 +1,7 @@
 {
   "name": "obsidian-vscode-workbench",
   "version": "0.1.0",
-  "description": "Open vault files in a real VS Code editor (code serve-web) inside an Obsidian tab.",
+  "description": "Open vault code files in a real VS Code editor (code serve-web) inside a tab, with VS Code's own terminal in a drawer at the bottom.",
   "main": "main.js",
   "private": true,
   "license": "MIT",
