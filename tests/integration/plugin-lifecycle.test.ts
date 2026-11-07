@@ -47,7 +47,7 @@ let terminalPids: string;
 const strays: number[] = [];
 
 const DOWNLOADING = "VS Code Workbench: downloading the VS Code server. The first run needs internet and can take a minute.";
-const PLUGIN_DIR = ".obsidian/plugins/obsidian-vscode-workbench";
+const PLUGIN_DIR = ".obsidian/plugins/vscode-workbench";
 
 /** A copy of the fake `code` laid out like an install (app/bin/code next to app/product.json), so the build has a version and a commit. */
 function fakeInstall(version: string, commit: string): string {
@@ -94,7 +94,7 @@ function makeApp(root: string): typeof app {
 async function load(env: Record<string, string> = {}, data: Record<string, unknown> = {}): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile, FAKE_CODE_ARGSFILE: argsFile }, env);
   app = makeApp(vault);
-  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: PLUGIN_DIR } as never);
+  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: PLUGIN_DIR } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, embed: "iframe", ...data };
   (plugin as unknown as { downloadHostReachable: () => Promise<boolean> }).downloadHostReachable = async () => networkUp;
   await plugin.onload();

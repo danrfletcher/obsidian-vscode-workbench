@@ -18,7 +18,7 @@ import { removeOverlay, rulesOf } from "../overlay-runner";
 import { BROWSER_APP_SETTINGS, buildBrowserSeedScript } from "../../src/settings";
 import { HANG_SCRIPT, makeApp as makeBundle, makeReadOnly, makeWritable, treeDigest } from "../instance-helpers";
 
-const PLUGIN_DIR = ".obsidian/plugins/obsidian-vscode-workbench";
+const PLUGIN_DIR = ".obsidian/plugins/vscode-workbench";
 const HERE = path.dirname(FAKE_CODE);
 
 let vault: string;
@@ -91,7 +91,7 @@ function makeAppObj(root: string): MockApp {
 async function load(data: Record<string, unknown> | null = {}, env: Record<string, string> = {}): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile, WB_LAUNCH_LOG: launchLog }, env);
   app = makeAppObj(vault);
-  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: PLUGIN_DIR } as never);
+  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: PLUGIN_DIR } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = data === null ? null : { serverLicenceAccepted: true, embed: "iframe", ...data };
   (plugin as unknown as { downloadHostReachable: () => Promise<boolean> }).downloadHostReachable = async () => false;
   await plugin.onload();
@@ -465,7 +465,7 @@ describe("the settings tab", () => {
       bothMicrosoft();
       Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile, WB_LAUNCH_LOG: launchLog });
       app = makeAppObj(vault);
-      plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: PLUGIN_DIR } as never);
+      plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: PLUGIN_DIR } as never);
       plugin.loadData = async () => {
         throw new Error("Unexpected token in JSON");
       };

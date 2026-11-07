@@ -131,7 +131,7 @@ PAGE_MARK_JS = """(async () => {
 })()"""
 for _token, _value in (("__NAME__", WORKBENCH_DB["name"]), ("__STORE__", WORKBENCH_DB["store"]), ("__KEY__", WORKBENCH_DB["settingsKey"]), ("__SETTING__", TERMINAL_PAGE_SETTING)):
     PAGE_MARK_JS = PAGE_MARK_JS.replace(_token, json.dumps(_value))
-PLUGIN_ID = "obsidian-vscode-workbench"  # manifest.json
+PLUGIN_ID = "vscode-workbench"  # manifest.json
 TRUST_BUTTON_TEXT = "Trust author and enable plugins"  # Obsidian's own wording on the trust prompt (seen in the tester's obs-state.png)
 TRUST_PROMPT_RE = "trust the author"
 CLICK_TRUST_JS = (

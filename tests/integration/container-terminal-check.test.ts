@@ -546,11 +546,11 @@ print(json.dumps({"fails": rep.fails, "lines": rep.lines, "calls": obs.calls, "s
   });
 
   it("the page script presses the button by its text and the state query reads the prompt, the instance and the commands (the strings the page runs)", () => {
-    const r = py<any>(`print(json.dumps({"click": m.CLICK_TRUST_JS, "state": m.plugin_state_js("obsidian-vscode-workbench")}))`);
+    const r = py<any>(`print(json.dumps({"click": m.CLICK_TRUST_JS, "state": m.plugin_state_js("vscode-workbench")}))`);
     expect(r.click).toContain("Trust author and enable plugins");
     expect(r.state).toContain("app.plugins");
-    expect(r.state).toContain('"obsidian-vscode-workbench"');
-    expect(JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "manifest.json"), "utf8")).id).toBe("obsidian-vscode-workbench");
+    expect(r.state).toContain('"vscode-workbench"');
+    expect(JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "manifest.json"), "utf8")).id).toBe("vscode-workbench");
   });
 });
 
@@ -582,7 +582,7 @@ describe("open-page (T29: nothing in the plugin opens a panel-only page, so the 
     };
     const server = { baseUrl: "http://127.0.0.1:45123", port: 45123, token: "tok-SECRET-123" };
     const plugin = { ensureServer: () => (opts.plugin === "fails" ? Promise.reject(new Error("licence declined\nsecond line")) : Promise.resolve(server)) };
-    w.app = { plugins: { plugins: opts.plugin === "none" ? {} : { "obsidian-vscode-workbench": plugin } } };
+    w.app = { plugins: { plugins: opts.plugin === "none" ? {} : { "vscode-workbench": plugin } } };
     const first = JSON.parse(await w.eval(script));
     const second = opts.twice ? JSON.parse(await w.eval(script)) : null;
     return { first, second, log, webviews, dom, server };
@@ -656,7 +656,7 @@ describe("open-page (T29: nothing in the plugin opens a panel-only page, so the 
     w.app = {
       vault: { getAbstractFileByPath: (p: string) => (files.has(p) ? { path: p } : null), create: async (p: string, text: string) => void files.set(p, text) },
       commands: { executeCommandById: (id: string) => (commandsRun.push(id), false) },
-      plugins: { plugins: opts.plugin === "none" ? {} : { "obsidian-vscode-workbench": { openCodeFile: async (p: string) => void (files.has(p) ? opened.push(p) : opened.push(`MISSING ${p}`)) } } },
+      plugins: { plugins: opts.plugin === "none" ? {} : { "vscode-workbench": { openCodeFile: async (p: string) => void (files.has(p) ? opened.push(p) : opened.push(`MISSING ${p}`)) } } },
     };
     const answer = await w.eval(js);
     return { answer, files, opened, commandsRun, file };
@@ -998,7 +998,7 @@ describe("T37: the panel-only page opens in the Code tab's profile (trust record
       return el;
     };
     const server = { baseUrl: "http://127.0.0.1:45123", port: 45123, token: "tok-SECRET-123" };
-    w.app = { plugins: { plugins: { "obsidian-vscode-workbench": { ensureServer: () => Promise.resolve(server) } } } };
+    w.app = { plugins: { plugins: { "vscode-workbench": { ensureServer: () => Promise.resolve(server) } } } };
     return { result: JSON.parse(await w.eval(script)), log, VAULT, server };
   }
 

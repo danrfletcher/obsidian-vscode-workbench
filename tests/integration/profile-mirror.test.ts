@@ -17,7 +17,7 @@ import { FAKE_CODE, isAlive, tempDir } from "../helpers";
 import { makeApp as makeBundle, makeReadOnly, makeWritable, treeDigest } from "../instance-helpers";
 import { PROFILES, TOGGLE_PANEL_KEY, TOGGLE_SIDEBAR_KEY, makeFakeUserData, vscodeFolderUri, writeUserData } from "../fixtures/make-fake-user-data.mjs";
 
-const PLUGIN_DIR = ".obsidian/plugins/obsidian-vscode-workbench";
+const PLUGIN_DIR = ".obsidian/plugins/vscode-workbench";
 const HERE = path.dirname(FAKE_CODE);
 const DEFAULT = "__default__profile__";
 
@@ -70,7 +70,7 @@ function makeAppObj(root: string): MockApp {
 
 async function load(data: Record<string, unknown> = {}): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile, WB_LAUNCH_LOG: path.join(tempDir(), "launches.log") });
-  plugin = new VSCodeWorkbenchPlugin(makeAppObj(vault) as never, { id: "obsidian-vscode-workbench", dir: PLUGIN_DIR } as never);
+  plugin = new VSCodeWorkbenchPlugin(makeAppObj(vault) as never, { id: "vscode-workbench", dir: PLUGIN_DIR } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = { serverLicenceAccepted: true, embed: "iframe", ...data };
   (plugin as unknown as { downloadHostReachable: () => Promise<boolean> }).downloadHostReachable = async () => false;
   await plugin.onload();

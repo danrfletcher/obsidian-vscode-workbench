@@ -116,7 +116,7 @@ describe("the plugin's wiring", () => {
   });
 
   async function load(): Promise<void> {
-    plugin = new VSCodeWorkbenchPlugin(makeApp(vault) as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+    plugin = new VSCodeWorkbenchPlugin(makeApp(vault) as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
     (plugin as unknown as { pluginData: unknown }).pluginData = {};
     await plugin.onload();
   }

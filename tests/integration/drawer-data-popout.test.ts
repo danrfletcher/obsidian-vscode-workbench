@@ -63,7 +63,7 @@ function makeApp(root: string): MockApp {
 
 /** Load the plugin with `raw` exactly as `loadData()` returns it (what is in data.json, whatever its shape). */
 async function loadRaw(raw: unknown): Promise<void> {
-  plugin = new VSCodeWorkbenchPlugin(makeApp(vault) as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+  plugin = new VSCodeWorkbenchPlugin(makeApp(vault) as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = raw;
   await plugin.onload();
 }

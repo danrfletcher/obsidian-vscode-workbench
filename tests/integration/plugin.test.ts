@@ -45,7 +45,7 @@ function makeApp(root: string): MockApp {
 async function load(env: Record<string, string> = {}, data: Record<string, unknown> = {}): Promise<void> {
   Object.assign(process.env, { FAKE_CODE_NODE: process.execPath, FAKE_CODE_PIDFILE: pidFile }, env);
   app = makeApp(vault);
-  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "obsidian-vscode-workbench", dir: ".obsidian/plugins/obsidian-vscode-workbench" } as never);
+  plugin = new VSCodeWorkbenchPlugin(app as never, { id: "vscode-workbench", dir: ".obsidian/plugins/vscode-workbench" } as never);
   (plugin as unknown as { pluginData: unknown }).pluginData = { codeCliPath: FAKE_CODE, embed: "iframe", serverLicenceAccepted: true, ...data };
   await plugin.onload();
 }
@@ -191,7 +191,7 @@ describe("failure", () => {
     expect(shown).toContain("could not listen on 127.0.0.1:");
     expect(shown).toContain("exit code 3");
     expect(shown).toContain("Last message: secret <redacted> leaked on purpose");
-    const tokenFile = path.join(vault, ".obsidian/plugins/obsidian-vscode-workbench/.server/connection-token");
+    const tokenFile = path.join(vault, ".obsidian/plugins/vscode-workbench/.server/connection-token");
     expect(shown).not.toContain(fs.readFileSync(tokenFile, "utf8"));
     expect(app.workspace.leaves).toHaveLength(0);
   });
@@ -227,7 +227,7 @@ describe("unload", () => {
   });
 
   it("a pty_helper.py left in .server by 0.1.0 is neither read, run, rewritten nor removed, and nothing fails on it", async () => {
-    const serverDir = path.join(vault, ".obsidian/plugins/obsidian-vscode-workbench/.server");
+    const serverDir = path.join(vault, ".obsidian/plugins/vscode-workbench/.server");
     fs.mkdirSync(serverDir, { recursive: true });
     const helper = path.join(serverDir, "pty_helper.py");
     fs.writeFileSync(helper, "raise SystemExit('must never run')\n", { mode: 0o444 });
@@ -246,7 +246,7 @@ describe("unload", () => {
   it("never writes the token anywhere in the vault except the token file itself", async () => {
     await load();
     await plugin.openSpikeFile();
-    const pluginDir = path.join(vault, ".obsidian/plugins/obsidian-vscode-workbench");
+    const pluginDir = path.join(vault, ".obsidian/plugins/vscode-workbench");
     const tokenFile = path.join(pluginDir, ".server/connection-token");
     const token = fs.readFileSync(tokenFile, "utf8");
     expect(token).toMatch(/^[0-9a-f]{64}$/);
