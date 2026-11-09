@@ -1231,6 +1231,65 @@ export default class VSCodeWorkbenchPlugin extends Plugin implements CodeViewHos
     if (found) explorer.revealInFolder(found);
   }
 
+  /**
+   * The file name at the end of a Code tab's path was clicked: reveal the file in the file explorer, as the path's folders do.
+   * The file is found in the form given or the other Unicode form. Nothing happens when the plugin is off or the file is not in the vault.
+   */
+  revealFile(file: string): void {
+    const app = this.app as unknown as {
+      internalPlugins?: { getEnabledPluginById?(id: string): { revealInFolder?(f: unknown): void } | null };
+    };
+    const explorer = app.internalPlugins?.getEnabledPluginById?.("file-explorer");
+    if (!explorer?.revealInFolder) return;
+    const found = this.findFile(file);
+    if (found) explorer.revealInFolder(found);
+  }
+
+  /** The vault file at `file`, found in the form given or the other Unicode form (macOS names are decomposed). */
+  private findFile(file: string): unknown {
+    const vault = (this.app as unknown as { vault?: { getFileByPath?(p: string): unknown } }).vault;
+    for (const form of [file, file.normalize("NFC"), file.normalize("NFD")]) {
+      const found = vault?.getFileByPath?.(form);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  /** Hover tooltip on the file name at the end of a Code tab's path: the file's vault-relative path (the name itself is already on show). */
+  fileTooltip(el: unknown, file: string): void {
+    setTooltip(el as HTMLElement, file);
+  }
+
+  /**
+   * Right-click on the file name at the end of a Code tab's path. Built as the folder crumb's menu is: `Menu.forEvent` (which cancels the
+   * browser menu and shows itself once this handler returns), the same sections, "Reveal in file explorer" when the file explorer is on,
+   * then `file-menu` triggered with the file and the file explorer's source so that other plugins' items (this plugin's
+   * "New terminal at folder", which opens the file's folder, too) are added. Nothing when the file is not in the vault.
+   */
+  fileMenu(file: string, evt: unknown): void {
+    const found = this.findFile(file);
+    if (!found) return;
+    const app = this.app as unknown as {
+      workspace: { trigger(name: string, ...args: unknown[]): void };
+      internalPlugins?: { getEnabledPluginById?(id: string): { revealInFolder?(f: unknown): void } | null };
+    };
+    const menu = Menu.forEvent(evt as MouseEvent) as Menu & { addSections?(sections: string[]): Menu };
+    menu.addSections?.(["title", "open", "action-primary", "action", "info", "info.copy", "view", "system", "", "danger"]);
+    const explorer = app.internalPlugins?.getEnabledPluginById?.("file-explorer");
+    if (explorer) {
+      menu.addItem((item) =>
+        item
+          .setSection("system")
+          .setTitle("Reveal in file explorer")
+          .setIcon("lucide-folder-open")
+          .onClick(() => explorer.revealInFolder?.(found)),
+      );
+    }
+    const title = (evt as { currentTarget?: unknown } | null)?.currentTarget;
+    if (typeof HTMLElement !== "undefined" && title instanceof HTMLElement) menu.setParentElement(title);
+    app.workspace.trigger("file-menu", menu, found, FILE_EXPLORER_SOURCE);
+  }
+
   /** Hover tooltip on a path crumb: the crumb's own folder name, as Obsidian's `createBreadcrumb` sets it on a note's. (Obsidian skips it on mobile; this plugin is desktop-only.) */
   folderTooltip(el: unknown, folder: string): void {
     setTooltip(el as HTMLElement, baseName(folder));

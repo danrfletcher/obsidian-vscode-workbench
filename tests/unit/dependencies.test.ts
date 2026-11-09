@@ -141,8 +141,8 @@ describe("no store submission artefacts (F10)", () => {
     }
   });
 
-  it("README says the plugin is not submitted to the community store", () => {
+  it("README no longer says the plugin is not submitted to the community store (it is listed)", () => {
     const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
-    expect(readme).toMatch(/not submitted to the community store/i);
+    expect(readme).not.toMatch(/not submitted to the community store/i);
   });
 });
