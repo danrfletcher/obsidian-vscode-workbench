@@ -40,13 +40,17 @@ export function folderChain(file: string): string[] {
   return parts.map((_, i) => parts.slice(0, i + 1).join("/"));
 }
 
+/** Class on the header title while it holds a file name that can be clicked (styles.css gives it the pointer cursor). */
+export const FILE_TITLE_CLASS = "vscode-workbench-file-title";
+
 /** The part of Obsidian's `titleEl` (the view header's title, which follows the path's crumbs) the file name uses. */
 export interface FileTitleEl {
   setText(text: string): void;
   onclick: ((evt: unknown) => unknown) | null;
   /** Right-click. Assigned, like `onclick`, so a redraw replaces the handler instead of stacking another. */
   oncontextmenu?: ((evt: CrumbEvent) => unknown) | null;
-  style?: { cursor: string };
+  /** Obsidian's DOM `classList`; marks the name as clickable (the pointer cursor is a CSS class, not an inline style). */
+  classList?: { add(cls: string): void; remove(cls: string): void };
 }
 
 /** What the file name does besides reveal on click. Both are optional: a host without them gets a name that reveals and nothing more. */
@@ -70,10 +74,11 @@ export function renderFileTitle(titleEl: FileTitleEl, file: string, reveal: (fil
   if (!name) {
     titleEl.onclick = null;
     titleEl.oncontextmenu = null;
+    titleEl.classList?.remove(FILE_TITLE_CLASS);
     return;
   }
   titleEl.onclick = () => reveal(file);
-  if (titleEl.style) titleEl.style.cursor = "pointer";
+  titleEl.classList?.add(FILE_TITLE_CLASS);
   actions.tooltip?.(titleEl, file);
   const { menu } = actions;
   titleEl.oncontextmenu = menu

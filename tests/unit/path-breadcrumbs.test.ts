@@ -58,7 +58,8 @@ class FakeTitle {
   text = "VS Code"; // what the header holds before the tab knows its file
   onclick: ((evt: unknown) => unknown) | null = null;
   oncontextmenu: ((evt: { preventDefault(): void }) => unknown) | null = null;
-  style = { cursor: "" };
+  classes = new Set<string>();
+  classList = { add: (c: string) => void this.classes.add(c), remove: (c: string) => void this.classes.delete(c) };
   setText(t: string): void {
     this.text = t;
   }
@@ -297,6 +298,14 @@ describe("renderFileTitle", () => {
     expect(title.text).toBe("");
     expect(title.onclick).toBeNull();
     expect(title.oncontextmenu).toBeNull();
+    expect(title.classes.has("vscode-workbench-file-title")).toBe(false);
+  });
+
+  it("marks a clickable file name with a CSS class (no inline style)", () => {
+    const title = new FakeTitle();
+    renderFileTitle(title, "a/b.py", vi.fn());
+    expect(title.classes.has("vscode-workbench-file-title")).toBe(true);
+    expect(Object.keys(title)).not.toContain("style");
   });
 });
 

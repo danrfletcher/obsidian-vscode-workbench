@@ -157,3 +157,8 @@ button.vscode-workbench-banner-button {
 .modal-content .vscode-workbench-wrap-anywhere {
   overflow-wrap: anywhere;
 }
+
+/* The file name at the end of a Code tab's path reveals the file when clicked, as a folder crumb does. */
+.view-header-title.vscode-workbench-file-title {
+  cursor: pointer;
+}
