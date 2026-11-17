@@ -1,6 +1,6 @@
 /**
- * Finding VS Code builds (G15). The scan reads the app folders (`/Applications`
- * and `~/Applications`) and lists a build only if its CLI passes the serve-web
+ * Finding VS Code builds (G15). The scan reads macOS app folders or Linux CLI
+ * directories and lists a build only if its CLI passes the serve-web
  * probe. It only reads: nothing under an app bundle or a VS Code data folder
  * is written, renamed, deleted or chmod-ed (F3).
  *
@@ -86,12 +86,17 @@ export const CUSTOM_ID = "custom";
 export function scanRoots(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string[] {
   const override = env.WORKBENCH_SCAN_ROOTS;
   if (override !== undefined) return override.split(path.delimiter).filter((r) => r !== "");
+  if (os.platform() === "linux") {
+    return [...new Set([...(env.PATH ?? "").split(path.delimiter).filter((r) => path.isAbsolute(r)), "/usr/bin", "/usr/local/bin", "/usr/share/code/bin", "/opt/visual-studio-code/bin"])];
+  }
   return ["/Applications", path.join(home, "Applications")];
 }
 
 /** The folder holding the instances' user folders. `WORKBENCH_APP_SUPPORT_ROOT` replaces it (tests only). */
 export function appSupportRoot(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string {
-  return env.WORKBENCH_APP_SUPPORT_ROOT ?? path.join(home, "Library", "Application Support");
+  if (env.WORKBENCH_APP_SUPPORT_ROOT !== undefined) return env.WORKBENCH_APP_SUPPORT_ROOT;
+  if (os.platform() === "linux") return env.XDG_CONFIG_HOME && path.isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(home, ".config");
+  return path.join(home, "Library", "Application Support");
 }
 
 interface ProductInfo {
@@ -173,6 +178,33 @@ function labelOf(base: string, version: string): string {
   return version ? `${base} ${version}` : base;
 }
 
+/** Linux packages put resources/app next to bin; macOS puts bin inside resources/app. */
+function productForCli(cli: string): ProductInfo {
+  const root = path.dirname(path.dirname(cli));
+  for (const dir of [root, path.join(root, "resources", "app")]) {
+    if (isFile(path.join(dir, "product.json"))) return readProduct(dir);
+  }
+  return {};
+}
+
+/** A known Linux launcher, classified by its product metadata rather than an alias's name. */
+function inspectCli(cli: string): { instance: Instance } | { rejected: RejectedBuild } | null {
+  let real: string;
+  try {
+    real = fs.realpathSync(cli);
+  } catch {
+    return null;
+  }
+  if (!isFile(real)) return null;
+  const product = productForCli(real);
+  const known = KNOWN_BUILDS.find((k) => k.bundleIds.includes(product.darwinBundleIdentifier ?? "") || k.userDataName === product.nameShort);
+  if (!known) return null;
+  const version = product.version ?? "";
+  const label = labelOf(known.label, version);
+  if (!isExecutable(real)) return { rejected: { label, appPath: real, reason: "its CLI is not executable." } };
+  return { instance: { id: `${known.kind}:${real}`, kind: known.kind, label, version, userDataName: known.userDataName, cli: real, appPath: null, microsoft: known.microsoft } };
+}
+
 export interface ScanOptions {
   roots?: string[];
   env?: NodeJS.ProcessEnv;
@@ -219,7 +251,7 @@ export function describeCustom(cli: string): Instance {
   } catch {
     /* keep the typed path */
   }
-  const product = readProduct(path.dirname(path.dirname(real))); // .../app/bin/<cli> -> .../app
+  const product = productForCli(real);
   const m = /^(.*?\.app)(?:\/|$)/.exec(real);
   const appPath = m ? m[1] : null;
   const cls = appPath ? classifyBundle(appPath) : null;
@@ -264,13 +296,13 @@ function collectBuilds(roots: string[]): { toProbe: Instance[]; rejected: Reject
   for (const root of roots) {
     let names: string[];
     try {
-      names = fs.readdirSync(root).filter((n) => n.toLowerCase().endsWith(".app"));
+      names = fs.readdirSync(root).filter((n) => n.toLowerCase().endsWith(".app") || (os.platform() === "linux" && KNOWN_BUILDS.some((k) => k.cliNames.includes(n))));
     } catch {
       continue; // a missing root (no ~/Applications) is normal
     }
     for (const name of names.sort()) {
       const appPath = path.join(root, name);
-      const found = inspectApp(appPath);
+      const found = name.toLowerCase().endsWith(".app") ? inspectApp(appPath) : inspectCli(appPath);
       if (!found) continue;
       if ("rejected" in found) {
         rejected.push(found.rejected);

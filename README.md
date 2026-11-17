@@ -10,6 +10,8 @@ It is not a Monaco look-alike. The plugin runs the official `code serve-web` on 
 
 Desktop only. Needs Obsidian 1.13.0 or newer and an installed VS Code (any build whose `code` command has `serve-web`).
 
+On Linux, the plugin finds known VS Code launchers in absolute `PATH` directories and standard installation locations, following symlinks such as `/usr/bin/code`. Settings and profiles are read from `$XDG_CONFIG_HOME` (when absolute), or `~/.config`. A custom CLI path can still be selected in the plugin settings for other installation layouts.
+
 ## What you get
 
 ### A Code tab that is just the editor
