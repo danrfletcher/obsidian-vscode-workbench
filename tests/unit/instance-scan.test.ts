@@ -1,10 +1,13 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
-import { appSupportRoot, bundleIdFromPlist, classifyBundle, describeCustom, scanInstances, scanRoots, type Instance } from "../../src/instances/scan";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { appSupportRoot, bundleIdFromPlist, classifyBundle, describeCustom, resolveInstanceForStart, scanInstances, scanRoots, type Instance } from "../../src/instances/scan";
 import type { ProbeResult } from "../../src/instances/probe";
 import { makeAllKnown, makeApp, PASS_SCRIPT } from "../instance-helpers";
 import { tempDir } from "../helpers";
+
+vi.mock("node:os", { spy: true });
 
 /** A probe that answers from a table keyed by the CLI's app folder name; records what it was asked. */
 function tableProbe(answers: Record<string, ProbeResult>, asked: string[] = []) {
@@ -16,6 +19,8 @@ function tableProbe(answers: Record<string, ProbeResult>, asked: string[] = []) 
 }
 
 const labels = (r: { instances: Instance[] }) => r.instances.map((i) => i.label);
+
+afterEach(() => vi.restoreAllMocks());
 
 describe("scanInstances: known builds", () => {
   it("lists every known build whose probe passes, with kind, version and CLI", async () => {
@@ -160,6 +165,7 @@ describe("scanInstances: roots", () => {
   });
 
   it("reads /Applications and ~/Applications by default; WORKBENCH_SCAN_ROOTS (test only) replaces them", () => {
+    vi.spyOn(os, "platform").mockReturnValue("darwin");
     expect(scanRoots({}, "/home/dan")).toEqual(["/Applications", "/home/dan/Applications"]);
     expect(scanRoots({ WORKBENCH_SCAN_ROOTS: "/a:/b b" }, "/home/dan")).toEqual(["/a", "/b b"]);
     expect(scanRoots({ WORKBENCH_SCAN_ROOTS: "" }, "/home/dan")).toEqual([]);
@@ -172,6 +178,100 @@ describe("scanInstances: roots", () => {
     makeApp(root, { name: "VSCodium.app", bundleId: "com.vscodium", version: "1.140.0", cli: "codium" });
     const r = await scanInstances({ env: { WORKBENCH_SCAN_ROOTS: root }, probe: tableProbe({}) });
     expect(labels(r)).toEqual(["VSCodium 1.140.0"]);
+  });
+});
+
+describe("Linux instances", () => {
+  /** A package layout reached through a launcher symlink, like /usr/bin/code. */
+  function install(root: string, name = "code", nameShort = "Code", version = "1.112.0") {
+    const app = path.join(root, "share", name);
+    const bin = path.join(app, "bin");
+    const resources = path.join(app, "resources", "app");
+    const launchers = path.join(root, "bin");
+    fs.mkdirSync(bin, { recursive: true });
+    fs.mkdirSync(resources, { recursive: true });
+    fs.mkdirSync(launchers, { recursive: true });
+    fs.writeFileSync(path.join(resources, "product.json"), JSON.stringify({ nameShort, version }));
+    const cli = path.join(bin, name);
+    fs.writeFileSync(cli, PASS_SCRIPT, { mode: 0o755 });
+    fs.symlinkSync(cli, path.join(launchers, name));
+    return { cli, app, launchers };
+  }
+
+  it("finds a symlinked package in both settings scans and server-start selection", async () => {
+    vi.spyOn(os, "platform").mockReturnValue("linux");
+    const { cli, launchers } = install(tempDir());
+    const env = { WORKBENCH_SCAN_ROOTS: launchers };
+    const r = await scanInstances({ env, probe: tableProbe({}) });
+    expect(r.instances).toEqual([{ id: `vscode:${cli}`, kind: "vscode", label: "VS Code 1.112.0", version: "1.112.0", userDataName: "Code", cli, appPath: null, microsoft: true }]);
+    expect(await resolveInstanceForStart({ env, savedId: null, probe: tableProbe({}) })).toEqual(r.instances[0]);
+  });
+
+  it("uses product metadata when a code alias actually points to Insiders", async () => {
+    vi.spyOn(os, "platform").mockReturnValue("linux");
+    const { cli, launchers } = install(tempDir(), "code", "Code - Insiders", "1.113.0-insider");
+    const r = await scanInstances({ roots: [launchers], probe: tableProbe({}) });
+    expect(r.instances[0]).toMatchObject({ kind: "vscode-insiders", userDataName: "Code - Insiders", cli, version: "1.113.0-insider" });
+  });
+
+  it("deduplicates aliases and repeated roots by the real launcher path", async () => {
+    vi.spyOn(os, "platform").mockReturnValue("linux");
+    const { cli, launchers } = install(tempDir());
+    fs.symlinkSync(cli, path.join(launchers, "code-insiders"));
+    const asked: string[] = [];
+    const r = await scanInstances({ roots: [launchers, path.dirname(cli), launchers], probe: tableProbe({}, asked) });
+    expect(r.instances).toHaveLength(1);
+    expect(asked).toEqual([cli]);
+  });
+
+  it("rejects unsupported or non-executable launchers and ignores broken links and unknown products", async () => {
+    vi.spyOn(os, "platform").mockReturnValue("linux");
+    const { cli, launchers } = install(tempDir());
+    fs.symlinkSync(path.join(launchers, "missing"), path.join(launchers, "code-insiders"));
+    const failed = await scanInstances({ roots: [launchers], probe: async () => ({ ok: false, reason: "no serve-web" }) });
+    expect(failed.instances).toEqual([]);
+    expect(failed.rejected[0]).toMatchObject({ appPath: cli, reason: expect.stringContaining("no serve-web") });
+    expect(await resolveInstanceForStart({ roots: [launchers], savedId: null, probe: async () => ({ ok: false, reason: "no serve-web" }) })).toBeNull();
+    fs.chmodSync(cli, 0o644);
+    const probe = vi.fn(tableProbe({}));
+    const rejected = await scanInstances({ roots: [launchers], probe });
+    expect(rejected.rejected[0].reason).toContain("not executable");
+    expect(probe).not.toHaveBeenCalled();
+    const unknown = install(tempDir(), "codium", "Unknown Editor");
+    expect((await scanInstances({ roots: [unknown.launchers], probe })).instances).toEqual([]);
+  });
+
+  it("retains saved choices and the default newest Microsoft build", async () => {
+    vi.spyOn(os, "platform").mockReturnValue("linux");
+    const root = tempDir();
+    const stable = install(root);
+    const insiders = install(root, "code-insiders", "Code - Insiders", "1.113.0-insider");
+    install(root, "codium", "VSCodium", "2.0.0");
+    expect(await resolveInstanceForStart({ roots: [stable.launchers], savedId: null, probe: tableProbe({}) })).toMatchObject({ cli: insiders.cli });
+    expect(await resolveInstanceForStart({ roots: [stable.launchers], savedId: `vscode:${stable.cli}`, probe: tableProbe({}) })).toMatchObject({ cli: stable.cli });
+    expect(await resolveInstanceForStart({ roots: [stable.launchers], customCliPath: stable.cli, savedId: "custom", probe: tableProbe({}) })).toMatchObject({ id: "custom", cli: stable.cli });
+  });
+
+  it("reads Linux package metadata for the existing custom CLI override", () => {
+    const { cli, launchers } = install(tempDir());
+    expect(describeCustom(path.join(launchers, "code"))).toMatchObject({ id: "custom", version: "1.112.0", userDataName: "Code", cli: path.join(launchers, "code") });
+    expect(fs.realpathSync(path.join(launchers, "code"))).toBe(cli);
+  });
+
+  it("uses absolute PATH entries plus standard Linux directories, while explicit roots stay isolated", async () => {
+    vi.spyOn(os, "platform").mockReturnValue("linux");
+    const roots = scanRoots({ PATH: "/custom/bin:/custom/bin:relative::/other/bin" }, "/home/dan");
+    expect(roots).toEqual(["/custom/bin", "/other/bin", "/usr/bin", "/usr/local/bin", "/usr/share/code/bin", "/opt/visual-studio-code/bin"]);
+    expect(scanRoots({ PATH: "/custom/bin", WORKBENCH_SCAN_ROOTS: "" })).toEqual([]);
+    expect((await scanInstances({ roots: [], probe: tableProbe({}) })).instances).toEqual([]);
+  });
+
+  it("uses XDG_CONFIG_HOME or ~/.config for Linux settings, with explicit overrides first", () => {
+    vi.spyOn(os, "platform").mockReturnValue("linux");
+    expect(appSupportRoot({}, "/home/dan")).toBe("/home/dan/.config");
+    expect(appSupportRoot({ XDG_CONFIG_HOME: "/custom/config" }, "/home/dan")).toBe("/custom/config");
+    expect(appSupportRoot({ XDG_CONFIG_HOME: "relative" }, "/home/dan")).toBe("/home/dan/.config");
+    expect(appSupportRoot({ XDG_CONFIG_HOME: "/custom/config", WORKBENCH_APP_SUPPORT_ROOT: "/override" }, "/home/dan")).toBe("/override");
   });
 });
 
