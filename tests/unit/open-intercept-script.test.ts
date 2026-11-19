@@ -191,6 +191,9 @@ describe("the open-from-editor page script", () => {
     // a few real report/restore cycles through the observer ...
     for (let i = 0; i < 3; i++) {
       showEditor(OTHER, 5 + i);
+      // The report comes from a 250 ms timer inside jsdom. A fixed wait of 450 ms is not enough on a machine under load (the full
+      // run failed here once with 2 reports where 3 were due), so wait for it, then wait again to see it is still just one.
+      for (let waited = 0; reports().length < i + 1 && waited < 10_000; waited += 50) await sleep(50);
       await settle();
       expect(reports()).toHaveLength(i + 1);
       onClose = () => showEditor(OWN, 3);
