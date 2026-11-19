@@ -6,8 +6,28 @@ import { afterEach } from "vitest";
 
 const dirs: string[] = [];
 
-/** A fresh temp dir, removed after each test. */
-export function tempDir(prefix = "vscode-workbench-test-"): string {
+/**
+ * A fresh temp dir, removed after each test.
+ *
+ * With the default prefix the name is `vscode-workbench-test-<runner pid>-<random>`, the runner being the vitest main process
+ * (WORKBENCH_TEST_RUN, set by tests/global-setup.ts). A fake server's command line then carries that pid, which is how the next
+ * run's sweep (tests/sweep-leftovers.ts) knows whose it is. A custom prefix is used as given.
+ *
+ * When WORKBENCH_TEST_RUN is not set (the setup did not run: a test file run under another config) the name is the old
+ * `vscode-workbench-test-<random>`. The sweep never reads that as a runner pid, so such a dir is left alone: no sweep can tell
+ * whose it is. It does not throw, because a test that does not start a server needs no runner.
+ */
+export function tempDir(prefix?: string): string {
+  const run = process.env.WORKBENCH_TEST_RUN;
+  return makeTempDir(prefix ?? (run && /^\d+$/.test(run) ? `vscode-workbench-test-${run}-` : "vscode-workbench-test-"));
+}
+
+/** A temp dir named for runner `pid` (not necessarily this run's), for the tests of the sweep. Removed after each test. */
+export function tempDirForRun(pid: number): string {
+  return makeTempDir(`vscode-workbench-test-${pid}-`);
+}
+
+function makeTempDir(prefix: string): string {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   dirs.push(d);
   return d;

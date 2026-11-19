@@ -19,6 +19,9 @@ export default defineConfig({
     testTimeout: 30_000,
     hookTimeout: 30_000,
     include: ["tests/**/*.test.ts"],
+    // Runs once, before any test file: names the run (WORKBENCH_TEST_RUN, the runner's pid, which is in every temp dir name), writes
+    // the run's lease and ends what earlier killed runs left behind. Registered here only, in the one config.
+    globalSetup: ["./tests/global-setup.ts"],
     coverage: {
       provider: "v8",
       // skipFull: false lists every file, including those at 100% (the new terminal files are), so per-file coverage is reported

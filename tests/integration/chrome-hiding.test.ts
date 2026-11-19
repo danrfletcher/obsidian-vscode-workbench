@@ -166,6 +166,15 @@ async function openTab(host: Partial<CodeViewHost> = {}, file = FILE) {
   const wv = contentEl.children[0] as PageWebview;
   await wv.loaded;
   await settle();
+  // The chrome script runs in a jsdom timer: on a machine under load a fixed 80 ms was once too short (the full run found no editor
+  // yet). Keep looking until the fake workbench's state has stayed the same for three looks in a row.
+  const looks = () => JSON.stringify([wv.page!.window.__fake.state, wv.page!.window.__fake.commands]);
+  for (let same = 0, last = looks(), waited = 0; same < 3 && waited < 10_000; waited += 80) {
+    await settle();
+    const now = looks();
+    same = now === last ? same + 1 : 0;
+    last = now;
+  }
   return { view, wv, page: wv.page! };
 }
 

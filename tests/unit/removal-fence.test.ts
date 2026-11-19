@@ -241,6 +241,8 @@ const F1_ALLOWED: Record<string, string> = {
   "tests/render/obsidian-live-check.py": "this slice: live C2 and C12 check run in the Obsidian container (python3 script: shebang and the docker exec usage line)",
   "tests/fixtures/container_check_world.py": "earlier slice: fixture for the container check; `python3 -m http.server` is a process-table row",
   "tests/fixtures/fake-serve-web.mjs": "earlier slice: fake serve-web whose shell runs `python3 -m http.server` as a dev server",
+  "tests/unit/sweep-leftovers.test.ts": "this slice: sweep decision test; a markerless `python3 -m http.server` is a decoy it must leave alone, and a python shell is a leader it must find",
+  "tests/integration/fake-watchdog.test.ts": "this slice: fake watchdog test; asks whether python3 exists before it starts the fake's http-server extra (`python3 -m http.server`)",
 };
 
 describe("F1: the files that still name the old terminal are exactly the listed ones", () => {
