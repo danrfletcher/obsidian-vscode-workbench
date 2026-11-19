@@ -32,11 +32,12 @@ describe("the run the global setup names", () => {
     expect(fs.readFileSync(lease, "utf8").trim()).toBe(start);
   });
 
-  it("names the run's ledger in the same folder as its lease, and writes nothing to it", () => {
+  // The ledger itself is written by the fake servers the run's tests start, so whether the file exists is not the setup's to say.
+  it("names the run's ledger in the same folder as its lease, with the runner's pid in the file name", () => {
     const pid = Number(process.env[RUN_ENV]);
     expect(process.env[LEDGER_ENV]).toBe(ledgerFile(pid));
     expect(path.dirname(ledgerFile(pid))).toBe(leaseDirOf());
-    expect(fs.existsSync(ledgerFile(pid))).toBe(false);
+    expect(path.basename(ledgerFile(pid))).toBe(`${pid}.ledger`);
   });
 });
 

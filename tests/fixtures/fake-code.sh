@@ -5,7 +5,8 @@
 #                                     like the real wrapper (which does NOT forward SIGTERM,
 #                                     so killing only this shell would orphan the server).
 # Env: FAKE_CODE_NODE (node binary), FAKE_CODE_MODE, FAKE_CODE_PIDFILE, FAKE_CODE_ARGSFILE,
-#      FAKE_CODE_DOWNLOAD_REQUESTS, FAKE_CODE_HELP_DELAY (seconds `serve-web --help` takes to answer).
+#      FAKE_CODE_DOWNLOAD_REQUESTS, FAKE_CODE_HELP_DELAY (seconds `serve-web --help` takes to answer),
+#      FAKE_CODE_LEDGER (a file: one line is appended for each server this wrapper starts, see ledger_append below).
 here=$(dirname "$0")
 node_bin=${FAKE_CODE_NODE:-node}
 
@@ -130,8 +131,41 @@ watchdog() {
   done
 }
 
+# The test temp dir this server belongs to, for the ledger: the marked directory (`vscode-workbench-test-<runner pid>-<random>`) on
+# the command line, which is where `tempDir()` puts the token file and the data dirs; else the token file's own directory.
+temp_dir_of() {
+  prev=""
+  for a in "$@"; do
+    case $a in
+      */vscode-workbench-test-[0-9]*-*)
+        rest=${a#*/vscode-workbench-test-}
+        printf '%s\n' "${a%%/vscode-workbench-test-*}/vscode-workbench-test-${rest%%/*}"
+        return 0
+        ;;
+    esac
+    if [ "$prev" = --connection-token-file ]; then token_dir=$(dirname "$a"); fi
+    prev=$a
+  done
+  printf '%s\n' "${token_dir:-$PWD}"
+}
+
+# One line per server this wrapper starts, for the end-of-run leak report (tests/leak-report.ts): the node server's pid, its start
+# time and the temp dir, separated by tabs. Written with a single `>>` so lines from forks that run together do not interleave.
+# Only when FAKE_CODE_LEDGER is set: a hand-started fake, and the copy in a temp app dir, write nothing. A write that fails
+# (an unwritable path, a full disk) is not an error: the fake starts and exits as it would without a ledger.
+ledger_append() {
+  [ -n "$FAKE_CODE_LEDGER" ] || return 0
+  child_start=$(LC_ALL=C ps -o lstart= -p "$child" 2>/dev/null)
+  [ -n "$child_start" ] || return 0 # the server is already gone: nothing to report
+  child_start=$(echo $child_start)
+  dir=$(temp_dir_of "$@")
+  ( printf '%s\t%s\t%s\n' "$child" "$child_start" "$dir" >>"$FAKE_CODE_LEDGER" ) 2>/dev/null || :
+  return 0
+}
+
 "$node_bin" "$here/fake-serve-web.mjs" "$@" &
 child=$!
+ledger_append "$@"
 watchdog </dev/null >/dev/null 2>&1 &
 wait "$child"
 exit $?

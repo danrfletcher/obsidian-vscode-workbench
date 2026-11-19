@@ -631,13 +631,14 @@ describe("fake fixtures: static fences (F9, F10)", () => {
     expect(mjs).not.toMatch(/process\.ppid|process\.stdin/);
   });
 
-  it("no environment variable switches the watchdog off: the only FAKE_CODE_* names are the known ones, and the one new name is the cap", () => {
+  it("no environment variable switches the watchdog off: the only FAKE_CODE_* names are the known ones, and the new names are the cap and the ledger path (a report, not a switch)", () => {
     const names = new Set([...(sh + mjs).matchAll(/FAKE_CODE_[A-Z_]+/g)].map((m) => m[0]));
     expect([...names].sort()).toEqual(
       [
         "FAKE_CODE_ARGSFILE",
         "FAKE_CODE_DOWNLOAD_REQUESTS",
         "FAKE_CODE_HELP_DELAY",
+        "FAKE_CODE_LEDGER",
         "FAKE_CODE_MAX_LIFETIME_S",
         "FAKE_CODE_MODE",
         "FAKE_CODE_NODE",
